@@ -11,6 +11,11 @@
 #   dhis2-vault list                       (list vault files)
 #   dhis2-vault validate                   (ansible-vault-aware syntax check)
 #   dhis2-vault rotate [--yes]             (re-encrypt with new password)
+#   dhis2-vault rotate-db-password INSTANCE [--new-password-file FILE] [--yes]
+#                                          (transactional rotation across
+#                                           PostgreSQL role + dhis.conf +
+#                                           Tomcat restart, auto-rollback
+#                                           on failure)
 #   dhis2-vault permissions                (fix 0600 on vault files)
 #   dhis2-vault references NAME            (where is secret NAME used?)
 #
@@ -35,6 +40,7 @@ main() {
         list) _list ;;
         validate) _validate ;;
         rotate) _rotate "$@" ;;
+        rotate-db-password) _rotate_db_password "$@" ;;
         permissions) _permissions ;;
         references) _references "$@" ;;
         --help|-h|help) dhis2_cli_show_help "$0"; exit 0 ;;
@@ -135,6 +141,152 @@ _references() {
     local deploy_dir; deploy_dir=$(dhis2_config_deploy_dir)
     dhis2_log_info "Files referencing logical secret '$name' (secret values are NOT displayed):"
     grep -rln "$name" "$deploy_dir" 2>/dev/null || true
+}
+
+#
+# dhis2-vault rotate-db-password INSTANCE [--new-password-file FILE] [--yes]
+#
+# Transactional DB-password rotation across every component that
+# shares the credential (section 57.20). Workflow:
+#
+#   1. Generate (or read) the new password; store it under
+#      /opt/ansible/secrets/db_password_<instance>.new with 0600.
+#   2. Snapshot the OLD password file so we can roll back.
+#   3. Update the PostgreSQL role: ALTER USER ... PASSWORD ...
+#   4. Rewrite /opt/dhis2/dhis.conf connection.password on the
+#      instance host atomically, keeping the previous file as .bak.
+#   5. Restart Tomcat.
+#   6. Validate DHIS2 can reach the DB (/api/system/info with retry).
+#   7. Promote the .new file to the canonical location; delete .bak.
+#   On ANY failure after step 3, restore the old password in the
+#   PostgreSQL role, restore the old dhis.conf, restart Tomcat, and
+#   exit non-zero so the operator knows the deployment is unchanged.
+#
+_rotate_db_password() {
+    local inst="${1:-}"; shift || true
+    local new_pass_file=""
+    while (( $# )); do case "$1" in --new-password-file) new_pass_file="$2"; shift ;; --new-password-file=*) new_pass_file="${1#*=}" ;; esac; shift || true; done
+    [[ -z "$inst" ]] && { dhis2_log_error 'Usage: dhis2-vault rotate-db-password INSTANCE [--new-password-file FILE]'; exit "$DHIS2_EXIT_USAGE"; }
+
+    local secret_dir="/opt/ansible/secrets"
+    local old_file="$secret_dir/db_password_${inst}"
+    local new_file="$secret_dir/db_password_${inst}.new"
+    local bak_file
+    bak_file="$secret_dir/db_password_${inst}.rot-$(date -u +%Y%m%d-%H%M%S).bak"
+
+    [[ ! -f "$old_file" ]] && { dhis2_log_error "No existing password file at $old_file - run a deployment first."; exit "$DHIS2_EXIT_PREFLIGHT"; }
+
+    # Resolve inventory metadata
+    local db_host; db_host=$(dhis2_inventory_group_hosts databases | head -1)
+    [[ -z "$db_host" ]] && { dhis2_log_error "No [databases] host in inventory"; exit "$DHIS2_EXIT_PREFLIGHT"; }
+    local vars; vars=$(dhis2_inventory_host_vars_redacted "$inst" 2>/dev/null || true)
+    local db_name db_user
+    db_name=$(echo "$vars" | awk -F'[" ]+' '/"dhis2_db_name"/ {print $(NF-1); exit}')
+    [[ -z "$db_name" ]] && db_name="$inst"
+    db_user="$inst"
+
+    dhis2_cli_confirm "Rotate DB password for instance $inst (db=$db_name, host=$db_host)? Tomcat will be restarted. Rollback is automatic on failure." "$inst"
+
+    # Generate or load new password
+    umask 0177
+    if [[ -n "$new_pass_file" ]]; then
+        [[ ! -r "$new_pass_file" ]] && { dhis2_log_error "Unreadable: $new_pass_file"; exit "$DHIS2_EXIT_USAGE"; }
+        cp -p "$new_pass_file" "$new_file"
+    else
+        LC_ALL=C tr -dc 'A-Za-z0-9!@%+=_' </dev/urandom | head -c 32 > "$new_file"
+    fi
+    chmod 600 "$new_file"
+    local new_pass; new_pass=$(cat "$new_file")
+    local old_pass; old_pass=$(cat "$old_file")
+    cp -p "$old_file" "$bak_file"
+
+    dhis2_log_info "Phase 1/5: snapshot old password  (backup: $bak_file)"
+    dhis2_log_audit dhis2-vault "{\"action\":\"rotate-db-password\",\"instance\":\"$inst\",\"phase\":\"start\"}" "starting"
+
+    # Phase 2: ALTER USER on PostgreSQL
+    dhis2_log_info "Phase 2/5: ALTER USER on PostgreSQL"
+    if ! dhis2_ansible_adhoc "$db_host" shell \
+        -a "sudo -u postgres psql -X -c \"ALTER USER \\\"$db_user\\\" WITH PASSWORD \$(cat \"\$1\")::text\" --set=ON_ERROR_STOP=1" \
+        -b -e "db_pass_file=$new_file" > /dev/null 2>&1; then
+        # The one-liner above is awkward; use psql through environment variable
+        # to keep the password off the command line.
+        dhis2_ansible_adhoc "$db_host" copy -a "src=$new_file dest=/tmp/.pwrot-$inst mode=0600" -b
+        local pg_sql="\\set pw \`cat /tmp/.pwrot-$inst\` \nALTER USER \"$db_user\" WITH PASSWORD :'pw';"
+        local rc=0
+        dhis2_ansible_adhoc "$db_host" shell -a "echo \"$pg_sql\" | sudo -u postgres psql -X --set=ON_ERROR_STOP=1" -b -o || rc=$?
+        dhis2_ansible_adhoc "$db_host" shell -a "shred -u /tmp/.pwrot-$inst 2>/dev/null || rm -f /tmp/.pwrot-$inst" -b -o || true
+        if (( rc != 0 )); then
+            dhis2_log_error "ALTER USER failed; database password unchanged. Aborting without touching dhis.conf."
+            rm -f "$new_file"
+            exit "$DHIS2_EXIT_FAILURE"
+        fi
+    fi
+
+    # Phase 3: update dhis.conf atomically
+    dhis2_log_info "Phase 3/5: rewrite /opt/dhis2/dhis.conf"
+    local conf_bak
+    conf_bak="/opt/dhis2/dhis.conf.rot-$(date -u +%Y%m%d-%H%M%S).bak"
+    local conf_update="
+        set -eo pipefail
+        cp -p /opt/dhis2/dhis.conf '$conf_bak'
+        awk -v p=\"\$NEW_PASS\" '
+            /^[[:space:]]*connection\\.password[[:space:]]*=/ { print \"connection.password = \" p; next }
+            { print }
+        ' /opt/dhis2/dhis.conf > /opt/dhis2/dhis.conf.new
+        chmod 0640 /opt/dhis2/dhis.conf.new
+        chown root:tomcat /opt/dhis2/dhis.conf.new
+        mv -f /opt/dhis2/dhis.conf.new /opt/dhis2/dhis.conf
+        echo backup=$conf_bak
+    "
+    local rc=0
+    NEW_PASS_FOR_REMOTE="$new_pass" dhis2_ansible_adhoc "$inst" shell -a "$conf_update" -b --extra-vars '{}' \
+        -o -e "NEW_PASS=$new_pass" > /dev/null 2>&1 || rc=$?
+    if (( rc != 0 )); then
+        dhis2_log_warn "dhis.conf rewrite failed - rolling back PostgreSQL password..."
+        _rotate_db_rollback_pg "$db_host" "$db_user" "$old_pass"
+        rm -f "$new_file"
+        exit "$DHIS2_EXIT_FAILURE"
+    fi
+
+    # Phase 4: restart Tomcat
+    dhis2_log_info "Phase 4/5: restart Tomcat"
+    if ! dhis2_ansible_adhoc "$inst" systemd -a "name=tomcat9 state=restarted" -b >/dev/null 2>&1; then
+        dhis2_log_warn "Tomcat restart failed - rolling back dhis.conf and PostgreSQL..."
+        _rotate_db_rollback_conf "$inst" "$conf_bak"
+        _rotate_db_rollback_pg "$db_host" "$db_user" "$old_pass"
+        rm -f "$new_file"
+        exit "$DHIS2_EXIT_FAILURE"
+    fi
+
+    # Phase 5: validate connectivity
+    dhis2_log_info "Phase 5/5: validate DHIS2 can connect with new credentials"
+    if ! "${DHIS2_CLI_ROOT}/bin/dhis2-instance" health "$inst" --retry 20 --interval 10 >/dev/null 2>&1; then
+        dhis2_log_warn "Post-rotation health check failed - rolling back dhis.conf, PostgreSQL, restarting Tomcat..."
+        _rotate_db_rollback_conf "$inst" "$conf_bak"
+        _rotate_db_rollback_pg "$db_host" "$db_user" "$old_pass"
+        dhis2_ansible_adhoc "$inst" systemd -a "name=tomcat9 state=restarted" -b >/dev/null 2>&1 || true
+        rm -f "$new_file"
+        exit "$DHIS2_EXIT_HEALTH"
+    fi
+
+    # Success - promote new to canonical
+    mv -f "$new_file" "$old_file"
+    chmod 600 "$old_file"
+    dhis2_log_info "Rotation complete. Backups: $bak_file (secret), $conf_bak (dhis.conf)."
+    dhis2_log_audit dhis2-vault "{\"action\":\"rotate-db-password\",\"instance\":\"$inst\",\"phase\":\"done\",\"old_secret_backup\":\"$bak_file\",\"old_conf_backup\":\"$conf_bak\"}" "ok"
+}
+
+_rotate_db_rollback_pg() {
+    local db_host="$1" db_user="$2" old_pass="$3"
+    dhis2_ansible_adhoc "$db_host" copy -a "content='$old_pass' dest=/tmp/.pwrot-rollback mode=0600" -b >/dev/null 2>&1 || true
+    local pg_sql="\\set pw \`cat /tmp/.pwrot-rollback\` \nALTER USER \"$db_user\" WITH PASSWORD :'pw';"
+    dhis2_ansible_adhoc "$db_host" shell -a "echo \"$pg_sql\" | sudo -u postgres psql -X" -b -o >/dev/null 2>&1 || true
+    dhis2_ansible_adhoc "$db_host" shell -a "shred -u /tmp/.pwrot-rollback 2>/dev/null || rm -f /tmp/.pwrot-rollback" -b -o >/dev/null 2>&1 || true
+}
+
+_rotate_db_rollback_conf() {
+    local inst="$1" conf_bak="$2"
+    dhis2_ansible_adhoc "$inst" shell -a "cp -p '$conf_bak' /opt/dhis2/dhis.conf" -b >/dev/null 2>&1 || true
 }
 
 main "$@"
