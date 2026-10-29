@@ -126,7 +126,7 @@ _init() {
 }
 
 _preflight() {
-    local inv findings=() rc=0
+    local inv findings=() rc=0 warnings=()
     inv=$(dhis2_config_resolve_inventory)
     local u; u=$(dhis2_validate_ubuntu_release) || findings+=("os: $u")
     dhis2_validate_ansible_present || findings+=("ansible-playbook: missing")
@@ -143,6 +143,38 @@ _preflight() {
     if grep -qE 'ansible_connection=lxd' "$inv" || grep -qE '^[[:space:]]*ansible_connection[[:space:]]*=[[:space:]]*lxd' "$inv"; then
         dhis2_validate_lxd_present || findings+=("lxd: not installed")
     fi
+
+    # Section 11.3 additions: DNS, disk, RAM, CPU. All treated as warnings
+    # rather than hard failures because they may be true positives in
+    # transient conditions (DNS flap, mid-dump disk pressure, etc.) and
+    # the operator sometimes knows better. The thresholds are overridable
+    # via environment variables.
+    local fqdn
+    fqdn=$(awk -F= '/^[[:space:]]*fqdn[[:space:]]*=/ {gsub(/[[:space:]]/,"",$2); print $2; exit}' "$inv")
+    if [[ -n "$fqdn" ]]; then
+        if ! getent ahosts "$fqdn" >/dev/null 2>&1 && ! host "$fqdn" >/dev/null 2>&1; then
+            warnings+=("dns: $fqdn does not resolve from this controller (TLS/HTTP checks will fail)")
+        fi
+    fi
+    local disk_min_gb="${DHIS2_PREFLIGHT_DISK_MIN_GB:-10}"
+    local root_free_gb
+    root_free_gb=$(df -BG --output=avail / 2>/dev/null | tail -1 | tr -dc '0-9')
+    if [[ -n "$root_free_gb" && "$root_free_gb" -lt "$disk_min_gb" ]]; then
+        warnings+=("disk: controller / has ${root_free_gb}G free (threshold ${disk_min_gb}G)")
+    fi
+    local ram_min_mb="${DHIS2_PREFLIGHT_RAM_MIN_MB:-2048}"
+    local ram_mb
+    ram_mb=$(awk '/MemTotal:/ {printf "%d", $2/1024}' /proc/meminfo 2>/dev/null)
+    if [[ -n "$ram_mb" && "$ram_mb" -lt "$ram_min_mb" ]]; then
+        warnings+=("memory: controller has ${ram_mb}MB total RAM (threshold ${ram_min_mb}MB)")
+    fi
+    local cpu_min="${DHIS2_PREFLIGHT_CPU_MIN:-2}"
+    local nproc
+    nproc=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 0)
+    if [[ -n "$nproc" && "$nproc" -lt "$cpu_min" ]]; then
+        warnings+=("cpu: controller has ${nproc} core(s) (threshold ${cpu_min})")
+    fi
+
     (( ${#findings[@]} )) && rc=$DHIS2_EXIT_PREFLIGHT
     if [[ "$DHIS2_OPT_JSON" == true ]]; then
         local arr="[" first=true f
@@ -154,8 +186,16 @@ _preflight() {
             arr+="\"$safe\""
         done
         arr+="]"
+        local warn_arr="[" first=true f
+        for f in "${warnings[@]:-}"; do
+            [[ -z "$f" ]] && continue
+            $first || warn_arr+=","; first=false
+            local safe="${f//\"/\\\"}"
+            warn_arr+="\"$safe\""
+        done
+        warn_arr+="]"
         local succ; if (( rc == 0 )); then succ=true; else succ=false; fi
-        dhis2_json_emit command=dhis2-deploy action=preflight success="$succ" findings="$arr"
+        dhis2_json_emit command=dhis2-deploy action=preflight success="$succ" findings="$arr" warnings="$warn_arr"
     else
         if (( rc == 0 )); then
             dhis2_status_ok "OK"; echo " - preflight passed"
@@ -163,6 +203,10 @@ _preflight() {
             dhis2_status_fail "FAIL"; echo " - findings:"
             local f
             for f in "${findings[@]}"; do printf '  - %s\n' "$f"; done
+        fi
+        if (( ${#warnings[@]} )); then
+            local w
+            for w in "${warnings[@]}"; do dhis2_c_yellow "warn"; printf '  %s\n' "$w"; done
         fi
     fi
     exit $rc
