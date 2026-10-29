@@ -1,87 +1,261 @@
 ---
 #
-# Flyway migration monitoring - section 76 (stages 9/10) and 79.
+# Flyway migration monitoring - section 76 (stages 9/10) and 79, plus
+# the Flyway hardening gaps identified in
+# docs/vital-enhancements/gap-analysis-flyway-and-beyond.md (F1-F10).
 #
 # Runs ONLY when the CLI explicitly asks for migration monitoring:
 #
 #     dhis2_monitor_migrations: true
 #     dhis2_allow_db_migrations:  true
 #
-# Starts Tomcat (controlled start), polls catalina.out for Flyway
-# markers, records state to /var/lib/dhis2-server-tools/state, and
-# fails the play if a Flyway error is detected or if monitoring times
-# out without an application-ready signal. The CLI (dhis2-upgrade run)
-# then surfaces this as a non-zero exit without ever reporting
-# upgrade success - requirement from scenario X.
+# Workflow:
+#   1. Pre-start gate: query flyway_schema_history for failed rows and
+#      long-held locks. Fail before Tomcat starts if either is found.
+#   2. Record migration-started state with inferred source version.
+#   3. Start Tomcat.
+#   4. Poll BOTH the Flyway history table AND catalina.out. Record the
+#      currently-running migration script and execution_time to the
+#      state file every poll cycle. Watch pg_stat_activity for
+#      connection-pool pressure.
+#   5. On failure, dump the failing migration SQL to the failure
+#      bundle and raise a Fail task with recovery guidance.
+#   6. On timeout, raise a Fail task - never silently succeed.
 #
-# This is intentionally conservative: no SQL repairs are attempted
-# (section 79). On failure, operator-ready next steps are logged.
+# No automatic SQL repair is attempted (section 79).
 #
 
-- name: Monitor-migrations | Ensure state directory exists
+- name: Monitor-migrations | Resolve runtime variables
+  ansible.builtin.set_fact:
+    _dhis2_catalina_log: "{{ dhis2_catalina_log | default('/var/log/tomcat' + (tomcat_version | string) + '/catalina.out') }}"
+    _dhis2_migration_timeout: "{{ (dhis2_migration_timeout | default(1800)) | int }}"
+    _dhis2_poll_seconds: "{{ (dhis2_migration_poll_seconds | default(5)) | int }}"
+    _dhis2_stale_lock_sec: "{{ (dhis2_flyway_stale_lock_sec | default(1800)) | int }}"
+    _dhis2_bundle_dir: "/var/log/dhis2-server-tools/bundles"
+    _dhis2_state_dir:  "/var/lib/dhis2-server-tools/state"
+    _dhis2_db_name: "{{ dhis2_db_name | default(inventory_hostname) }}"
+    _dhis2_db_host: "{{ database_host | default('postgres') }}"
+
+- name: Monitor-migrations | Ensure state and bundle directories exist
   ansible.builtin.file:
-    path: /var/lib/dhis2-server-tools/state
+    path: "{{ item }}"
     state: directory
     owner: root
     group: root
     mode: "0750"
+  loop:
+    - "{{ _dhis2_state_dir }}"
+    - "{{ _dhis2_bundle_dir }}"
+
+#
+# ----- F1 pre-start gate: refuse to start if the Flyway history is
+# in a known-bad state (failed rows). -----
+#
+- name: Monitor-migrations | Query Flyway history for failed rows (F1)
+  ansible.builtin.command: >
+    psql -X -tAc "SELECT count(*)
+                  FROM flyway_schema_history
+                  WHERE success=false"
+    -h {{ _dhis2_db_host }}
+    -d {{ _dhis2_db_name }}
+    -U {{ _dhis2_db_name }}
+  register: _flyway_failed_rows
+  changed_when: false
+  failed_when: false
+  no_log: true   # avoid leaking any env password
+
+- name: Monitor-migrations | Refuse start when prior Flyway failures exist
+  ansible.builtin.fail:
+    msg: |
+      Flyway history for {{ _dhis2_db_name }} contains
+      {{ _flyway_failed_rows.stdout | default('?') | trim }} failed row(s).
+      Starting a newer DHIS2 against a broken schema is unsafe.
+
+      Investigate with:
+        dhis2-db flyway info     {{ _dhis2_db_name }}
+        dhis2-db flyway failed   {{ _dhis2_db_name }}
+
+      When you are certain the previous failure is understood:
+        dhis2-db flyway repair   {{ _dhis2_db_name }}   # DANGEROUS, section 79
+      or restore the pre-upgrade backup:
+        dhis2-restore database --backup {{ dhis2_pre_upgrade_backup | default('<PATH>') }} \
+          --instance {{ inventory_hostname }} --drop-existing --create-db --yes
+  when:
+    - _flyway_failed_rows.rc == 0
+    - (_flyway_failed_rows.stdout | default('0') | trim) | int > 0
+
+#
+# ----- F2 pre-start gate: refuse to start if a Flyway lock is older
+# than dhis2_flyway_stale_lock_sec. -----
+#
+- name: Monitor-migrations | Detect stuck Flyway locks (F2)
+  ansible.builtin.command: >
+    psql -X -tAc "SELECT coalesce(max(extract(epoch from (now()-a.xact_start)))::int, 0)
+                  FROM pg_locks l
+                  JOIN pg_stat_activity a ON l.pid = a.pid
+                  JOIN pg_class c ON l.relation = c.oid
+                  WHERE c.relname = 'flyway_schema_history'
+                    AND l.granted = true"
+    -h {{ _dhis2_db_host }}
+    -d {{ _dhis2_db_name }}
+    -U {{ _dhis2_db_name }}
+  register: _flyway_lock_age
+  changed_when: false
+  failed_when: false
+  no_log: true
+
+- name: Monitor-migrations | Refuse start when Flyway lock is stuck
+  ansible.builtin.fail:
+    msg: |
+      A Flyway lock on {{ _dhis2_db_name }}.flyway_schema_history is
+      {{ _flyway_lock_age.stdout | default('?') | trim }} seconds old
+      (threshold {{ _dhis2_stale_lock_sec }}s). A previous DHIS2 start
+      probably died mid-migration.
+
+      Inspect:
+        dhis2-db flyway locks {{ _dhis2_db_name }}
+      Clear after confirming no live migration is running:
+        dhis2-db flyway unlock {{ _dhis2_db_name }}
+  when:
+    - _flyway_lock_age.rc == 0
+    - (_flyway_lock_age.stdout | default('0') | trim) | int > _dhis2_stale_lock_sec | int
+
+#
+# ----- Record migration-started marker with the inferred source version. -----
+#
+- name: Monitor-migrations | Infer source DHIS2 schema version
+  ansible.builtin.command: >
+    psql -X -tAc "SELECT coalesce(max(version), 'UNKNOWN')
+                  FROM flyway_schema_history
+                  WHERE success=true"
+    -h {{ _dhis2_db_host }}
+    -d {{ _dhis2_db_name }}
+    -U {{ _dhis2_db_name }}
+  register: _flyway_source
+  changed_when: false
+  failed_when: false
+  no_log: true
 
 - name: Monitor-migrations | Record migration-started marker
   ansible.builtin.copy:
     content: |
       instance: {{ inventory_hostname }}
       target_version: {{ dhis2_version | default('unknown') }}
-      source_version: {{ dhis2_source_version | default('unknown') }}
+      source_version: {{ dhis2_source_version | default(_flyway_source.stdout | default('UNKNOWN') | trim) }}
+      source_version_confidence: {{ 'operator' if (dhis2_source_version is defined) else ('inferred' if (_flyway_source.rc == 0) else 'none') }}
       started_at: {{ ansible_date_time.iso8601 }}
       backup_path: {{ dhis2_pre_upgrade_backup | default('n/a') }}
       policy: {{ dhis2_database_upgrade_mode | default('detect') }}
-    dest: "/var/lib/dhis2-server-tools/state/upgrade.{{ inventory_hostname }}.state"
+      poll_seconds: {{ _dhis2_poll_seconds }}
+      migration_timeout: {{ _dhis2_migration_timeout }}
+    dest: "{{ _dhis2_state_dir }}/upgrade.{{ inventory_hostname }}.state"
     mode: "0640"
     owner: root
     group: tomcat
 
-- name: Monitor-migrations | Resolve tomcat log location
-  ansible.builtin.set_fact:
-    _dhis2_catalina_log: "{{ dhis2_catalina_log | default('/var/log/tomcat' + (tomcat_version | string) + '/catalina.out') }}"
-    _dhis2_migration_timeout: "{{ (dhis2_migration_timeout | default(1800)) | int }}"
-
-- name: Monitor-migrations | Record Tomcat startup
+- name: Monitor-migrations | Start Tomcat (controlled)
   ansible.builtin.systemd:
     name: "tomcat{{ tomcat_version }}"
     state: started
     enabled: true
     daemon_reload: true
 
-- name: Monitor-migrations | Watch for Flyway completion or failure
+#
+# ----- Main watch loop: combines log parse + direct Flyway query + pool pressure. -----
+#
+- name: Monitor-migrations | Watch Flyway progress (log + history + pool)
   ansible.builtin.shell: |
     set -eo pipefail
     log={{ _dhis2_catalina_log | quote }}
+    state={{ (_dhis2_state_dir ~ '/upgrade.' ~ inventory_hostname ~ '.state') | quote }}
     timeout={{ _dhis2_migration_timeout }}
+    poll={{ _dhis2_poll_seconds }}
+    db={{ _dhis2_db_name | quote }}
+    host={{ _dhis2_db_host | quote }}
     deadline=$(( $(date +%s) + timeout ))
     saw_start=false
     saw_success=false
+    last_rank=-1
+
+    # psql may be absent (e.g. a diagnostic-only build) or the DB may be
+    # unreachable from the application host. Fall back to log-parsing
+    # only in that case - we still get the fast-fail behaviour, we just
+    # don't get live rank progress or pool pressure signals.
+    pg_available=false
+    PGCMD=""
+    if command -v psql >/dev/null 2>&1; then
+        PGCMD="psql -X -tAF | -h ${host} -d ${db} -U ${db}"
+        if $PGCMD -c 'SELECT 1' >/dev/null 2>&1; then
+            pg_available=true
+        else
+            echo "warning: psql reachable but DB ${host}/${db} not responding - falling back to log-only monitor" >> "$state"
+        fi
+    else
+        echo "warning: psql not installed on $(hostname) - falling back to log-only monitor" >> "$state"
+    fi
+    PG_MAXCONN=0
+    if $pg_available; then
+        PG_MAXCONN=$($PGCMD -c "SELECT setting::int FROM pg_settings WHERE name='max_connections'" 2>/dev/null | tr -d '[:space:]')
+        [ -z "$PG_MAXCONN" ] && PG_MAXCONN=0
+    fi
+
     while (( $(date +%s) < deadline )); do
-        if [[ -r "$log" ]]; then
-            # Any Flyway error terminates immediately
-            if grep -qE 'ERROR .*Flyway|Migration .*failed|FlywayException' "$log"; then
-                echo "flyway=failed"
+        # ---- 1. Log-based fast-fail on Flyway errors (F6) ----
+        if [[ -r "$log" ]] && grep -qE 'ERROR .*Flyway|Migration .*failed|FlywayException' "$log"; then
+            echo "flyway=failed" >> "$state"
+            exit 10
+        fi
+
+        # ---- 2. Direct history query: which migration is currently
+        #        running? (F10 progress) - skipped if no psql reachable ----
+        row=""
+        if $pg_available; then
+            row=$($PGCMD -c "SELECT installed_rank, version, left(script, 80), success, execution_time FROM flyway_schema_history ORDER BY installed_rank DESC LIMIT 1" 2>/dev/null | tail -1 || true)
+        fi
+        if [[ -n "$row" ]]; then
+            rank=$(echo "$row" | awk -F'|' '{print $1}')
+            ver=$(echo "$row"  | awk -F'|' '{print $2}')
+            script=$(echo "$row" | awk -F'|' '{print $3}')
+            ok=$(echo "$row"   | awk -F'|' '{print $4}')
+            ms=$(echo "$row"   | awk -F'|' '{print $5}')
+            if [[ "$ok" == "f" ]]; then
+                # ---- F6: dump failing SQL ----
+                dump={{ _dhis2_bundle_dir | quote }}/failing-migration.{{ inventory_hostname }}.$$.txt
+                $PGCMD -c "SELECT version, script, installed_on, execution_time FROM flyway_schema_history WHERE installed_rank=$rank" > "$dump" 2>/dev/null || true
+                echo "failing_migration_dump: $dump" >> "$state"
+                echo "flyway=failed" >> "$state"
                 exit 10
             fi
-            # Migration started
-            grep -qE 'Flyway .* Database:|Migrating schema' "$log" && saw_start=true
-            # Successful completion
+            if [[ "$rank" != "$last_rank" ]]; then
+                saw_start=true
+                echo "progress: installed_rank=$rank version=$ver script=\"$script\" execution_time_ms=$ms" >> "$state"
+                last_rank="$rank"
+            fi
+        fi
+
+        # ---- 3. Pool pressure watch (F9) - skipped without psql ----
+        if $pg_available && [[ "$PG_MAXCONN" -gt 0 ]]; then
+            active=$($PGCMD -c "SELECT count(*) FROM pg_stat_activity WHERE state='active'" 2>/dev/null | tr -d '[:space:]')
+            if [[ -n "$active" ]] && [[ $(( active * 100 / PG_MAXCONN )) -ge 80 ]]; then
+                echo "warning: pg_stat_activity active=$active >=80% of max_connections=$PG_MAXCONN at $(date -u +%FT%TZ)" >> "$state"
+            fi
+        fi
+
+        # ---- 4. Success signals ----
+        if [[ -r "$log" ]]; then
             if grep -qE 'Successfully applied .* migration|up to date|Schema version:' "$log"; then
                 saw_success=true
                 break
             fi
-            # Application ready
             if grep -qE 'Server startup in|Catalina.start Server startup|Started Server' "$log"; then
                 saw_success=true
                 break
             fi
         fi
-        sleep 5
+
+        sleep "$poll"
     done
+
     if $saw_success; then
         $saw_start && echo "flyway=completed" || echo "flyway=noop"
         exit 0
@@ -90,6 +264,10 @@
     exit 11
   args:
     executable: /bin/bash
+  environment:
+    # The CLI pre-install step writes the per-instance password here;
+    # we use PGPASSFILE so it never appears in process listings.
+    PGPASSFILE: "/opt/dhis2/.pgpass"
   register: _flyway_watch
   changed_when: false
   failed_when:
@@ -100,33 +278,87 @@
 
 - name: Monitor-migrations | Append result to state file
   ansible.builtin.lineinfile:
-    path: "/var/lib/dhis2-server-tools/state/upgrade.{{ inventory_hostname }}.state"
+    path: "{{ _dhis2_state_dir }}/upgrade.{{ inventory_hostname }}.state"
     line: "finished_at: {{ ansible_date_time.iso8601 }} result: {{ _flyway_watch.stdout | default('skipped') }}"
     create: true
     mode: "0640"
     owner: root
     group: tomcat
 
+#
+# ----- On failure: capture a focused diagnostic bundle (F6) and raise
+# a Fail task with recovery guidance. -----
+#
+- name: Monitor-migrations | Capture failure diagnostic bundle
+  ansible.builtin.shell: |
+    set -eo pipefail
+    ts=$(date -u +%Y%m%d-%H%M%S)
+    out={{ _dhis2_bundle_dir | quote }}/upgrade-{{ inventory_hostname }}-${ts}
+    mkdir -p "$out" && chmod 700 "$out"
+    cp -p {{ _dhis2_catalina_log | quote }} "$out/catalina.out" 2>/dev/null || true
+    cp -p {{ (_dhis2_state_dir ~ '/upgrade.' ~ inventory_hostname ~ '.state') | quote }} "$out/state" 2>/dev/null || true
+    # Failing migration SQL
+    psql -X -c "SELECT * FROM flyway_schema_history WHERE success=false ORDER BY installed_rank" \
+         -h {{ _dhis2_db_host | quote }} -d {{ _dhis2_db_name | quote }} -U {{ _dhis2_db_name | quote }} \
+         > "$out/flyway-failed-rows.txt" 2>&1 || true
+    # pg_stat_activity + lock snapshot
+    psql -X -c "SELECT pid, usename, state, left(query,120) FROM pg_stat_activity" \
+         -h {{ _dhis2_db_host | quote }} -d {{ _dhis2_db_name | quote }} -U {{ _dhis2_db_name | quote }} \
+         > "$out/pg_stat_activity.txt" 2>&1 || true
+    # Resource snapshot
+    df -h > "$out/disk.txt" 2>&1 || true
+    free -h > "$out/mem.txt" 2>&1 || true
+    uptime > "$out/uptime.txt" 2>&1 || true
+    # Redact in place
+    for f in "$out"/*; do
+        [[ -f "$f" ]] || continue
+        sed -i -E \
+            -e 's/(password[[:space:]]*[:=][[:space:]]*)[^[:space:]"]+/\1***REDACTED***/Ig' \
+            -e 's/(token[[:space:]]*[:=][[:space:]]*)[^[:space:]"]+/\1***REDACTED***/Ig' \
+            -e 's/(secret[[:space:]]*[:=][[:space:]]*)[^[:space:]"]+/\1***REDACTED***/Ig' \
+            "$f" 2>/dev/null || true
+    done
+    tar czf "${out}.tgz" -C "{{ _dhis2_bundle_dir }}" "$(basename "$out")"
+    chmod 600 "${out}.tgz"
+    rm -rf "$out"
+    echo "bundle=${out}.tgz"
+  args:
+    executable: /bin/bash
+  environment:
+    PGPASSFILE: "/opt/dhis2/.pgpass"
+  register: _flyway_bundle
+  changed_when: false
+  failed_when: false
+  when:
+    - dhis2_monitor_migrations | default(false) | bool
+    - dhis2_allow_db_migrations | default(false) | bool
+    - _flyway_watch.rc is defined
+    - _flyway_watch.rc != 0
+
 - name: Monitor-migrations | Fail with actionable guidance on timeout/error
   ansible.builtin.fail:
     msg: |
       DHIS2 Flyway migration did not complete successfully for {{ inventory_hostname }}.
       Observed: {{ _flyway_watch.stdout | default('(no observation recorded)') }}
+      Diagnostic bundle: {{ _flyway_bundle.stdout | default('(not captured)') }}
 
       Recommended next steps (section 79):
-        1. Inspect application logs:
+        1. Open the diagnostic bundle (redacted):
+             tar tzf {{ _flyway_bundle.stdout | default('<path>') | regex_replace('^bundle=','') }}
+        2. Inspect application logs:
              dhis2-logs migration {{ inventory_hostname }}
              dhis2-instance logs {{ inventory_hostname }} --lines 500
-        2. Inspect Flyway history:
-             dhis2-db show {{ dhis2_db_name | default(inventory_hostname) }}
-        3. Restore the pre-upgrade database if required:
+        3. Inspect Flyway history:
+             dhis2-db flyway info     {{ _dhis2_db_name }}
+             dhis2-db flyway failed   {{ _dhis2_db_name }}
+        4. Restore the pre-upgrade database if required:
              dhis2-restore database --backup {{ dhis2_pre_upgrade_backup | default('<PATH>') }} \
                --instance {{ inventory_hostname }} --drop-existing --create-db --yes
-        4. Roll back the application artifact if required:
+        5. Roll back the application artifact if required:
              dhis2-instance war rollback {{ inventory_hostname }} --yes
 
-      The pre-upgrade backup path and state are recorded in
-      /var/lib/dhis2-server-tools/state/upgrade.{{ inventory_hostname }}.state
+      Pre-upgrade backup + state are recorded in
+      {{ _dhis2_state_dir }}/upgrade.{{ inventory_hostname }}.state
   when:
     - dhis2_monitor_migrations | default(false) | bool
     - dhis2_allow_db_migrations | default(false) | bool

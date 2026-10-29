@@ -39,9 +39,24 @@
 #   dhis2-db tune [--profile small|medium|large|custom|auto] [--dry-run]
 #   dhis2-db capacity              [--host HOST]
 #   dhis2-db oom-check             [--host HOST]
+#   dhis2-db kill-grace PID [--grace-seconds N] [--yes]
+#   dhis2-db pg-version                       [--json]
+#   dhis2-db analytics status DB
+#   dhis2-db flyway info     DB               [--json]
+#   dhis2-db flyway history  DB [--limit N]
+#   dhis2-db flyway pending  DB [--to VERSION]
+#   dhis2-db flyway failed   DB               [--json]
+#   dhis2-db flyway locks    DB
+#   dhis2-db flyway unlock   DB [--yes]
+#   dhis2-db flyway repair   DB [--yes]
+#   dhis2-db flyway baseline DB --version X [--description TEXT] [--yes]
+#   dhis2-db flyway validate DB
+#   dhis2-db flyway source-version DB         [--json]
 #
-# All destructive queries (drop, vacuum full, terminate-session) require
-# explicit confirmation unless --yes is supplied (section 33).
+# All destructive queries (drop, vacuum full, terminate-session,
+# flyway repair/unlock/baseline) require explicit confirmation unless
+# --yes is supplied (section 33). Flyway repair never attempts
+# arbitrary SQL repairs - section 79.
 # USAGE_END
 set -Eeuo pipefail
 . "$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")/.." && pwd)/lib/common.sh"
@@ -103,6 +118,10 @@ main() {
         tune) _tune "$@" ;;
         capacity) _capacity ;;
         oom-check) _oom_check ;;
+        flyway) _flyway "$@" ;;
+        kill-grace) _kill_grace "$@" ;;
+        analytics) _analytics_cmd "$@" ;;
+        pg-version) _pg_version_json ;;
         --help|-h|help) dhis2_cli_show_help "$0"; exit 0 ;;
         *) dhis2_log_error "Unknown subcommand: $sub"; exit "$DHIS2_EXIT_USAGE" ;;
     esac
@@ -324,6 +343,396 @@ _capacity() {
 
 _oom_check() {
     dhis2_ansible_adhoc "$DB_HOST" shell -a 'journalctl -k -g "Out of memory" --since "7 days ago" --no-pager | tail -20; dmesg -T 2>/dev/null | grep -iE "oom|killed process" | tail -20' -b -o
+}
+
+#
+# -------- Flyway operations --------
+#
+# All Flyway subcommands query the DHIS2 instance database directly.
+# They never attempt SQL repairs implicitly - repair/unlock/baseline
+# are explicit, confirmation-gated operations (section 79).
+#
+# Usage:
+#   dhis2-db flyway info     DB                [--json]
+#   dhis2-db flyway history  DB [--limit N]    [--json]
+#   dhis2-db flyway pending  DB [--to VER]
+#   dhis2-db flyway failed   DB                [--json]
+#   dhis2-db flyway locks    DB                [--json]
+#   dhis2-db flyway unlock   DB [--yes]
+#   dhis2-db flyway repair   DB [--yes]
+#   dhis2-db flyway baseline DB --version VER --description TEXT [--yes]
+#   dhis2-db flyway validate DB
+#   dhis2-db flyway source-version DB
+#
+_flyway() {
+    local sub="${1:-}"; shift || true
+    [[ -z "$sub" ]] && { dhis2_log_error 'Usage: dhis2-db flyway SUB DB ...'; exit "$DHIS2_EXIT_USAGE"; }
+    case "$sub" in
+        info) _flyway_info "$@" ;;
+        history) _flyway_history "$@" ;;
+        pending) _flyway_pending "$@" ;;
+        failed) _flyway_failed "$@" ;;
+        locks) _flyway_locks "$@" ;;
+        unlock) _flyway_unlock "$@" ;;
+        repair) _flyway_repair "$@" ;;
+        baseline) _flyway_baseline "$@" ;;
+        validate) _flyway_validate "$@" ;;
+        source-version) _flyway_source_version "$@" ;;
+        --help|-h|help)
+            awk '/^# -------- Flyway/,/^#$/' "$0" | sed 's/^# \{0,1\}//'
+            exit 0
+            ;;
+        *) dhis2_log_error "Unknown flyway subcommand: $sub"; exit "$DHIS2_EXIT_USAGE" ;;
+    esac
+}
+
+# Return the Flyway schema-history table name. DHIS2 uses the Flyway
+# default `flyway_schema_history`. If an older schema uses the pre-5
+# `schema_version` name we honour it transparently.
+_flyway_table() {
+    local db="$1"
+    local out
+    out=$(dhis2_ansible_adhoc "$DB_HOST" shell -a "sudo -u postgres psql -X -tAc \"SELECT CASE WHEN to_regclass('public.flyway_schema_history') IS NOT NULL THEN 'flyway_schema_history' WHEN to_regclass('public.schema_version') IS NOT NULL THEN 'schema_version' ELSE '' END\" -d '$db'" -b -o 2>&1 | tail -1 | awk '{print $NF}')
+    printf '%s' "$out"
+}
+
+_flyway_run_sql() {
+    local db="$1" sql="$2"
+    dhis2_ansible_adhoc "$DB_HOST" shell -a "sudo -u postgres psql -X -tAF '|' -d '$db' -c \"$sql\"" -b -o 2>&1 | tail -n +2 | sed '/^$/d'
+}
+
+_flyway_run_sql_table() {
+    local db="$1" sql="$2"
+    dhis2_ansible_adhoc "$DB_HOST" shell -a "sudo -u postgres psql -X -d '$db' -c \"$sql\"" -b -o
+}
+
+_flyway_require_table() {
+    local db="$1"
+    local tbl; tbl=$(_flyway_table "$db")
+    if [[ -z "$tbl" ]]; then
+        if [[ "$DHIS2_OPT_JSON" == true ]]; then
+            dhis2_json_emit command=dhis2-db-flyway database="$db" present=false hint="no flyway_schema_history or schema_version table found - may need baseline"
+        else
+            dhis2_log_warn "No Flyway history found in database '$db'. If this is an existing DHIS2 database being re-attached, consider:"
+            dhis2_log_warn "  dhis2-db flyway baseline $db --version <SOURCE_DHIS2_SCHEMA_VERSION> --description 'baseline attach'"
+        fi
+        exit "$DHIS2_EXIT_PREFLIGHT"
+    fi
+    printf '%s' "$tbl"
+}
+
+_flyway_info() {
+    local db="${1:-}"; shift || true
+    [[ -z "$db" ]] && { dhis2_log_error 'Usage: dhis2-db flyway info DB'; exit "$DHIS2_EXIT_USAGE"; }
+    local tbl; tbl=$(_flyway_require_table "$db")
+    local sql="SELECT installed_rank, version, left(description, 60), success, execution_time, installed_on FROM $tbl ORDER BY installed_rank DESC LIMIT 20"
+    local failed_count latest_version lock_count
+    failed_count=$(_flyway_run_sql "$db" "SELECT count(*) FROM $tbl WHERE success=false")
+    latest_version=$(_flyway_run_sql "$db" "SELECT version FROM $tbl WHERE success=true ORDER BY installed_rank DESC LIMIT 1")
+    lock_count=$(dhis2_ansible_adhoc "$DB_HOST" shell -a "sudo -u postgres psql -X -tAc \"SELECT count(*) FROM pg_locks l JOIN pg_class c ON l.relation=c.oid WHERE c.relname='${tbl}' AND l.granted=true\" -d '$db'" -b -o 2>&1 | tail -1 | awk '{print $NF}')
+    if [[ "$DHIS2_OPT_JSON" == true ]]; then
+        dhis2_json_emit \
+            command=dhis2-db-flyway action=info database="$db" table="$tbl" \
+            latest_version="${latest_version:-null}" \
+            failed_count="${failed_count:-0}" \
+            lock_rows="${lock_count:-0}"
+        return 0
+    fi
+    printf 'database:         %s\n' "$db"
+    printf 'flyway table:     %s\n' "$tbl"
+    printf 'latest version:   %s\n' "${latest_version:-<none>}"
+    printf 'failed rows:      %s\n' "${failed_count:-0}"
+    printf 'locks held:       %s\n' "${lock_count:-0}"
+    echo
+    dhis2_c_bold "Recent migrations (newest 20)"; echo
+    _flyway_run_sql_table "$db" "$sql"
+    # Non-zero exit if there are failed rows (section F1 of the gap analysis).
+    [[ "${failed_count:-0}" -gt 0 ]] && exit "$DHIS2_EXIT_HEALTH"
+    return 0
+}
+
+_flyway_history() {
+    local db="${1:-}"; shift || true
+    local limit=100
+    while (( $# )); do case "$1" in --limit) limit="$2"; shift ;; --limit=*) limit="${1#*=}" ;; esac; shift || true; done
+    [[ -z "$db" ]] && { dhis2_log_error 'Usage: dhis2-db flyway history DB [--limit N]'; exit "$DHIS2_EXIT_USAGE"; }
+    local tbl; tbl=$(_flyway_require_table "$db")
+    _flyway_run_sql_table "$db" "SELECT installed_rank, version, type, left(script, 70) AS script, success, execution_time, installed_on, installed_by FROM $tbl ORDER BY installed_rank DESC LIMIT $limit"
+}
+
+_flyway_pending() {
+    local db="${1:-}"; shift || true
+    local to=""
+    while (( $# )); do case "$1" in --to) to="$2"; shift ;; --to=*) to="${1#*=}" ;; esac; shift || true; done
+    [[ -z "$db" ]] && { dhis2_log_error 'Usage: dhis2-db flyway pending DB [--to VERSION]'; exit "$DHIS2_EXIT_USAGE"; }
+    # Pending migrations are files shipped in the WAR that have no row in
+    # the history table yet. We cannot enumerate them without the WAR
+    # classpath; what we CAN do reliably is report the current head and
+    # any gaps/out-of-order history that would prevent a target upgrade.
+    local tbl; tbl=$(_flyway_require_table "$db")
+    local head
+    head=$(_flyway_run_sql "$db" "SELECT version FROM $tbl WHERE success=true ORDER BY installed_rank DESC LIMIT 1")
+    printf 'current head version: %s\n' "${head:-<none>}"
+    [[ -n "$to" ]] && printf 'target version:       %s\n' "$to"
+    echo
+    dhis2_c_bold "Non-success rows (would block Flyway on next start)"; echo
+    _flyway_run_sql_table "$db" "SELECT installed_rank, version, left(script, 70), success, installed_on FROM $tbl WHERE success=false ORDER BY installed_rank"
+    echo
+    dhis2_c_bold "Last 10 applied migrations"; echo
+    _flyway_run_sql_table "$db" "SELECT installed_rank, version, left(description, 70) FROM $tbl WHERE success=true ORDER BY installed_rank DESC LIMIT 10"
+    dhis2_log_info 'Pending-FROM-WAR enumeration requires classpath access. Use the application log on the next start to see Flyway "Migrating schema" lines.'
+}
+
+_flyway_failed() {
+    local db="${1:-}"
+    [[ -z "$db" ]] && { dhis2_log_error 'Usage: dhis2-db flyway failed DB'; exit "$DHIS2_EXIT_USAGE"; }
+    local tbl; tbl=$(_flyway_require_table "$db")
+    local count
+    count=$(_flyway_run_sql "$db" "SELECT count(*) FROM $tbl WHERE success=false")
+    if [[ "${count:-0}" -gt 0 ]]; then
+        if [[ "$DHIS2_OPT_JSON" != true ]]; then
+            dhis2_status_fail "FAIL"; echo " - $count failed migration(s) in $db.$tbl"
+            _flyway_run_sql_table "$db" "SELECT installed_rank, version, left(script, 80), installed_on, left(coalesce(regexp_replace(installed_by, '.*', 'redacted'), ''), 20) AS actor FROM $tbl WHERE success=false ORDER BY installed_rank"
+        else
+            dhis2_json_emit command=dhis2-db-flyway action=failed database="$db" count="$count"
+        fi
+        exit "$DHIS2_EXIT_HEALTH"
+    fi
+    [[ "$DHIS2_OPT_JSON" == true ]] \
+        && dhis2_json_emit command=dhis2-db-flyway action=failed database="$db" count=0 \
+        || { dhis2_status_ok "OK"; echo " - no failed Flyway migrations in $db"; }
+}
+
+_flyway_locks() {
+    local db="${1:-}"
+    [[ -z "$db" ]] && { dhis2_log_error 'Usage: dhis2-db flyway locks DB'; exit "$DHIS2_EXIT_USAGE"; }
+    local tbl; tbl=$(_flyway_require_table "$db")
+    # Flyway holds a row-level or advisory lock on the history table while
+    # migrating. If a start-up died mid-migration the row-level lock dies
+    # with the backend; but Flyway 7+ also uses an "LOCK TABLE" or an
+    # advisory lock. We expose both views so the operator can decide.
+    local stale="${DHIS2_FLYWAY_STALE_LOCK_SEC:-1800}"
+    dhis2_ansible_adhoc "$DB_HOST" shell -a "sudo -u postgres psql -X -d '$db' -c \"
+        SELECT l.pid, a.state, a.application_name, now()-a.xact_start AS xact_age, left(a.query, 80) AS query
+        FROM pg_locks l JOIN pg_stat_activity a ON l.pid = a.pid
+        JOIN pg_class c ON l.relation = c.oid
+        WHERE c.relname = '${tbl}' AND l.granted = true
+    \"" -b -o
+    dhis2_log_info "Any lock held longer than ${stale}s should be investigated. Use 'dhis2-db flyway unlock $db' to clear a stuck advisory lock after confirming the owning backend is gone."
+}
+
+_flyway_unlock() {
+    local db="${1:-}"
+    [[ -z "$db" ]] && { dhis2_log_error 'Usage: dhis2-db flyway unlock DB'; exit "$DHIS2_EXIT_USAGE"; }
+    dhis2_cli_confirm "Clear stuck Flyway lock on database '$db'? This is only safe if no DHIS2 process is currently migrating." "$db"
+    local tbl; tbl=$(_flyway_require_table "$db")
+    # Any backend still holding the lock is terminated; then advisory
+    # locks are released. The row-level lock will clear automatically.
+    dhis2_ansible_adhoc "$DB_HOST" shell -a "sudo -u postgres psql -X -d '$db' -c \"
+        SELECT pg_terminate_backend(l.pid)
+          FROM pg_locks l JOIN pg_class c ON l.relation = c.oid
+         WHERE c.relname = '${tbl}' AND l.granted = true AND l.pid <> pg_backend_pid();
+        SELECT pg_advisory_unlock_all();
+    \"" -b -o
+}
+
+_flyway_repair() {
+    local db="${1:-}"
+    [[ -z "$db" ]] && { dhis2_log_error 'Usage: dhis2-db flyway repair DB'; exit "$DHIS2_EXIT_USAGE"; }
+    dhis2_cli_confirm "Mark failed Flyway rows in '$db' as resolved? This is a BREAK-GLASS operation. Section 79 forbids automatic SQL repair - this only cleans the history table so the next start can proceed." "$db"
+    local tbl; tbl=$(_flyway_require_table "$db")
+    local before
+    before=$(_flyway_run_sql "$db" "SELECT count(*) FROM $tbl WHERE success=false")
+    [[ "${before:-0}" -eq 0 ]] && { dhis2_log_info "No failed rows to repair in $db.$tbl"; return 0; }
+    # The classical Flyway repair deletes failed rows AND recomputes
+    # checksums for applied rows. We only perform the row deletion -
+    # the checksum recompute requires the WAR classpath. If the operator
+    # also needs checksum recompute, dhis2-db flyway validate reports it.
+    dhis2_ansible_adhoc "$DB_HOST" shell -a "sudo -u postgres psql -X -d '$db' -c \"
+        DELETE FROM $tbl WHERE success=false;
+    \"" -b -o
+    dhis2_log_info "Removed $before failed row(s) from $db.$tbl. Run 'dhis2-db flyway info $db' to verify."
+}
+
+_flyway_baseline() {
+    local db="${1:-}"; shift || true
+    local version="" description="baseline"
+    while (( $# )); do
+        case "$1" in
+            --version) version="$2"; shift ;; --version=*) version="${1#*=}" ;;
+            --description) description="$2"; shift ;; --description=*) description="${1#*=}" ;;
+        esac
+        shift || true
+    done
+    [[ -z "$db" || -z "$version" ]] && { dhis2_log_error 'Usage: dhis2-db flyway baseline DB --version X [--description TEXT]'; exit "$DHIS2_EXIT_USAGE"; }
+    dhis2_cli_confirm "Baseline Flyway history for '$db' at version $version?" "$db"
+    # If the table does not exist yet, create it. If it exists and is
+    # empty, insert the baseline row. If it has rows, refuse.
+    local tbl; tbl=$(_flyway_table "$db")
+    if [[ -z "$tbl" ]]; then
+        dhis2_log_info "Creating flyway_schema_history and inserting baseline row"
+        dhis2_ansible_adhoc "$DB_HOST" shell -a "sudo -u postgres psql -X -d '$db' -c \"
+            CREATE TABLE IF NOT EXISTS flyway_schema_history (
+                installed_rank  integer NOT NULL,
+                version         varchar(50),
+                description     varchar(200) NOT NULL,
+                type            varchar(20) NOT NULL,
+                script          varchar(1000) NOT NULL,
+                checksum        integer,
+                installed_by    varchar(100) NOT NULL,
+                installed_on    timestamp DEFAULT now() NOT NULL,
+                execution_time  integer NOT NULL,
+                success         boolean NOT NULL,
+                CONSTRAINT flyway_schema_history_pk PRIMARY KEY (installed_rank)
+            );
+            CREATE INDEX IF NOT EXISTS flyway_schema_history_s_idx ON flyway_schema_history (success);
+            INSERT INTO flyway_schema_history
+                (installed_rank, version, description, type, script, installed_by, execution_time, success)
+            VALUES (0, '$version', '<< $description >>', 'BASELINE', '<< $description >>', current_user, 0, true);
+        \"" -b -o
+    else
+        local rows
+        rows=$(_flyway_run_sql "$db" "SELECT count(*) FROM $tbl")
+        if [[ "${rows:-0}" -gt 0 ]]; then
+            dhis2_log_error "Refusing to baseline: $db.$tbl already has $rows row(s). Investigate before overriding."
+            exit "$DHIS2_EXIT_SAFETY"
+        fi
+        dhis2_ansible_adhoc "$DB_HOST" shell -a "sudo -u postgres psql -X -d '$db' -c \"
+            INSERT INTO $tbl
+                (installed_rank, version, description, type, script, installed_by, execution_time, success)
+            VALUES (0, '$version', '<< $description >>', 'BASELINE', '<< $description >>', current_user, 0, true);
+        \"" -b -o
+    fi
+    dhis2_log_info "Baseline recorded. Verify with 'dhis2-db flyway info $db'."
+}
+
+_flyway_validate() {
+    local db="${1:-}"
+    [[ -z "$db" ]] && { dhis2_log_error 'Usage: dhis2-db flyway validate DB'; exit "$DHIS2_EXIT_USAGE"; }
+    local tbl; tbl=$(_flyway_require_table "$db")
+    local findings=0
+    # Check 1: non-success rows (same as `failed`).
+    local f
+    f=$(_flyway_run_sql "$db" "SELECT count(*) FROM $tbl WHERE success=false")
+    if [[ "${f:-0}" -gt 0 ]]; then
+        dhis2_c_yellow "warn"; printf '  %s failed row(s) in %s\n' "$f" "$tbl"
+        findings=$((findings+1))
+    fi
+    # Check 2: gaps in installed_rank.
+    local gaps
+    gaps=$(_flyway_run_sql "$db" "WITH r AS (SELECT installed_rank, lag(installed_rank) OVER (ORDER BY installed_rank) prev FROM $tbl) SELECT count(*) FROM r WHERE prev IS NOT NULL AND installed_rank <> prev + 1")
+    if [[ "${gaps:-0}" -gt 0 ]]; then
+        dhis2_c_yellow "warn"; printf '  %s gap(s) in installed_rank sequence\n' "$gaps"
+        findings=$((findings+1))
+    fi
+    # Check 3: duplicate versions.
+    local dupv
+    dupv=$(_flyway_run_sql "$db" "SELECT count(*) FROM (SELECT version FROM $tbl WHERE version IS NOT NULL GROUP BY version HAVING count(*) > 1) t")
+    if [[ "${dupv:-0}" -gt 0 ]]; then
+        dhis2_c_red "FAIL"; printf '  %s duplicate version(s) in %s - history is corrupt\n' "$dupv" "$tbl"
+        findings=$((findings+1))
+    fi
+    # Check 4: Flyway checksum columns look sane.
+    local nullc
+    nullc=$(_flyway_run_sql "$db" "SELECT count(*) FROM $tbl WHERE type IN ('SQL','JDBC') AND checksum IS NULL")
+    if [[ "${nullc:-0}" -gt 0 ]]; then
+        dhis2_c_yellow "warn"; printf '  %s SQL/JDBC row(s) have NULL checksum\n' "$nullc"
+        findings=$((findings+1))
+    fi
+    if (( findings == 0 )); then
+        dhis2_status_ok "OK"; echo " - Flyway history for $db looks consistent"
+        return 0
+    fi
+    dhis2_log_info "Full checksum validation against the WAR classpath requires the Flyway CLI with DHIS2 on the classpath; this command performs the subset of checks that can be answered from the database alone."
+    exit "$DHIS2_EXIT_PARTIAL"
+}
+
+_flyway_source_version() {
+    local db="${1:-}"
+    [[ -z "$db" ]] && { dhis2_log_error 'Usage: dhis2-db flyway source-version DB'; exit "$DHIS2_EXIT_USAGE"; }
+    local tbl; tbl=$(_flyway_table "$db")
+    if [[ -z "$tbl" ]]; then
+        if [[ "$DHIS2_OPT_JSON" == true ]]; then
+            dhis2_json_emit command=dhis2-db-flyway action=source-version database="$db" source="UNKNOWN" confidence=none
+        else
+            printf 'Source DHIS2 version: UNKNOWN (no flyway table found)\n'
+        fi
+        return 0
+    fi
+    local v
+    v=$(_flyway_run_sql "$db" "SELECT version FROM $tbl WHERE success=true ORDER BY installed_rank DESC LIMIT 1")
+    if [[ "$DHIS2_OPT_JSON" == true ]]; then
+        local conf; if [[ -n "$v" ]]; then conf=inferred; else conf=none; fi
+        dhis2_json_emit command=dhis2-db-flyway action=source-version database="$db" source="${v:-UNKNOWN}" confidence="$conf"
+    else
+        printf 'Source DHIS2 schema version: %s [INFERRED from %s]\n' "${v:-UNKNOWN}" "$tbl"
+    fi
+}
+
+#
+# -------- Session termination with grace --------
+#
+_kill_grace() {
+    local pid="${1:-}"; shift || true
+    local grace=15
+    while (( $# )); do case "$1" in --grace-seconds) grace="$2"; shift ;; --grace-seconds=*) grace="${1#*=}" ;; esac; shift || true; done
+    [[ -z "$pid" ]] && { dhis2_log_error 'Usage: dhis2-db kill-grace PID [--grace-seconds N]'; exit "$DHIS2_EXIT_USAGE"; }
+    dhis2_cli_confirm "Signal pg backend $pid: cancel, wait ${grace}s, then terminate if still alive?"
+    dhis2_ansible_adhoc "$DB_HOST" shell -a "
+        sudo -u postgres psql -X -tAc \"SELECT pg_cancel_backend($pid)\"
+        for i in \$(seq 1 $grace); do
+            alive=\$(sudo -u postgres psql -X -tAc \"SELECT count(*) FROM pg_stat_activity WHERE pid=$pid\")
+            [ \"\$alive\" = '0' ] && { echo cancelled-gracefully; exit 0; }
+            sleep 1
+        done
+        sudo -u postgres psql -X -tAc \"SELECT pg_terminate_backend($pid)\"
+        echo terminated-after-grace
+    " -b -o
+}
+
+#
+# -------- Analytics table rebuild tracking --------
+#
+_analytics_cmd() {
+    local sub="${1:-status}"; shift || true
+    local db="${1:-}"
+    [[ -z "$db" ]] && { dhis2_log_error 'Usage: dhis2-db analytics status DB'; exit "$DHIS2_EXIT_USAGE"; }
+    case "$sub" in
+        status)
+            # DHIS2 version drift means the table name varies. Try the
+            # modern name first, then the legacy name. Report whichever
+            # answers.
+            dhis2_ansible_adhoc "$DB_HOST" shell -a "sudo -u postgres psql -X -d '$db' -c \"
+                WITH candidates AS (
+                    SELECT 'analytics_tableupdates' AS t WHERE to_regclass('public.analytics_tableupdates') IS NOT NULL
+                    UNION ALL
+                    SELECT 'analytics_tablerebuild' AS t WHERE to_regclass('public.analytics_tablerebuild') IS NOT NULL
+                )
+                SELECT * FROM candidates;
+            \"" -b -o
+            dhis2_ansible_adhoc "$DB_HOST" shell -a "sudo -u postgres psql -X -d '$db' -c \"
+                SELECT 'analytics_tableupdates' AS table, * FROM analytics_tableupdates ORDER BY coalesce(enddate, startdate) DESC LIMIT 5
+            \" 2>/dev/null || true" -b -o
+            dhis2_log_info 'Column names vary by DHIS2 version. If this query returns an error for your version, the schema may use a different table.'
+            ;;
+        *) dhis2_log_error "Usage: dhis2-db analytics status DB"; exit "$DHIS2_EXIT_USAGE" ;;
+    esac
+}
+
+#
+# -------- PostgreSQL version probe (JSON) --------
+#
+_pg_version_json() {
+    local v
+    v=$(dhis2_ansible_adhoc "$DB_HOST" shell -a "sudo -u postgres psql -X -tAc 'SHOW server_version_num'" -b -o 2>&1 | tail -1 | awk '{print $NF}')
+    local vn="${v//[^0-9]/}"
+    local major
+    major=$(( ${vn:-0} / 10000 ))
+    if [[ "$DHIS2_OPT_JSON" == true ]]; then
+        dhis2_json_emit command=dhis2-db action=pg-version host="$DB_HOST" server_version_num="${vn:-0}" major="$major"
+    else
+        printf 'host:                %s\nserver_version_num:  %s\nmajor:               %s\n' "$DB_HOST" "${vn:-0}" "$major"
+    fi
 }
 
 main "$@"

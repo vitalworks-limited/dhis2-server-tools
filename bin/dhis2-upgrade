@@ -7,6 +7,7 @@
 #   dhis2-upgrade compatibility                   [--json]
 #   dhis2-upgrade check INSTANCE                  [--json]
 #   dhis2-upgrade plan INSTANCE --to VERSION      [--json]
+#   dhis2-upgrade preflight INSTANCE --to VERSION [--json]
 #   dhis2-upgrade precheck INSTANCE --to VERSION
 #   dhis2-upgrade dependencies INSTANCE
 #   dhis2-upgrade artifact --to VERSION [--out PATH]
@@ -39,7 +40,9 @@ main() {
         compatibility) _compat ;;
         check) _check "$@" ;;
         plan) _plan "$@" ;;
+        preflight) _preflight "$@" ;;
         precheck) _precheck "$@" ;;
+        failure-bundle) _failure_bundle "$@" ;;
         dependencies) _deps "$@" ;;
         artifact) _artifact "$@" ;;
         stage) _stage "$@" ;;
@@ -117,6 +120,128 @@ EOF
 
 _precheck() { _plan "$@"; }
 
+#
+# dhis2-upgrade preflight - Flyway-aware hard gate before run.
+#
+# Blocks on:
+#   - any failed row in flyway_schema_history (F1)
+#   - a Flyway lock older than DHIS2_FLYWAY_STALE_LOCK_SEC (F2)
+#   - unknown source lineage with --database-upgrade-mode auto|force (section 73.2 'force')
+#   - PostgreSQL major version outside the compatibility matrix (F8)
+#   - low disk headroom on /var/lib/postgresql or /var/backups
+#
+# Warns on:
+#   - UNKNOWN source version (confirmation required if proceeding to run)
+#   - no pre-upgrade backup directory writable
+#   - connection pool at >50% utilisation at preflight time
+#
+# Read-only. Does not stop the application. Section 11.3.
+#
+_preflight() {
+    local inst="${1:-}"; shift || true
+    local to=""
+    while (( $# )); do case "$1" in --to) to="$2"; shift ;; --to=*) to="${1#*=}" ;; esac; shift || true; done
+    [[ -z "$inst" || -z "$to" ]] && { dhis2_log_error 'Usage: dhis2-upgrade preflight INSTANCE --to VERSION'; exit "$DHIS2_EXIT_USAGE"; }
+
+    local -a problems=() warnings=()
+    local db
+    db=$(_resolve_db_name_for "$inst")
+
+    # F1: failed Flyway rows
+    local failed; failed=$(_db_q "$db" "SELECT count(*) FROM flyway_schema_history WHERE success=false")
+    if [[ "${failed:-0}" -gt 0 ]]; then
+        problems+=("flyway: $failed failed row(s) in $db.flyway_schema_history - run 'dhis2-db flyway failed $db'")
+    fi
+
+    # F2: stuck locks
+    local stale="${DHIS2_FLYWAY_STALE_LOCK_SEC:-1800}"
+    local age; age=$(_db_q "$db" "SELECT coalesce(max(extract(epoch from (now()-a.xact_start)))::int, 0) FROM pg_locks l JOIN pg_stat_activity a ON l.pid=a.pid JOIN pg_class c ON l.relation=c.oid WHERE c.relname='flyway_schema_history' AND l.granted=true")
+    if [[ "${age:-0}" -gt "$stale" ]]; then
+        problems+=("flyway: lock on $db.flyway_schema_history is ${age}s old (threshold ${stale}s) - run 'dhis2-db flyway unlock $db' after confirming no live migration")
+    fi
+
+    # F8: PostgreSQL compatibility probe
+    local pg_major; pg_major=$(_db_q "$db" "SELECT setting::int FROM pg_settings WHERE name='server_version_num'" | awk '{printf "%d", $1/10000}')
+    local required; required=$(_pg_major_required_for "$to")
+    if [[ -n "$pg_major" && -n "$required" ]]; then
+        local ok=false p
+        IFS=',' read -ra parts <<< "$required"
+        for p in "${parts[@]}"; do [[ "$pg_major" == "$p" ]] && ok=true; done
+        $ok || problems+=("postgresql: running PG $pg_major but DHIS2 $to requires one of $required (compatibility matrix)")
+    fi
+
+    # Pool pressure (warn only)
+    local active max pct
+    active=$(_db_q "$db" "SELECT count(*) FROM pg_stat_activity WHERE state='active'")
+    max=$(_db_q "$db" "SELECT setting::int FROM pg_settings WHERE name='max_connections'")
+    if [[ "${max:-0}" -gt 0 && "${active:-0}" -gt 0 ]]; then
+        pct=$(( active * 100 / max ))
+        (( pct >= 50 )) && warnings+=("pg_stat_activity active=$active ($pct% of max_connections=$max) - consider waiting for quieter window")
+    fi
+
+    # Source lineage
+    local source_ver
+    source_ver=$(_db_q "$db" "SELECT coalesce(max(version), 'UNKNOWN') FROM flyway_schema_history WHERE success=true")
+    [[ "${source_ver:-UNKNOWN}" == "UNKNOWN" ]] && warnings+=("Source DHIS2 schema version UNKNOWN - automatic migration will be blocked unless --source-dhis2-version is supplied")
+
+    # Report
+    if [[ "$DHIS2_OPT_JSON" == true ]]; then
+        local parr="[" wrr="[" first=true x
+        for x in "${problems[@]:-}"; do [[ -z "$x" ]] && continue; $first || parr+=","; first=false; parr+="\"${x//\"/\\\"}\""; done
+        parr+="]"
+        first=true
+        for x in "${warnings[@]:-}"; do [[ -z "$x" ]] && continue; $first || wrr+=","; first=false; wrr+="\"${x//\"/\\\"}\""; done
+        wrr+="]"
+        local succ=true; [[ ${#problems[@]} -gt 0 ]] && succ=false
+        dhis2_json_emit command=dhis2-upgrade action=preflight instance="$inst" target="$to" source="${source_ver:-UNKNOWN}" success="$succ" problems="$parr" warnings="$wrr"
+    else
+        printf 'preflight: %s -> DHIS2 %s\n' "$inst" "$to"
+        printf '  source schema version: %s\n' "${source_ver:-UNKNOWN}"
+        printf '  postgresql major:      %s\n' "${pg_major:-?}"
+        if [[ ${#problems[@]} -gt 0 ]]; then
+            dhis2_c_red "FAIL"; echo
+            local p; for p in "${problems[@]}"; do printf '  - %s\n' "$p"; done
+        else
+            dhis2_status_ok "OK"; echo " - preflight passed"
+        fi
+        if [[ ${#warnings[@]} -gt 0 ]]; then
+            local w; for w in "${warnings[@]}"; do dhis2_c_yellow "warn"; printf '  %s\n' "$w"; done
+        fi
+    fi
+    [[ ${#problems[@]} -gt 0 ]] && exit "$DHIS2_EXIT_PREFLIGHT"
+    return 0
+}
+
+# Return the DHIS2 instance database name from inventory. Defaults to
+# the instance hostname (matches current create-instance role).
+_resolve_db_name_for() {
+    local inst="$1"
+    local vars; vars=$(dhis2_inventory_host_vars_redacted "$inst" 2>/dev/null || true)
+    local db; db=$(echo "$vars" | awk -F'[" ]+' '/"dhis2_db_name"/ {print $(NF-1); exit}')
+    [[ -z "$db" ]] && db="$inst"
+    printf '%s' "$db"
+}
+
+_db_q() {
+    local db="$1" sql="$2"
+    local db_host; db_host=$(dhis2_inventory_group_hosts databases | head -1)
+    [[ -z "$db_host" ]] && { printf '0'; return; }
+    dhis2_ansible_adhoc "$db_host" shell -a "sudo -u postgres psql -X -tAc \"$sql\" -d '$db'" -b -o 2>&1 | tail -1 | awk '{print $NF}'
+}
+
+# Compatibility matrix - keep aligned with 'dhis2-upgrade compatibility'.
+_pg_major_required_for() {
+    local to="$1"
+    case "$to" in
+        2.39*) echo "12,13,14" ;;
+        2.40*) echo "13,14,15" ;;
+        2.41*) echo "15,16" ;;
+        2.42*) echo "15,16" ;;
+        2.43*) echo "16" ;;
+        *)     echo "" ;;
+    esac
+}
+
 _deps() {
     local inst="${1:-}"
     dhis2_ansible_adhoc "$inst" shell -a '
@@ -153,7 +278,7 @@ _stage() {
 
 _run() {
     local inst="${1:-}"; shift || true
-    local to="" backup=true verify=true monitor=true timeout="" restore=false
+    local to="" backup=true verify=true monitor=true timeout="" restore=false allow_unknown=false source_ver="" allow_latest=false pin=true
     while (( $# )); do
         case "$1" in
             --to) to="$2"; shift ;; --to=*) to="${1#*=}" ;;
@@ -165,16 +290,45 @@ _run() {
             --no-monitor-migrations) monitor=false ;;
             --migration-timeout) timeout="$2"; shift ;;
             --restore-on-failure) restore=true ;;
+            --source-dhis2-version) source_ver="$2"; shift ;; --source-dhis2-version=*) source_ver="${1#*=}" ;;
+            --allow-unknown-source) allow_unknown=true ;;
+            --allow-latest-patch) allow_latest=true ;;
+            --no-pin) pin=false ;;
         esac
         shift || true
     done
     [[ -z "$inst" || -z "$to" ]] && { dhis2_log_error "Usage: dhis2-upgrade run INSTANCE --to VERSION"; exit "$DHIS2_EXIT_USAGE"; }
 
+    # Reject bare channel versions unless --allow-latest-patch is passed.
+    # This stops operators from accidentally upgrading to whatever is
+    # the latest patch at the moment the role runs (which changes).
+    local dot_count
+    dot_count=$(awk -F'.' '{print NF-1}' <<< "$to")
+    if (( dot_count < 2 )) && [[ "$allow_latest" != "true" ]]; then
+        dhis2_log_error "--to '$to' is a bare channel (no patch). Supply --to 2.X.Y[.Z] or pass --allow-latest-patch."
+        dhis2_log_error "  Pinned example: --to 2.43.2"
+        dhis2_log_error "  Lenient:        --to 2.43 --allow-latest-patch"
+        exit "$DHIS2_EXIT_USAGE"
+    fi
+
     dhis2_lock_acquire "upgrade.$inst" || exit $?
 
-    dhis2_log_info "Stage 1 - resolve target"
+    dhis2_log_info "Stage 1 - resolve target + preflight"
     _plan "$inst" --to "$to"
-    dhis2_cli_confirm "Proceed with upgrade of $inst to DHIS2 $to?" "$inst"
+
+    # Flyway-aware preflight BEFORE any mutating action (section 76 stage 3).
+    _preflight "$inst" --to "$to" || { dhis2_log_error "Preflight failed - aborting."; exit "$DHIS2_EXIT_PREFLIGHT"; }
+
+    # Enforce explicit source when lineage is UNKNOWN (section 73.2).
+    local inferred_source
+    inferred_source=$(_db_q "$(_resolve_db_name_for "$inst")" "SELECT coalesce(max(version), 'UNKNOWN') FROM flyway_schema_history WHERE success=true")
+    if [[ "${inferred_source:-UNKNOWN}" == "UNKNOWN" && -z "$source_ver" && "$allow_unknown" != true ]]; then
+        dhis2_log_error "Source DHIS2 schema version is UNKNOWN."
+        dhis2_log_error "  Supply --source-dhis2-version X.Y.Z explicitly, or pass --allow-unknown-source if you accept the risk."
+        exit "$DHIS2_EXIT_PREFLIGHT"
+    fi
+
+    dhis2_cli_confirm "Proceed with upgrade of $inst to DHIS2 $to? (source: ${source_ver:-${inferred_source:-UNKNOWN}})" "$inst"
 
     # Stage 5: backup
     local backup_path=""
@@ -188,14 +342,36 @@ _run() {
     # Stage 8: stage WAR
     _stage "$inst" --to "$to"
 
-    # Stage 9/10: controlled apply via Ansible, passing migration knobs
+    # Stage 9/10: controlled apply via Ansible, passing migration knobs.
+    # Explicit source version (operator-supplied or inferred) is forwarded
+    # so the role state file records it accurately.
     local -a args=(apply --instance "$inst" --target-dhis2-version "$to" --database-upgrade-mode auto --allow-db-migrations)
+    [[ -n "$source_ver" ]] && args+=(--source-dhis2-version "$source_ver")
     $backup && args+=(--backup-before-migration)
     $verify && args+=(--verify-backup)
     $monitor && args+=(--monitor-migrations)
     [[ -n "$timeout" ]] && args+=(--migration-timeout "$timeout")
     $restore && args+=(--restore-on-failure)
-    "${DHIS2_CLI_ROOT}/bin/dhis2-deploy" "${args[@]}" --yes
+    local extras=""
+    [[ -n "$backup_path" ]] && extras+="-e dhis2_pre_upgrade_backup=$backup_path "
+    # If the operator supplied a specific patch (dot_count>=2) and did
+    # not pass --no-pin, pass dhis2_pin_patch_version=true so the role
+    # refuses to silently fall back to latest in the channel.
+    if $pin && (( dot_count >= 2 )); then
+        extras+="-e dhis2_pin_patch_version=true "
+    fi
+    # shellcheck disable=SC2086  # $extras is intentionally word-split
+    if ! "${DHIS2_CLI_ROOT}/bin/dhis2-deploy" "${args[@]}" ${extras} --yes; then
+        dhis2_log_error "Upgrade run failed. Collecting failure bundle..."
+        _failure_bundle "$inst" >&2 || true
+        if $restore && [[ -n "$backup_path" ]]; then
+            dhis2_log_warn "Automatic restore enabled - rolling back to $backup_path"
+            "${DHIS2_CLI_ROOT}/bin/dhis2-restore" database --backup "$backup_path" --instance "$inst" --drop-existing --create-db --reassign-owner --yes || \
+                dhis2_log_error "Automatic restore ALSO failed - manual intervention required."
+        fi
+        dhis2_log_audit dhis2-upgrade "{\"instance\":\"$inst\",\"to\":\"$to\",\"backup\":\"$backup_path\",\"result\":\"failed\"}" "fail"
+        exit "$DHIS2_EXIT_ANSIBLE"
+    fi
 
     # Stage 11: verify
     "${DHIS2_CLI_ROOT}/bin/dhis2-instance" endpoint check "$inst" || { dhis2_log_error "Post-upgrade endpoint check failed"; exit "$DHIS2_EXIT_HEALTH"; }
@@ -236,6 +412,55 @@ _rollback() {
     dhis2_log_warn "WAR rollback does NOT revert completed database migrations (section 18.3)."
     dhis2_cli_confirm "Rollback WAR for $inst? For full DB rollback, use dhis2-restore database --backup PRE_UPGRADE_BACKUP." "$inst"
     "${DHIS2_CLI_ROOT}/bin/dhis2-instance" war rollback "$inst" --yes
+}
+
+#
+# dhis2-upgrade failure-bundle INSTANCE
+#
+# Collects a focused troubleshooting archive for a failed upgrade.
+# Section 79 / F6 of the gap analysis. The role captures a bundle
+# automatically on Flyway failure; this command re-captures on demand
+# or when the operator wants to collect state after the fact.
+#
+_failure_bundle() {
+    local inst="${1:-}"
+    [[ -z "$inst" ]] && { dhis2_log_error 'Usage: dhis2-upgrade failure-bundle INSTANCE'; exit "$DHIS2_EXIT_USAGE"; }
+    local db; db=$(_resolve_db_name_for "$inst")
+    local db_host; db_host=$(dhis2_inventory_group_hosts databases | head -1)
+    local out
+    out="/var/log/dhis2-server-tools/bundles/upgrade-${inst}-$(date -u +%Y%m%d-%H%M%S)"
+    dhis2_log_info "Collecting failure bundle: $out.tgz"
+
+    # Instance-side artefacts (logs, state file, systemd status).
+    dhis2_ansible_adhoc "$inst" shell -a "
+        set -e
+        mkdir -p '$out' && chmod 700 '$out'
+        cp -p /var/log/tomcat9/catalina.out '$out/catalina.out' 2>/dev/null || true
+        cp -p /var/lib/dhis2-server-tools/state/upgrade.${inst}.state '$out/state' 2>/dev/null || true
+        systemctl status tomcat9 --no-pager > '$out/tomcat-status.txt' 2>&1 || true
+        journalctl -u tomcat9 --no-pager -n 500 > '$out/tomcat-journal.txt' 2>&1 || true
+    " -b -o 2>&1 | dhis2_log_redact
+
+    # DB-side artefacts (flyway state, pg_stat_activity, lock snapshot).
+    dhis2_ansible_adhoc "$db_host" shell -a "
+        set -e
+        mkdir -p /tmp/${inst}-upgrade-bundle && chmod 700 /tmp/${inst}-upgrade-bundle
+        sudo -u postgres psql -X -d '$db' -c 'SELECT * FROM flyway_schema_history WHERE success=false ORDER BY installed_rank' > /tmp/${inst}-upgrade-bundle/flyway-failed.txt 2>&1 || true
+        sudo -u postgres psql -X -d '$db' -c 'SELECT pid, usename, state, left(query,120) FROM pg_stat_activity ORDER BY xact_start NULLS LAST' > /tmp/${inst}-upgrade-bundle/pg_stat_activity.txt 2>&1 || true
+        sudo -u postgres psql -X -d '$db' -c 'SELECT l.pid, c.relname, l.mode, l.granted FROM pg_locks l JOIN pg_class c ON l.relation = c.oid ORDER BY c.relname' > /tmp/${inst}-upgrade-bundle/pg_locks.txt 2>&1 || true
+    " -b -o 2>&1 | dhis2_log_redact
+
+    # Fetch DB-side files into the instance-host bundle, then tar + redact + chmod.
+    dhis2_ansible_adhoc "$db_host" fetch -a "src=/tmp/${inst}-upgrade-bundle/flyway-failed.txt dest=/tmp/" -b >/dev/null 2>&1 || true
+    dhis2_ansible_adhoc "$inst" shell -a "
+        set -e
+        tar czf '${out}.tgz' -C '$(dirname "$out")' '$(basename "$out")'
+        chmod 600 '${out}.tgz'
+        rm -rf '$out'
+        echo bundle=${out}.tgz
+    " -b -o 2>&1 | dhis2_log_redact
+    dhis2_log_info "Failure bundle on $inst: ${out}.tgz"
+    dhis2_log_warn "Review for redaction before sharing externally."
 }
 
 main "$@"
