@@ -75,6 +75,33 @@ rsync -a --delete \
 mkdir -p /etc/dhis2-server-tools /var/log/dhis2-server-tools /var/lib/dhis2-server-tools
 chmod 750 /etc/dhis2-server-tools /var/log/dhis2-server-tools /var/lib/dhis2-server-tools
 
+# Install logrotate for CLI audit + bundle growth (section 30).
+if [[ -d /etc/logrotate.d && $EUID -eq 0 ]]; then
+    cat >/etc/logrotate.d/dhis2-server-tools <<'EOF'
+/var/log/dhis2-server-tools/*.log /var/log/dhis2-server-tools/*.ndjson {
+    weekly
+    rotate 12
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+    create 0640 root root
+}
+
+/var/log/dhis2-server-tools/bundles/*.tgz {
+    monthly
+    rotate 6
+    missingok
+    notifempty
+    nocreate
+    nocompress
+}
+EOF
+    chmod 0644 /etc/logrotate.d/dhis2-server-tools
+    echo "  installed /etc/logrotate.d/dhis2-server-tools (weekly audit rotation, 12-week retention)"
+fi
+
 # Ensure executable bits on bin/.
 chmod -R a+rX "$PREFIX"
 find "$PREFIX/bin" -type f -exec chmod 0755 {} +

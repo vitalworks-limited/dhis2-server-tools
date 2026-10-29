@@ -20,9 +20,14 @@
 #   dhis2-doctor snapshot                     (operational state snapshot)
 #   dhis2-doctor compare SNAP_A SNAP_B
 #   dhis2-doctor bundle --out PATH            (shortcut for dhis2-logs bundle)
+#   dhis2-doctor fix [--yes]                  (low-risk auto-corrections)
+#   dhis2-doctor --fix                        (same)
 #
 # All checks are read-only unless --fix is passed; only well-understood
-# low-risk fixes are applied with --fix (section 23.2).
+# low-risk fixes are applied with --fix (section 23.2):
+#   chmod 0640 on dhis.conf, 0600 on vault files + inventory,
+#   chmod +x on bin/dhis2-* scripts, 0700 on /opt/ansible/secrets.
+# No firewall, SSH, DB, or TLS changes are auto-applied.
 # USAGE_END
 set -Eeuo pipefail
 . "$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")/.." && pwd)/lib/common.sh"
@@ -42,11 +47,13 @@ main() {
         case "$1" in
             --quick) scope=quick ;;
             --full) scope=full ;;
+            --fix|fix) scope="fix" ;;
             network|database|proxy|memory|config|storage|services|tls|backup|upgrade-readiness|snapshot|compare|bundle|instance) scope="$1"; shift || true; extra_arg="${1:-}" ;;
             --help|-h|help) dhis2_cli_show_help "$0"; exit 0 ;;
         esac
     fi
     case "$scope" in
+        fix) _fix; return ;;
         quick) _controller; _inventory_check ;;
         full|all) _controller; _inventory_check; _network; _services; _database; _proxy; _memory; _tls; _backup; _config ;;
         network) _network ;;
@@ -286,6 +293,107 @@ _compare() {
     local a="$1" b="$2"
     [[ -z "$a" || -z "$b" ]] && { dhis2_log_error "Usage: dhis2-doctor compare SNAP_A SNAP_B"; exit "$DHIS2_EXIT_USAGE"; }
     diff -ruN "$a" "$b" | dhis2_log_redact
+}
+
+#
+# dhis2-doctor fix / --fix - low-risk auto-corrections only.
+#
+# What it will do:
+#   - chmod 0640 /opt/dhis2/dhis.conf on every instance host (idempotent)
+#   - chmod 0600 on every vault-encrypted file under deploy/
+#   - chmod 0600 on the controller inventory file
+#   - chmod +x on every bin/dhis2-* script that is readable but not executable
+#   - chmod 0700 on /opt/ansible/secrets if it exists
+#
+# What it will NOT do (section 23.2):
+#   - any firewall change
+#   - any SSH config change
+#   - any database write
+#   - any TLS artefact change
+#   - anything that could lock an operator out
+#
+# Always shows the diff first. Requires --yes to apply, otherwise
+# prints "would apply" lines and exits 0.
+#
+_fix() {
+    dhis2_c_bold "Low-risk auto-fixes (section 23.2)"; echo
+    local apply=false
+    [[ "${DHIS2_OPT_YES:-false}" == true ]] && apply=true
+
+    local inst
+    for inst in $(dhis2_inventory_group_hosts instances); do
+        [[ -z "$inst" ]] && continue
+        local m
+        m=$(dhis2_ansible_adhoc "$inst" shell -a "stat -c '%a' /opt/dhis2/dhis.conf 2>/dev/null" -b -o 2>&1 | tail -1 | awk '{print $NF}')
+        if [[ -n "$m" && "$m" != "640" ]]; then
+            if $apply; then
+                dhis2_ansible_adhoc "$inst" file -a "path=/opt/dhis2/dhis.conf mode=0640 owner=root group=tomcat" -b >/dev/null 2>&1 || true
+                _record_ok "fix: $inst /opt/dhis2/dhis.conf chmod 0640 (was $m)"
+            else
+                _record_warn "would fix: $inst /opt/dhis2/dhis.conf chmod 0640 (was $m)"
+            fi
+        fi
+    done
+
+    # Vault files on controller
+    local vp="/opt/ansible/secrets/vault_pass"
+    if [[ -f "$vp" ]]; then
+        local m; m=$(stat -c '%a' "$vp" 2>/dev/null || stat -f '%A' "$vp" 2>/dev/null)
+        if [[ -n "$m" && "$m" != "600" ]]; then
+            if $apply; then chmod 600 "$vp" && _record_ok "fix: $vp chmod 0600 (was $m)"
+            else _record_warn "would fix: $vp chmod 0600 (was $m)"
+            fi
+        fi
+    fi
+    local deploy_dir; deploy_dir=$(dhis2_config_deploy_dir)
+    local f
+    while IFS= read -r f; do
+        [[ -z "$f" ]] && continue
+        local m; m=$(stat -c '%a' "$f" 2>/dev/null || stat -f '%A' "$f" 2>/dev/null)
+        if [[ -n "$m" && "$m" != "600" ]]; then
+            if $apply; then chmod 600 "$f" && _record_ok "fix: $f chmod 0600 (was $m)"
+            else _record_warn "would fix: $f chmod 0600 (was $m)"
+            fi
+        fi
+    done < <(grep -rlE '^\$ANSIBLE_VAULT' "$deploy_dir" 2>/dev/null)
+
+    # Inventory file
+    local inv; inv=$(dhis2_config_resolve_inventory)
+    if [[ -f "$inv" ]]; then
+        local m; m=$(stat -c '%a' "$inv" 2>/dev/null || stat -f '%A' "$inv" 2>/dev/null)
+        if [[ -n "$m" && "$m" != "600" ]]; then
+            if $apply; then chmod 600 "$inv" && _record_ok "fix: $inv chmod 0600 (was $m)"
+            else _record_warn "would fix: $inv chmod 0600 (was $m)"
+            fi
+        fi
+    fi
+
+    # Executable bits on bin/
+    local b
+    for b in "${DHIS2_CLI_ROOT}/bin/"dhis2-*; do
+        [[ -e "$b" ]] || continue
+        if [[ ! -x "$b" ]]; then
+            if $apply; then chmod +x "$b" && _record_ok "fix: $b chmod +x"
+            else _record_warn "would fix: $b chmod +x"
+            fi
+        fi
+    done
+
+    # Secrets dir permissions
+    local sdir="/opt/ansible/secrets"
+    if [[ -d "$sdir" ]]; then
+        local m; m=$(stat -c '%a' "$sdir" 2>/dev/null || stat -f '%A' "$sdir" 2>/dev/null)
+        if [[ -n "$m" && "$m" != "700" ]]; then
+            if $apply; then chmod 700 "$sdir" && _record_ok "fix: $sdir chmod 0700 (was $m)"
+            else _record_warn "would fix: $sdir chmod 0700 (was $m)"
+            fi
+        fi
+    fi
+
+    if ! $apply; then
+        dhis2_log_info "Dry-run only. Re-run with --yes to apply."
+    fi
+    _summary
 }
 
 main "$@"
