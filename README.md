@@ -30,7 +30,16 @@ Table of contents
 ## Introduction 
 This is a quick DHIS2 install guide using [ansible](https://www.ansible.com/). At the end, you will have
 one or more dhis2 instances running, configured with postgreSQL database and
-nginx or apache2 proxy. Out of the box, you'll benefit from comprehensive application and server resource monitoring with Glowroot APM (Application Performance Monitoring) and a Munin instance. 
+nginx or apache2 proxy. Out of the box, you'll benefit from comprehensive application and server resource monitoring with Glowroot APM (Application Performance Monitoring) and a Munin instance.
+
+> **Operator CLI:** a `dhis2-*` command family is also available, built on top of the same
+> Ansible roles. It adds preflight, planning, lifecycle, backup, restore,
+> upgrade, diagnostics, and security commands with safety gates and
+> machine-readable output. The direct `deploy.sh` / `ansible-playbook`
+> workflows below continue to work unchanged. See [docs/CLI.md](docs/CLI.md)
+> and [docs/Migration-to-CLI.md](docs/Migration-to-CLI.md).
+>
+> Install:  `sudo ./install.sh`  →  `dhis2-status`  `dhis2-doctor --quick`
 
 At the moment, the tools support two deployment architectures:
 - [Installation with LXD containers](#installation-with-lxd-containers) (single server)
