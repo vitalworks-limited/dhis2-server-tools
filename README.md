@@ -271,13 +271,62 @@ application points at an older DHIS2 database:
 | `auto`    | Full controlled workflow: compat check → verified backup → stage WAR → monitored start. |
 | `force`   | Break-glass; requires `--yes` and still creates a backup by default. |
 
-Flyway progress is monitored during the controlled start; a Flyway
-error, a disk-full event, or a timeout fails the task with
-operator-ready recovery guidance. A failed upgrade **cannot** be
-reported as success.
+Flyway progress is monitored during the controlled start — the role
+polls `flyway_schema_history` and reports the currently-running
+migration in the state file. A Flyway error, a stuck lock, a disk-full
+event, or a timeout fails the task with operator-ready recovery
+guidance and a focused diagnostic bundle (failing migration SQL +
+pg_stat_activity + logs). A failed upgrade **cannot** be reported as
+success.
 
-Full policy, workflow, and no-regression guarantees:
-[docs/CLI-Upgrades.md](./docs/CLI-Upgrades.md).
+### Per-host version pinning
+
+Each host's `dhis2_version` can be:
+
+- `2.43` — latest patch of the 2.43 channel (auto-advance semantics)
+- `"2.43.2"` — pin to patch 2.43.2 exactly
+- `"2.43.2.1"` — pin to a specific sub-patch
+
+Add `dhis2_pin_patch_version=true` to a host to make a pin **strict**:
+the deployment fails if that exact patch is not in `releases.json`,
+preventing silent drift to "latest" on upgrade of
+`releases.dhis2.org`. Full precedence rules:
+[docs/CLI-Version-Pinning.md](./docs/CLI-Version-Pinning.md).
+
+CLI helpers:
+
+```bash
+dhis2-instance set-version     hmis "2.43.2" --pin
+dhis2-instance resolve-version hmis
+dhis2-upgrade  run             hmis --to 2.43.2    # patch required by default
+```
+
+Pre-flight hard gates (blocks `run` before any mutating step):
+
+```bash
+dhis2-upgrade preflight hmis --to 2.43.2
+```
+
+Blocks on prior failed Flyway rows, stuck Flyway locks (default
+threshold 1800s), PostgreSQL major-version incompatibility, and
+UNKNOWN source lineage unless `--source-dhis2-version X.Y.Z` or
+`--allow-unknown-source` is supplied.
+
+Direct Flyway introspection and recovery:
+
+```bash
+dhis2-db flyway info     hmis
+dhis2-db flyway failed   hmis           # exit 6 if any failed rows
+dhis2-db flyway locks    hmis
+dhis2-db flyway unlock   hmis           # clear stuck lock, confirmation required
+dhis2-db flyway repair   hmis           # delete failed rows, confirmation required
+dhis2-db flyway baseline hmis --version 2.40
+dhis2-upgrade failure-bundle hmis       # on-demand focused diagnostic archive
+```
+
+Full policy, workflow, failure runbook, and no-regression guarantees:
+[docs/CLI-Upgrades.md](./docs/CLI-Upgrades.md) +
+[docs/CLI-Flyway-Operations.md](./docs/CLI-Flyway-Operations.md).
 
 ### Diagnostics and status
 
@@ -585,6 +634,8 @@ the generated `tests/regression/last-run.md`.
 - [docs/CLI.md](./docs/CLI.md) — command index, options, exit codes
 - [docs/CLI-Configuration-Preservation.md](./docs/CLI-Configuration-Preservation.md) — dhis.conf and PostgreSQL preservation
 - [docs/CLI-Upgrades.md](./docs/CLI-Upgrades.md) — controlled upgrade workflow and database upgrade policy
+- [docs/CLI-Version-Pinning.md](./docs/CLI-Version-Pinning.md) — per-host DHIS2 patch pinning (strict vs lenient)
+- [docs/CLI-Flyway-Operations.md](./docs/CLI-Flyway-Operations.md) — Flyway inspection, failure recovery, baseline, upgrade preflight
 - [docs/CLI-Testing.md](./docs/CLI-Testing.md) — the three-tier test strategy
 - [docs/Migration-to-CLI.md](./docs/Migration-to-CLI.md) — equivalences between legacy commands and the CLI
 - [docs/Compatibility.md](./docs/Compatibility.md) — no-regression guarantees
@@ -629,6 +680,7 @@ the generated `tests/regression/last-run.md`.
 ### Design reference
 
 - [docs/vital-enhancements/dhis2-server-tools-implementation-requirements-regenerated.md](./docs/vital-enhancements/dhis2-server-tools-implementation-requirements-regenerated.md) — the implementation requirements that drove the CLI design
+- [docs/vital-enhancements/gap-analysis-flyway-and-beyond.md](./docs/vital-enhancements/gap-analysis-flyway-and-beyond.md) — Flyway failure modes and the hardening they drove
 
 ---
 

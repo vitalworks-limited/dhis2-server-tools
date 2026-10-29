@@ -170,21 +170,80 @@ _backup() {
 }
 
 _config() {
+    # Cross-check inventory desired state vs observed state on each
+    # managed host. Section 23 / 57.14. Sensitive values are never
+    # displayed - only consistency is reported.
     dhis2_c_bold "Config consistency"; echo
     local inv; inv=$(dhis2_config_resolve_inventory)
     local fqdn; fqdn=$(awk -F= '/^[[:space:]]*fqdn[[:space:]]*=/ {gsub(/[[:space:]]/,"",$2); print $2; exit}' "$inv")
     [[ -n "$fqdn" ]] && _record_ok "fqdn set in inventory: $fqdn" || _record_warn "fqdn is empty (self-signed TLS will be used)"
     local inst; inst=$(dhis2_inventory_group_hosts instances)
+    local proxy_host; proxy_host=$(dhis2_inventory_group_hosts web | head -1)
     local i
     for i in $inst; do
         local vars; vars=$(dhis2_inventory_host_vars_redacted "$i")
+
+        # database_host must resolve to a real inventory host
         local dbhost; dbhost=$(echo "$vars" | awk -F'[" ]+' '/"database_host"/ {print $(NF-1); exit}')
         if dhis2_inventory_hosts | grep -qx "${dbhost:-__none__}"; then
             _record_ok "instance $i database_host=$dbhost resolves"
         else
             _record_fail "instance $i database_host=$dbhost does not resolve in inventory"
         fi
+
+        # server.base.url (if set) should match inventory fqdn + base path
+        local base_path; base_path=$(echo "$vars" | awk -F'[" ]+' '/"dhis2_base_path"/ {print $(NF-1); exit}')
+        [[ -z "$base_path" ]] && base_path="$i"
+        local expected_url=""
+        [[ -n "$fqdn" ]] && expected_url="https://${fqdn}/${base_path}"
+        if command -v ansible >/dev/null 2>&1; then
+            local observed_base
+            observed_base=$(dhis2_ansible_adhoc "$i" shell -a "grep -E '^[[:space:]]*server\.base\.url' /opt/dhis2/dhis.conf 2>/dev/null | head -1 | sed -E 's/.*=[[:space:]]*//'" -b -o 2>&1 | tail -1 | tr -d '[:space:]')
+            if [[ -n "$observed_base" ]]; then
+                if [[ -n "$expected_url" && "$observed_base" != "${expected_url%/}" && "$observed_base" != "$expected_url" ]]; then
+                    _record_warn "instance $i server.base.url=${observed_base} but inventory expects ${expected_url}"
+                else
+                    _record_ok "instance $i server.base.url matches inventory"
+                fi
+            fi
+
+            # connection.url should contain the inventory database_host
+            local connection_matches
+            connection_matches=$(dhis2_ansible_adhoc "$i" shell -a "grep -c '^connection.url.*${dbhost}' /opt/dhis2/dhis.conf 2>/dev/null || echo 0" -b -o 2>&1 | tail -1 | awk '{print $NF}')
+            if [[ "${connection_matches:-0}" -ge 1 ]]; then
+                _record_ok "instance $i connection.url references ${dbhost}"
+            else
+                _record_warn "instance $i connection.url does not reference inventory database_host=${dbhost} (secret-safe check)"
+            fi
+        fi
+
+        # TLS certificate SAN should include the FQDN
+        if [[ -n "$fqdn" && -n "$proxy_host" ]] && command -v ansible >/dev/null 2>&1; then
+            local san_match
+            san_match=$(dhis2_ansible_adhoc "$proxy_host" shell -a "
+                set -eo pipefail
+                for cert in /etc/letsencrypt/live/*/fullchain.pem /etc/ssl/dhis/*.crt; do
+                    [ -f \"\$cert\" ] || continue
+                    openssl x509 -in \"\$cert\" -noout -ext subjectAltName 2>/dev/null | grep -o '${fqdn}' | head -1
+                done | head -1
+            " -b -o 2>&1 | tail -1 | awk '{print $NF}')
+            if [[ "$san_match" == "$fqdn" ]]; then
+                _record_ok "TLS cert on $proxy_host includes SAN $fqdn"
+            else
+                _record_warn "TLS cert on $proxy_host does NOT include SAN $fqdn - users may see cert errors"
+            fi
+        fi
     done
+
+    # Monitoring target cross-check
+    local mon_host; mon_host=$(dhis2_inventory_group_hosts monitoring | head -1)
+    if [[ -n "$mon_host" ]]; then
+        local mon_setting
+        mon_setting=$(awk -F= '/^[[:space:]]*server_monitoring[[:space:]]*=/ {gsub(/[[:space:]]/,"",$2); print $2; exit}' "$inv")
+        [[ -n "$mon_setting" ]] \
+            && _record_ok "monitoring host $mon_host configured for stack '$mon_setting'" \
+            || _record_warn "monitoring host $mon_host present but server_monitoring is empty"
+    fi
 }
 
 _storage() {
