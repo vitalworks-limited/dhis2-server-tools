@@ -133,8 +133,10 @@ jobs:
       - name: Install ansible-core and the project's collections
         run: |
           python -m pip install --upgrade pip
-          pip install ansible==10.7.0
+          pip install ansible==10.7.0 pytest netaddr
           ansible-galaxy collection install community.general community.postgresql ansible.posix
+      - name: Run pytest unit tests
+        run: python -m pytest tests/unit -v
       - name: Run regression scenarios in mock mode
         run: bash tests/regression/run_scenarios.sh
       - name: Upload regression report

@@ -407,12 +407,14 @@ scenario_Y() {
 }
 
 scenario_Z() {
-    # Scenario Z - unknown source blocks automatic migration
-    # The monitor-migrations task records "unknown" when dhis2_source_version is not set
-    if grep -q "dhis2_source_version | default('unknown')" "$ROOT/deploy/roles/create-instance/tasks/monitor-migrations.yml"; then
-        _rec Z "unknown source version recorded as 'unknown'" mock PASS "monitor task records unknown lineage"
+    # Scenario Z - unknown source blocks automatic migration.
+    # The monitor-migrations task records "UNKNOWN" when neither
+    # dhis2_source_version nor a flyway_schema_history row is available.
+    if grep -q "default('UNKNOWN')" "$ROOT/deploy/roles/create-instance/tasks/monitor-migrations.yml" \
+       && grep -q "source_version_confidence" "$ROOT/deploy/roles/create-instance/tasks/monitor-migrations.yml"; then
+        _rec Z "unknown source version recorded with confidence" mock PASS "monitor task records UNKNOWN lineage + confidence"
     else
-        _rec Z "unknown source version recorded as 'unknown'" mock FAIL "no unknown handling"
+        _rec Z "unknown source version recorded with confidence" mock FAIL "no unknown handling"
     fi
 }
 
@@ -472,6 +474,143 @@ scenario_AE() {
     fi
 }
 
+# ---------- Flyway hardening (gap analysis F1-F10) ----------
+
+scenario_AF() {
+    # F1 - dhis2-db flyway info / failed must exist and query flyway_schema_history.
+    # The CLI resolves the actual table name at runtime (flyway_schema_history
+    # or the legacy schema_version), so we grep for either direct references
+    # to the table or the dynamic resolver function.
+    if grep -q '_flyway_info' "$BIN/dhis2-db" \
+       && grep -q 'flyway_schema_history\|_flyway_table' "$BIN/dhis2-db" \
+       && grep -q 'success=false' "$BIN/dhis2-db"; then
+        _rec AF "dhis2-db flyway failed-row gate" mock PASS "query against flyway_schema_history is wired"
+    else
+        _rec AF "dhis2-db flyway failed-row gate" mock FAIL "no flyway history query found"
+    fi
+    # Role must refuse to start when failed rows exist
+    if grep -q 'Flyway history for' "$ROOT/deploy/roles/create-instance/tasks/monitor-migrations.yml" \
+       && grep -q 'Refuse start when prior Flyway failures exist' "$ROOT/deploy/roles/create-instance/tasks/monitor-migrations.yml"; then
+        _rec AF2 "role refuses start on failed rows" mock PASS "pre-start fail task present"
+    else
+        _rec AF2 "role refuses start on failed rows" mock FAIL "pre-start fail task missing"
+    fi
+}
+
+scenario_AG() {
+    # F2 - stale Flyway lock detection in both CLI preflight and role
+    if awk '/^_preflight\(\)/,/^}/' "$BIN/dhis2-upgrade" | grep -q 'extract(epoch from (now()-a.xact_start))'; then
+        _rec AG "upgrade preflight detects stale Flyway locks" mock PASS "lock-age query present"
+    else
+        _rec AG "upgrade preflight detects stale Flyway locks" mock FAIL "lock-age query missing"
+    fi
+    if grep -q 'Detect stuck Flyway locks (F2)' "$ROOT/deploy/roles/create-instance/tasks/monitor-migrations.yml"; then
+        _rec AG2 "role refuses start on stuck locks" mock PASS "pre-start lock gate present"
+    else
+        _rec AG2 "role refuses start on stuck locks" mock FAIL "pre-start lock gate missing"
+    fi
+}
+
+scenario_AH() {
+    # F6 - failing migration SQL captured, failure bundle produced
+    if grep -q 'failing_migration_dump' "$ROOT/deploy/roles/create-instance/tasks/monitor-migrations.yml" \
+       && grep -q 'Capture failure diagnostic bundle' "$ROOT/deploy/roles/create-instance/tasks/monitor-migrations.yml"; then
+        _rec AH "role dumps failing migration SQL on failure" mock PASS "bundle capture task present"
+    else
+        _rec AH "role dumps failing migration SQL on failure" mock FAIL "no failure bundle step"
+    fi
+    if grep -q 'failure-bundle' "$BIN/dhis2-upgrade" && awk '/^_failure_bundle/,/^}/' "$BIN/dhis2-upgrade" | grep -q 'flyway-failed-rows\|flyway_schema_history'; then
+        _rec AH2 "dhis2-upgrade failure-bundle on-demand" mock PASS "command dumps flyway state"
+    else
+        _rec AH2 "dhis2-upgrade failure-bundle on-demand" mock FAIL "command missing or does not dump flyway state"
+    fi
+}
+
+scenario_AI() {
+    # F8 - PostgreSQL major-version compatibility probe
+    if awk '/^_preflight\(\)/,/^}/' "$BIN/dhis2-upgrade" | grep -q "DHIS2 .*to.* requires one of"; then
+        _rec AI "upgrade preflight gates on PG major-version mismatch" mock PASS "compatibility matrix enforced"
+    else
+        _rec AI "upgrade preflight gates on PG major-version mismatch" mock FAIL "no PG version gate"
+    fi
+    # F9 - pool-pressure monitoring
+    if grep -q 'pg_stat_activity active' "$ROOT/deploy/roles/create-instance/tasks/monitor-migrations.yml"; then
+        _rec AI2 "role records pool-pressure warnings" mock PASS "pool-pressure watcher present"
+    else
+        _rec AI2 "role records pool-pressure warnings" mock FAIL "no pool watcher"
+    fi
+    # F7 - analytics tracking
+    if grep -q "_analytics_cmd" "$BIN/dhis2-db"; then
+        _rec AI3 "dhis2-db analytics status wired" mock PASS "analytics subcommand present"
+    else
+        _rec AI3 "dhis2-db analytics status wired" mock FAIL "analytics subcommand missing"
+    fi
+}
+
+scenario_AJ() {
+    # Unknown-source gate (section 73.2, requirement from gap analysis)
+    if awk '/^_run\(\)/,/^}/' "$BIN/dhis2-upgrade" | grep -q "allow-unknown-source"; then
+        _rec AJ "upgrade run blocks on UNKNOWN source without override" mock PASS "escape hatch wired"
+    else
+        _rec AJ "upgrade run blocks on UNKNOWN source without override" mock FAIL "no unknown-source gate"
+    fi
+}
+
+scenario_AK() {
+    # dhis2-doctor config cross-check (section 23/57.14)
+    if awk '/^_config\(\)/,/^}/' "$BIN/dhis2-doctor" | grep -q "server.base.url" \
+       && awk '/^_config\(\)/,/^}/' "$BIN/dhis2-doctor" | grep -q "subjectAltName"; then
+        _rec AK "doctor config cross-checks base URL + TLS SAN" mock PASS "cross-check present"
+    else
+        _rec AK "doctor config cross-checks base URL + TLS SAN" mock FAIL "cross-check incomplete"
+    fi
+}
+
+# ---------- Per-host version pinning ----------
+
+scenario_AL() {
+    # Resolver supports exact patch and marks pinned_exact=True
+    if grep -q "pinned_exact" "$ROOT/deploy/filter_plugins/custom_filters.py" \
+       && grep -q "len(parts) >= 3" "$ROOT/deploy/filter_plugins/custom_filters.py"; then
+        _rec AL "normalize_dhis2_version detects pinned patch (>=3 dotted parts)" mock PASS "pinned_exact flag implemented"
+    else
+        _rec AL "normalize_dhis2_version detects pinned patch" mock FAIL "pinned_exact flag missing"
+    fi
+    # Role fails hard when strict pinning + unresolved patch
+    if grep -q "Fail when a pinned exact patch cannot be resolved and strict pinning is on" "$ROOT/deploy/roles/create-instance/tasks/set-dhis2-url.yml"; then
+        _rec AL2 "role fails on strict-pin + unknown patch" mock PASS "fail task present"
+    else
+        _rec AL2 "role fails on strict-pin + unknown patch" mock FAIL "no fail task"
+    fi
+}
+
+scenario_AM() {
+    # dhis2-upgrade run --to rejects bare channel unless --allow-latest-patch
+    local out rc=0
+    out=$("$BIN/dhis2-upgrade" run hmis --to 2.43 2>&1 </dev/null) || rc=$?
+    if (( rc == 2 )) && echo "$out" | grep -q 'bare channel'; then
+        _rec AM "dhis2-upgrade run --to rejects bare channel" mock PASS "requires patch by default"
+    else
+        _rec AM "dhis2-upgrade run --to rejects bare channel" mock FAIL "did not reject (rc=$rc)"
+    fi
+    # dhis2-instance set-version refuses bare channel by default
+    if grep -q "bare channel" "$BIN/dhis2-instance"; then
+        _rec AM2 "dhis2-instance set-version refuses bare channel by default" mock PASS "guard present"
+    else
+        _rec AM2 "dhis2-instance set-version refuses bare channel by default" mock FAIL "guard missing"
+    fi
+}
+
+scenario_AN() {
+    # dhis2-upgrade run defaults to passing dhis2_pin_patch_version=true
+    # when a specific patch is supplied
+    if awk '/^_run\(\)/,/^}/' "$BIN/dhis2-upgrade" | grep -q 'dhis2_pin_patch_version=true'; then
+        _rec AN "upgrade run defaults to strict pin on patch versions" mock PASS "pin flag propagated"
+    else
+        _rec AN "upgrade run defaults to strict pin on patch versions" mock FAIL "pin flag not propagated"
+    fi
+}
+
 # ---------- Report ----------
 
 _write_report() {
@@ -501,6 +640,8 @@ scenario_N; scenario_O; scenario_P; scenario_Q; scenario_R
 scenario_S; scenario_T
 scenario_U; scenario_V; scenario_W; scenario_X; scenario_Y; scenario_Z
 scenario_AA; scenario_AB; scenario_AC; scenario_AD; scenario_AE
+scenario_AF; scenario_AG; scenario_AH; scenario_AI; scenario_AJ; scenario_AK
+scenario_AL; scenario_AM; scenario_AN
 
 _write_report
 echo

@@ -38,3 +38,15 @@
       ansible.builtin.group:
         name: tomcat
         state: present
+
+    - name: Install PostgreSQL client (role calls psql in pre-start gates)
+      ansible.builtin.apt:
+        name: postgresql-client
+        state: present
+        update_cache: true
+
+    - name: Stub .pgpass so the role's PGPASSFILE env is readable
+      ansible.builtin.copy:
+        content: "localhost:*:*:*:not_a_real_password"
+        dest: /opt/dhis2/.pgpass
+        mode: "0600"

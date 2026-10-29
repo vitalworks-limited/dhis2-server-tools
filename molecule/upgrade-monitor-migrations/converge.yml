@@ -71,6 +71,51 @@
         that: case2_failed_as_expected | default(false)
         fail_msg: "monitor-migrations did NOT fail on FlywayException output"
 
+- name: Case 2b - prior failed Flyway row blocks start (F1 pre-gate)
+  hosts: all
+  gather_facts: false
+  vars:
+    dhis2_monitor_migrations: true
+    dhis2_allow_db_migrations: true
+    dhis2_version: 2.43.2
+    tomcat_version: 9
+    dhis2_catalina_log: /var/log/tomcat9/catalina.out
+    dhis2_migration_timeout: 10
+    dhis2_db_name: hmis
+  tasks:
+    - name: Stub a local psql that reports a non-zero failed-row count
+      ansible.builtin.copy:
+        content: |
+          #!/usr/bin/env bash
+          # Mock psql: returns 1 for the failed-row count query (F1).
+          # Any other query returns empty (and rc 0) so the watch loop
+          # can still run harmlessly.
+          case "$*" in
+              *"success=false"*) echo "1" ;;
+              *) echo "" ;;
+          esac
+          exit 0
+        dest: /usr/local/bin/psql
+        mode: "0755"
+
+    - name: Run monitor-migrations - MUST fail with F1 message
+      block:
+        - ansible.builtin.include_tasks: /opt/dhis2-server-tools/deploy/roles/create-instance/tasks/monitor-migrations.yml
+      rescue:
+        - name: Capture that the pre-gate fired
+          ansible.builtin.set_fact:
+            case2b_blocked: true
+
+    - name: Case 2b - assert pre-gate blocked the start
+      ansible.builtin.assert:
+        that: case2b_blocked | default(false)
+        fail_msg: "F1 pre-gate did not block start on failed Flyway row"
+
+    - name: Remove the mock psql so other cases run cleanly
+      ansible.builtin.file:
+        path: /usr/local/bin/psql
+        state: absent
+
 - name: Case 3 - no migration activity, server starts (noop success)
   hosts: all
   gather_facts: false
