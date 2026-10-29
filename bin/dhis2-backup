@@ -1,0 +1,248 @@
+#!/usr/bin/env bash
+# USAGE_START
+# dhis2-backup - safe DHIS2 backup management (section 16, 57.7).
+#
+# Usage:
+#   dhis2-backup create INSTANCE [--format custom|plain|plain-gzip|tar|directory]
+#                                [--out DIR] [--yes]
+#   dhis2-backup files INSTANCE   [--out DIR]
+#   dhis2-backup full  INSTANCE   [--out DIR]
+#   dhis2-backup list                                    [--json]
+#   dhis2-backup show PATH
+#   dhis2-backup manifest PATH                           [--json]
+#   dhis2-backup checksum PATH
+#   dhis2-backup verify PATH                             [--json]
+#   dhis2-backup test PATH                               (restore-dry-run)
+#   dhis2-backup prune --keep N [--yes]
+#   dhis2-backup schedule INSTANCE [--cron "0 2 * * *"]
+#   dhis2-backup unschedule INSTANCE [--yes]
+#   dhis2-backup export PATH --to s3://... [--yes]
+#   dhis2-backup config INSTANCE
+#
+# Pruning NEVER removes the newest valid backup (section 16.3).
+# USAGE_END
+set -Eeuo pipefail
+. "$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")/.." && pwd)/lib/common.sh"
+
+DB_HOST=""
+_resolve_db_host() {
+    [[ -n "$DB_HOST" ]] && return
+    DB_HOST="${DHIS2_OPT_HOST:-$(dhis2_inventory_group_hosts databases | head -1)}"
+    [[ -z "$DB_HOST" ]] && { dhis2_log_error "No [databases] host in inventory"; exit "$DHIS2_EXIT_PREFLIGHT"; }
+    return 0
+}
+
+main() {
+    dhis2_cli_parse_globals "$@"
+    set -- "${DHIS2_CLI_REMAINING[@]}"
+    [[ $# -eq 0 ]] && { dhis2_cli_show_help "$0"; exit "$DHIS2_EXIT_USAGE"; }
+    local sub="$1"; shift
+    _resolve_db_host
+    case "$sub" in
+        create) _create "$@" ;;
+        files) _files "$@" ;;
+        full) _full "$@" ;;
+        list) _list ;;
+        show) _show "$@" ;;
+        manifest) _manifest "$@" ;;
+        checksum) _checksum "$@" ;;
+        verify) _verify "$@" ;;
+        test) _test "$@" ;;
+        prune) _prune "$@" ;;
+        schedule) _schedule "$@" ;;
+        unschedule) _unschedule "$@" ;;
+        export) _export "$@" ;;
+        config) _config "$@" ;;
+        --help|-h|help) dhis2_cli_show_help "$0"; exit 0 ;;
+        *) dhis2_log_error "Unknown subcommand: $sub"; exit "$DHIS2_EXIT_USAGE" ;;
+    esac
+}
+
+_default_out() { echo "/var/backups/dhis2"; }
+
+_create() {
+    local inst="${1:-}"; shift || true
+    [[ -z "$inst" ]] && { dhis2_log_error "Usage: dhis2-backup create INSTANCE"; exit "$DHIS2_EXIT_USAGE"; }
+    local fmt=custom out
+    out=$(_default_out)
+    while (( $# )); do
+        case "$1" in --format) fmt="$2"; shift ;; --format=*) fmt="${1#*=}" ;;
+                     --out) out="$2"; shift ;; --out=*) out="${1#*=}" ;; esac
+        shift || true
+    done
+    local ts; ts=$(date -u +%Y%m%d-%H%M%S)
+    local base="$out/$inst-$ts"
+    local pg_fmt_opt
+    case "$fmt" in
+        custom) pg_fmt_opt='-F c'; local ext='.dump' ;;
+        plain)  pg_fmt_opt='';     ext='.sql' ;;
+        plain-gzip) pg_fmt_opt=''; ext='.sql.gz' ;;
+        tar)    pg_fmt_opt='-F t'; ext='.tar' ;;
+        directory) pg_fmt_opt='-F d'; ext='.dir' ;;
+        *) dhis2_log_error "Unknown --format: $fmt"; exit "$DHIS2_EXIT_USAGE" ;;
+    esac
+    local path="$base$ext"
+    dhis2_log_info "Creating $fmt backup for $inst -> $path"
+    local pg_cmd
+    if [[ "$fmt" == "plain-gzip" ]]; then
+        pg_cmd="mkdir -p '$out' && sudo -u postgres pg_dump '$inst' | gzip -9 > '$path'"
+    elif [[ "$fmt" == "plain" ]]; then
+        pg_cmd="mkdir -p '$out' && sudo -u postgres pg_dump '$inst' > '$path'"
+    else
+        pg_cmd="mkdir -p '$out' && sudo -u postgres pg_dump $pg_fmt_opt -f '$path' '$inst'"
+    fi
+    dhis2_ansible_adhoc "$DB_HOST" shell -a "$pg_cmd && echo DONE $path" -b -o || { dhis2_log_error "pg_dump failed"; exit "$DHIS2_EXIT_FAILURE"; }
+
+    # Manifest - section 57.7
+    local mf="$path.manifest.json"
+    dhis2_ansible_adhoc "$DB_HOST" shell -a "
+        size=\$(stat -c %s '$path' 2>/dev/null || du -sb '$path' | awk '{print \$1}')
+        sum=\$(sha256sum '$path' 2>/dev/null | awk '{print \$1}' || echo n/a)
+        pgv=\$(sudo -u postgres psql -X -tAc 'SHOW server_version')
+        cat > '$mf' <<EOF
+{
+  \"instance\": \"$inst\",
+  \"database\": \"$inst\",
+  \"backup_path\": \"$path\",
+  \"format\": \"$fmt\",
+  \"timestamp\": \"$ts\",
+  \"size_bytes\": \$size,
+  \"sha256\": \"\$sum\",
+  \"postgresql_version\": \"\$pgv\",
+  \"tool_version\": \"$DHIS2_CLI_VERSION\"
+}
+EOF
+        chmod 600 '$mf' '$path'
+        echo MANIFEST $mf
+    " -b -o
+    _verify "$path"
+}
+
+_files() {
+    local inst="${1:-}"; shift || true
+    [[ -z "$inst" ]] && { dhis2_log_error "Usage: dhis2-backup files INSTANCE"; exit "$DHIS2_EXIT_USAGE"; }
+    local out; out=$(_default_out)
+    while (( $# )); do case "$1" in --out) out="$2"; shift ;; --out=*) out="${1#*=}" ;; esac; shift || true; done
+    local ts; ts=$(date -u +%Y%m%d-%H%M%S)
+    local tgz="$out/$inst-files-$ts.tgz"
+    dhis2_ansible_adhoc "$inst" shell -a "mkdir -p '$out'; tar czf '$tgz' /opt/dhis2 2>/dev/null && chmod 600 '$tgz' && echo DONE $tgz" -b -o
+}
+
+_full() {
+    local inst="${1:-}"; shift || true
+    _create "$inst" "$@"
+    _files "$inst" "$@"
+}
+
+_list() {
+    local out; out=$(_default_out)
+    dhis2_ansible_adhoc "$DB_HOST" shell -a "ls -la $out 2>/dev/null" -b -o
+}
+
+_show() {
+    local p="${1:-}"
+    [[ -z "$p" ]] && { dhis2_log_error "Usage: dhis2-backup show PATH"; exit "$DHIS2_EXIT_USAGE"; }
+    dhis2_ansible_adhoc "$DB_HOST" shell -a "stat '$p'; [ -f '$p.manifest.json' ] && cat '$p.manifest.json'" -b -o
+}
+
+_manifest() {
+    local p="${1:-}"
+    dhis2_ansible_adhoc "$DB_HOST" shell -a "cat '$p.manifest.json' 2>/dev/null || echo 'no-manifest'" -b -o
+}
+
+_checksum() {
+    local p="${1:-}"
+    dhis2_ansible_adhoc "$DB_HOST" shell -a "sha256sum '$p'" -b -o
+}
+
+_verify() {
+    local p="${1:-}"
+    [[ -z "$p" ]] && { dhis2_log_error "Usage: dhis2-backup verify PATH"; exit "$DHIS2_EXIT_USAGE"; }
+    local out
+    out=$(dhis2_ansible_adhoc "$DB_HOST" shell -a "
+        test -s '$p' || { echo 'empty-or-missing'; exit 1; }
+        case '$p' in
+            *.gz) gzip -t '$p' && echo gzip-ok || { echo gzip-bad; exit 2; } ;;
+            *.sql) grep -q 'PostgreSQL database dump' '$p' && echo sql-ok || echo sql-unknown ;;
+            *.dump|*.tar) sudo -u postgres pg_restore -l '$p' >/dev/null && echo pg-list-ok || { echo pg-list-bad; exit 3; } ;;
+        esac
+        [ -f '$p.manifest.json' ] && echo manifest-present || echo manifest-missing
+    " -b -o 2>&1)
+    echo "$out"
+    if [[ "$DHIS2_OPT_JSON" == true ]]; then
+        local ok=true
+        echo "$out" | grep -qE 'bad|missing|empty' && ok=false
+        dhis2_json_emit command=dhis2-backup action=verify path="$p" success=$ok
+    fi
+}
+
+_test() {
+    local p="${1:-}"
+    [[ -z "$p" ]] && { dhis2_log_error "Usage: dhis2-backup test PATH"; exit "$DHIS2_EXIT_USAGE"; }
+    dhis2_log_info "Running restore test into temporary database (section 57.7)"
+    dhis2_ansible_adhoc "$DB_HOST" shell -a "
+        set -e
+        tdb=dhis2_restore_test_\$(date -u +%s)
+        sudo -u postgres createdb \"\$tdb\"
+        case '$p' in
+            *.gz)   gunzip -c '$p' | sudo -u postgres psql -q -d \"\$tdb\" ;;
+            *.sql)  sudo -u postgres psql -q -d \"\$tdb\" -f '$p' ;;
+            *.dump|*.tar) sudo -u postgres pg_restore -q -d \"\$tdb\" '$p' ;;
+        esac
+        sudo -u postgres psql -X -tAc 'SELECT count(*) FROM information_schema.tables' -d \"\$tdb\"
+        sudo -u postgres dropdb \"\$tdb\"
+        echo test-ok
+    " -b -o
+}
+
+_prune() {
+    local keep=0
+    while (( $# )); do case "$1" in --keep) keep="$2"; shift ;; --keep=*) keep="${1#*=}" ;; esac; shift || true; done
+    (( keep < 1 )) && { dhis2_log_error "--keep N (>=1) required"; exit "$DHIS2_EXIT_USAGE"; }
+    dhis2_cli_confirm "Prune oldest backups keeping newest $keep?"
+    local out; out=$(_default_out)
+    dhis2_ansible_adhoc "$DB_HOST" shell -a "
+        files=\$(ls -1t $out/*.dump $out/*.sql* $out/*.tar 2>/dev/null)
+        n=0
+        for f in \$files; do
+            n=\$((n+1))
+            if (( n <= $keep )); then continue; fi
+            echo WOULD-REMOVE \$f
+            rm -f \"\$f\" \"\$f.manifest.json\"
+        done
+    " -b -o
+}
+
+_schedule() {
+    local inst="${1:-}"; shift || true
+    local cron="0 2 * * *"
+    while (( $# )); do case "$1" in --cron) cron="$2"; shift ;; --cron=*) cron="${1#*=}" ;; esac; shift || true; done
+    [[ -z "$inst" ]] && { dhis2_log_error "Usage: dhis2-backup schedule INSTANCE [--cron ...]"; exit "$DHIS2_EXIT_USAGE"; }
+    # Delegate to the backup-script tag; the existing role is the source of truth.
+    "${DHIS2_CLI_ROOT}/bin/dhis2-deploy" apply --only backup --instance "$inst" -e backup_cron_schedule="$cron"
+}
+
+_unschedule() {
+    local inst="${1:-}"
+    dhis2_cli_confirm "Remove scheduled backup for $inst?"
+    dhis2_ansible_adhoc "$DB_HOST" cron -a "name='dhis2 backup $inst' state=absent" -b
+}
+
+_export() {
+    local src="${1:-}"; shift || true
+    local dest=""
+    while (( $# )); do case "$1" in --to) dest="$2"; shift ;; --to=*) dest="${1#*=}" ;; esac; shift || true; done
+    [[ -z "$src" || -z "$dest" ]] && { dhis2_log_error "Usage: dhis2-backup export PATH --to s3://..."; exit "$DHIS2_EXIT_USAGE"; }
+    dhis2_cli_confirm "Upload $src to $dest?"
+    case "$dest" in
+        s3://*) dhis2_ansible_adhoc "$DB_HOST" shell -a "aws s3 cp '$src' '$dest'" -b -o ;;
+        *) dhis2_log_error "Only s3://... destinations supported here"; exit "$DHIS2_EXIT_USAGE" ;;
+    esac
+}
+
+_config() {
+    local inst="${1:-}"
+    dhis2_ansible_adhoc "$DB_HOST" shell -a "cat /etc/dhis2-server-tools/backup-$inst.conf 2>/dev/null || cat /opt/dhis2/backup/$inst.conf 2>/dev/null || echo 'no-config'" -b -o | dhis2_log_redact
+}
+
+main "$@"

@@ -1,0 +1,223 @@
+#!/usr/bin/env bash
+# USAGE_START
+# dhis2-restore - safe DHIS2 restore orchestration (section 17, 57.8).
+#
+# Usage:
+#   dhis2-restore plan     --backup PATH --instance NAME         [--json]
+#   dhis2-restore dry-run  --backup PATH --instance NAME
+#   dhis2-restore database --backup PATH --instance NAME
+#                         [--owner USER] [--database NAME]
+#                         [--create-db] [--drop-existing] [--clean]
+#                         [--jobs N] [--reassign-owner] [--verify]
+#                         [--yes]
+#   dhis2-restore files    --backup PATH --instance NAME [--yes]
+#   dhis2-restore full     --backup PATH --instance NAME [--yes]
+#   dhis2-restore verify   --backup PATH
+#   dhis2-restore ownership --database DB --new-owner USER [--yes]
+#   dhis2-restore clone SRC DST --backup PATH [--yes]
+#   dhis2-restore config INSTANCE
+#
+# The database workflow follows the ordered steps in section 17.3:
+# resolve target → validate backup → disk check → stop app →
+# terminate sessions → optional current-DB backup → drop/create →
+# restore → normalize ownership → ANALYZE → start app → verify.
+# USAGE_END
+set -Eeuo pipefail
+. "$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")/.." && pwd)/lib/common.sh"
+
+DB_HOST=""
+_resolve_db_host() {
+    [[ -n "$DB_HOST" ]] && return
+    DB_HOST="${DHIS2_OPT_HOST:-$(dhis2_inventory_group_hosts databases | head -1)}"
+    [[ -z "$DB_HOST" ]] && { dhis2_log_error "No [databases] host in inventory"; exit "$DHIS2_EXIT_PREFLIGHT"; }
+    return 0
+}
+
+BACKUP=""; INSTANCE=""; OWNER=""; DBNAME=""
+CREATE_DB=false; DROP_EXISTING=false; CLEAN=false
+JOBS=""; REASSIGN=false; VERIFY=false
+
+main() {
+    dhis2_cli_parse_globals "$@"
+    set -- "${DHIS2_CLI_REMAINING[@]}"
+    [[ $# -eq 0 ]] && { dhis2_cli_show_help "$0"; exit "$DHIS2_EXIT_USAGE"; }
+    local sub="$1"; shift
+    _resolve_db_host
+    case "$sub" in
+        plan) _parse "$@"; _plan ;;
+        dry-run) _parse "$@"; _dry_run ;;
+        database) _parse "$@"; _database ;;
+        files) _parse "$@"; _files ;;
+        full) _parse "$@"; _full ;;
+        verify) _parse "$@"; "${DHIS2_CLI_ROOT}/bin/dhis2-backup" verify "$BACKUP" ;;
+        ownership) _ownership "$@" ;;
+        clone) _clone "$@" ;;
+        config) _config "$@" ;;
+        --help|-h|help) dhis2_cli_show_help "$0"; exit 0 ;;
+        *) dhis2_log_error "Unknown subcommand: $sub"; exit "$DHIS2_EXIT_USAGE" ;;
+    esac
+}
+
+_parse() {
+    while (( $# )); do
+        case "$1" in
+            --backup) BACKUP="$2"; shift ;; --backup=*) BACKUP="${1#*=}" ;;
+            --instance) INSTANCE="$2"; shift ;; --instance=*) INSTANCE="${1#*=}" ;;
+            --owner) OWNER="$2"; shift ;; --owner=*) OWNER="${1#*=}" ;;
+            --database) DBNAME="$2"; shift ;; --database=*) DBNAME="${1#*=}" ;;
+            --create-db) CREATE_DB=true ;;
+            --drop-existing) DROP_EXISTING=true ;;
+            --clean) CLEAN=true ;;
+            --jobs) JOBS="$2"; shift ;; --jobs=*) JOBS="${1#*=}" ;;
+            --reassign-owner) REASSIGN=true ;;
+            --verify) VERIFY=true ;;
+        esac
+        shift || true
+    done
+    [[ -z "$BACKUP" ]] && { dhis2_log_error "--backup required"; exit "$DHIS2_EXIT_USAGE"; }
+}
+
+_plan() {
+    _resolve_db_host
+    local tgt_db="${DBNAME:-$INSTANCE}"
+    local target_owner="${OWNER:-$INSTANCE}"
+    local manifest
+    manifest=$(dhis2_ansible_adhoc "$DB_HOST" shell -a "cat '$BACKUP.manifest.json' 2>/dev/null" -b -o 2>&1 | tail -n +2 | dhis2_log_redact)
+    local pgv; pgv=$(dhis2_ansible_adhoc "$DB_HOST" shell -a "sudo -u postgres psql -X -tAc 'SHOW server_version'" -b -o 2>&1 | tail -1)
+    local size; size=$(dhis2_ansible_adhoc "$DB_HOST" shell -a "du -h '$BACKUP' | awk '{print \$1}'" -b -o 2>&1 | tail -1)
+    local free; free=$(dhis2_ansible_adhoc "$DB_HOST" shell -a "df -h /var/lib/postgresql | tail -1 | awk '{print \$4}'" -b -o 2>&1 | tail -1)
+    cat <<EOF
+Restore plan
+  source backup:        $BACKUP (size: $size)
+  target instance:      $INSTANCE
+  target database:      $tgt_db
+  target host:          $DB_HOST
+  target postgres ver:  $pgv
+  disk free (data vol): $free
+  owner (post-restore): $target_owner
+  create-db:            $CREATE_DB
+  drop-existing:        $DROP_EXISTING
+  clean (pg_restore):   $CLEAN
+  reassign-owner:       $REASSIGN
+  verify post-restore:  $VERIFY
+
+Backup manifest:
+$manifest
+EOF
+}
+
+_dry_run() {
+    _plan
+    "${DHIS2_CLI_ROOT}/bin/dhis2-backup" verify "$BACKUP"
+}
+
+_database() {
+    [[ -z "$INSTANCE" ]] && { dhis2_log_error "--instance required"; exit "$DHIS2_EXIT_USAGE"; }
+    local tgt_db="${DBNAME:-$INSTANCE}"
+    local target_owner="${OWNER:-$INSTANCE}"
+
+    # Lock to prevent concurrent restores
+    dhis2_lock_acquire "restore.$tgt_db" || exit $?
+
+    # Step 2: validate backup
+    "${DHIS2_CLI_ROOT}/bin/dhis2-backup" verify "$BACKUP" > /dev/null || { dhis2_log_error "Backup verification failed - aborting."; exit "$DHIS2_EXIT_PREFLIGHT"; }
+
+    _plan
+    dhis2_cli_confirm "Restore $BACKUP into database $tgt_db on $DB_HOST?" "$tgt_db"
+
+    # Step 4: stop application
+    if $DROP_EXISTING; then
+        dhis2_log_info "Stopping application $INSTANCE"
+        dhis2_ansible_adhoc "$INSTANCE" systemd -a "name=tomcat9 state=stopped" -b || true
+    fi
+
+    # Step 5-7: terminate sessions, optionally backup current DB, drop/create
+    if $DROP_EXISTING; then
+        dhis2_ansible_adhoc "$DB_HOST" shell -a "sudo -u postgres psql -X -c \"SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='$tgt_db' AND pid<>pg_backend_pid()\"" -b -o
+        local preserve
+        preserve="/var/backups/dhis2/${tgt_db}-pre-restore-$(date -u +%Y%m%d-%H%M%S).dump"
+        dhis2_ansible_adhoc "$DB_HOST" shell -a "mkdir -p /var/backups/dhis2 && sudo -u postgres pg_dump -F c -f '$preserve' '$tgt_db' 2>/dev/null && echo preserved=$preserve || echo no-existing-db" -b -o
+        dhis2_ansible_adhoc "$DB_HOST" shell -a "sudo -u postgres dropdb --if-exists '$tgt_db'" -b -o
+    fi
+    if $CREATE_DB; then
+        dhis2_ansible_adhoc "$DB_HOST" shell -a "sudo -u postgres psql -X -c \"CREATE DATABASE \\\"$tgt_db\\\" OWNER \\\"$target_owner\\\" ENCODING 'UTF8' TEMPLATE template0\"" -b -o
+    fi
+
+    # Step 8: restore
+    local pg_opts=""
+    $CLEAN && pg_opts+=" --clean"
+    [[ -n "$JOBS" ]] && pg_opts+=" -j $JOBS"
+    dhis2_log_info "Running restore"
+    dhis2_ansible_adhoc "$DB_HOST" shell -a "
+        set -e
+        case '$BACKUP' in
+            *.gz)   gunzip -c '$BACKUP' | sudo -u postgres psql -q -d '$tgt_db' ;;
+            *.sql)  sudo -u postgres psql -q -d '$tgt_db' -f '$BACKUP' ;;
+            *.dump|*.tar|*.dir) sudo -u postgres pg_restore -q -d '$tgt_db' $pg_opts '$BACKUP' ;;
+            *) echo 'unknown-format'; exit 2 ;;
+        esac
+        echo restore-ok
+    " -b -o || { dhis2_log_error "Restore failed"; exit "$DHIS2_EXIT_FAILURE"; }
+
+    # Step 9: ownership normalisation
+    if $REASSIGN; then
+        dhis2_ansible_adhoc "$DB_HOST" shell -a "sudo -u postgres psql -X -d '$tgt_db' -c \"REASSIGN OWNED BY current_user TO \\\"$target_owner\\\"\"" -b -o || true
+    fi
+
+    # Step 10: ANALYZE
+    dhis2_ansible_adhoc "$DB_HOST" shell -a "sudo -u postgres psql -X -d '$tgt_db' -c ANALYZE" -b -o
+
+    # Step 11: start application
+    if $DROP_EXISTING; then
+        dhis2_log_info "Starting application $INSTANCE"
+        dhis2_ansible_adhoc "$INSTANCE" systemd -a "name=tomcat9 state=started" -b || true
+    fi
+
+    # Step 12-14: verify
+    if $VERIFY; then
+        "${DHIS2_CLI_ROOT}/bin/dhis2-instance" endpoint check "$INSTANCE" || dhis2_log_warn "Endpoint check reported issues"
+    fi
+
+    dhis2_log_audit dhis2-restore "{\"instance\":\"$INSTANCE\",\"backup\":\"$BACKUP\",\"db\":\"$tgt_db\"}" "ok"
+    dhis2_log_info "Restore complete"
+}
+
+_files() {
+    [[ -z "$INSTANCE" ]] && { dhis2_log_error "--instance required"; exit "$DHIS2_EXIT_USAGE"; }
+    dhis2_cli_confirm "Restore files tarball $BACKUP onto $INSTANCE?" "$INSTANCE"
+    dhis2_ansible_adhoc "$INSTANCE" shell -a "cd / && tar xzf '$BACKUP'" -b -o
+}
+
+_full() {
+    _database
+    _files
+}
+
+_ownership() {
+    local db="" new=""
+    while (( $# )); do case "$1" in --database) db="$2"; shift ;; --new-owner) new="$2"; shift ;; esac; shift || true; done
+    [[ -z "$db" || -z "$new" ]] && { dhis2_log_error "Usage: dhis2-restore ownership --database DB --new-owner USER"; exit "$DHIS2_EXIT_USAGE"; }
+    dhis2_cli_confirm "Reassign ownership of all objects in $db to $new?" "$db"
+    dhis2_ansible_adhoc "$DB_HOST" shell -a "sudo -u postgres psql -X -d '$db' -c \"REASSIGN OWNED BY current_user TO \\\"$new\\\"\"" -b -o
+}
+
+_clone() {
+    local src="${1:-}" dst="${2:-}"; shift 2 || true
+    local backup=""
+    while (( $# )); do case "$1" in --backup) backup="$2"; shift ;; --backup=*) backup="${1#*=}" ;; esac; shift || true; done
+    [[ -z "$src" || -z "$dst" || -z "$backup" ]] && { dhis2_log_error "Usage: dhis2-restore clone SRC DST --backup PATH"; exit "$DHIS2_EXIT_USAGE"; }
+    dhis2_cli_confirm "Clone backup of '$src' into instance '$dst'? Post-clone safety hooks (server.base.url, integrations, email, SMS, scheduled jobs) should be reviewed." "$dst"
+    _database_args_from_clone "$dst" "$backup"
+    "${DHIS2_CLI_ROOT}/bin/dhis2-restore" database --backup "$backup" --instance "$dst" --create-db --drop-existing --reassign-owner --verify
+}
+
+_database_args_from_clone() {
+    :
+}
+
+_config() {
+    local inst="${1:-}"
+    dhis2_ansible_adhoc "$inst" shell -a "cat /opt/dhis2/dhis.conf" -b | dhis2_log_redact
+}
+
+main "$@"

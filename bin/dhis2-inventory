@@ -1,0 +1,350 @@
+#!/usr/bin/env bash
+# USAGE_START
+# dhis2-inventory - inspect, validate and safely mutate inventory
+#
+# Usage:
+#   dhis2-inventory list        [--json]
+#   dhis2-inventory show HOST   [--json]
+#   dhis2-inventory validate    [--json]
+#   dhis2-inventory lint        [--json]
+#   dhis2-inventory graph
+#   dhis2-inventory resolve HOST
+#   dhis2-inventory diff FILE_A FILE_B
+#   dhis2-inventory backup
+#   dhis2-inventory restore BACKUP_PATH
+#   dhis2-inventory export [--format json|ini]
+#   dhis2-inventory template
+#   dhis2-inventory secrets
+#   dhis2-inventory add-host    GROUP HOST [KEY=VALUE ...]
+#   dhis2-inventory remove-host HOST
+#   dhis2-inventory add-instance NAME [KEY=VALUE ...]
+#   dhis2-inventory remove-instance NAME
+#   dhis2-inventory set    HOST KEY VALUE
+#   dhis2-inventory unset  HOST KEY
+#
+# Preserves the existing INI format - section 13.1.
+# All mutating commands take a timestamped backup first - section 13.3.
+# USAGE_END
+set -Eeuo pipefail
+
+. "$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")/.." && pwd)/lib/common.sh"
+
+main() {
+    dhis2_cli_parse_globals "$@"
+    set -- "${DHIS2_CLI_REMAINING[@]}"
+    [[ $# -eq 0 ]] && { dhis2_cli_show_help "$0"; exit "$DHIS2_EXIT_USAGE"; }
+    local sub="$1"; shift
+    case "$sub" in
+        list) _list "$@" ;;
+        show) _show "$@" ;;
+        validate) _validate ;;
+        lint) _lint ;;
+        graph) _graph ;;
+        resolve) _resolve "$@" ;;
+        diff) _diff "$@" ;;
+        backup) _backup ;;
+        restore) _restore "$@" ;;
+        export) _export "$@" ;;
+        template) _template ;;
+        secrets) _secrets ;;
+        add-host) _add_host "$@" ;;
+        remove-host) _remove_host "$@" ;;
+        add-instance) _add_instance "$@" ;;
+        remove-instance) _remove_instance "$@" ;;
+        set) _set "$@" ;;
+        unset) _unset "$@" ;;
+        --help|-h|help) dhis2_cli_show_help "$0"; exit 0 ;;
+        *) dhis2_log_error "Unknown subcommand: $sub"; exit "$DHIS2_EXIT_USAGE" ;;
+    esac
+}
+
+_inv() { dhis2_config_resolve_inventory; }
+
+_list() {
+    local inv; inv=$(_inv)
+    if [[ "$DHIS2_OPT_JSON" == true ]]; then
+        dhis2_inventory_json
+    else
+        printf 'Inventory: %s\n' "$inv"
+        echo
+        dhis2_c_bold "Groups and hosts"; echo
+        awk '
+            /^\[.*\]/ { grp=substr($0,2,length($0)-2); printf("\n[%s]\n", grp); next }
+            /^#/ || NF==0 { next }
+            { print "  " $1 }
+        ' "$inv"
+    fi
+}
+
+_show() {
+    local host="${1:-}"
+    [[ -z "$host" ]] && { dhis2_log_error "Usage: dhis2-inventory show HOST"; exit "$DHIS2_EXIT_USAGE"; }
+    if [[ "$DHIS2_OPT_JSON" == true ]]; then
+        local inv; inv=$(_inv)
+        if command -v ansible-inventory >/dev/null 2>&1; then
+            ansible-inventory -i "$inv" --host "$host" 2>/dev/null | dhis2_log_redact
+        else
+            dhis2_inventory_host_vars_redacted "$host"
+        fi
+    else
+        dhis2_inventory_host_vars_redacted "$host"
+    fi
+}
+
+_validate() {
+    local inv; inv=$(_inv)
+    local ok=true findings=()
+    if ! dhis2_inventory_validate_syntax "$inv" >/dev/null 2>&1; then
+        findings+=("syntax: invalid"); ok=false
+    fi
+    local dupes
+    if ! dupes=$(dhis2_validate_inventory_duplicates "$inv"); then
+        findings+=("duplicate-hosts: $dupes"); ok=false
+    fi
+    if ! dhis2_validate_database_refs "$inv" >/dev/null; then
+        findings+=("unresolved database_host references"); ok=false
+    fi
+    local proxy
+    proxy=$(dhis2_validate_proxy_choice "$inv")
+    [[ "$proxy" == invalid:* ]] && { findings+=("$proxy"); ok=false; }
+    if [[ "$DHIS2_OPT_JSON" == true ]]; then
+        local fjson="["
+        local first=true f
+        for f in "${findings[@]:-}"; do
+            [[ -z "$f" ]] && continue
+            $first || fjson+=","
+            first=false
+            local safe="${f//\\/\\\\}"
+            safe="${safe//\"/\\\"}"
+            fjson+="\"$safe\""
+        done
+        fjson+="]"
+        dhis2_json_emit command=dhis2-inventory success=$ok inventory="$inv" findings="$fjson"
+    else
+        if $ok; then
+            dhis2_status_ok "OK"; echo " - inventory $inv is valid"
+        else
+            dhis2_status_fail "FAIL"; echo
+            local f
+            for f in "${findings[@]}"; do echo "  - $f"; done
+            exit "$DHIS2_EXIT_PREFLIGHT"
+        fi
+    fi
+}
+
+_lint() {
+    local inv; inv=$(_inv)
+    local warnings=()
+    # Section 13.2 checks: style/consistency warnings beyond hard validation.
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^[[:space:]]*[^#].*password=.* ]]; then
+            warnings+=("plaintext credential-looking value present (consider vault)")
+            break
+        fi
+    done < "$inv"
+    if ! grep -q '^\[instances\]' "$inv"; then
+        warnings+=("missing [instances] group")
+    fi
+    if ! grep -q '^\[databases\]' "$inv"; then
+        warnings+=("missing [databases] group")
+    fi
+    if (( ${#warnings[@]} == 0 )); then
+        dhis2_status_ok "OK"; echo " - no lint findings"
+    else
+        local w
+        for w in "${warnings[@]}"; do printf '  - %s\n' "$w"; done
+        exit "$DHIS2_EXIT_PARTIAL"
+    fi
+}
+
+_graph() {
+    local inv; inv=$(_inv)
+    if command -v ansible-inventory >/dev/null 2>&1; then
+        ansible-inventory -i "$inv" --graph
+    else
+        awk '
+            /^\[.*\]/ { grp=substr($0,2,length($0)-2); print "@" grp ":"; next }
+            /^#/ || NF==0 { next }
+            { print "  |--" $1 }
+        ' "$inv"
+    fi
+}
+
+_resolve() {
+    local host="${1:-}"
+    [[ -z "$host" ]] && { dhis2_log_error "Usage: dhis2-inventory resolve HOST"; exit "$DHIS2_EXIT_USAGE"; }
+    local inv; inv=$(_inv)
+    if command -v ansible >/dev/null 2>&1; then
+        ANSIBLE_CONFIG="$(dhis2_ansible_cfg)" \
+          ansible -i "$inv" "$host" -m debug -a 'var=hostvars[inventory_hostname]' 2>/dev/null \
+          | dhis2_log_redact
+    else
+        dhis2_inventory_host_vars_redacted "$host"
+    fi
+}
+
+_diff() {
+    local a="${1:-}" b="${2:-}"
+    [[ -z "$a" || -z "$b" ]] && { dhis2_log_error "Usage: dhis2-inventory diff FILE_A FILE_B"; exit "$DHIS2_EXIT_USAGE"; }
+    diff -u "$a" "$b" | dhis2_log_redact || true
+}
+
+_backup() {
+    local inv backup
+    inv=$(_inv)
+    backup="${inv}.$(date -u +%Y%m%d-%H%M%S).bak"
+    cp -p "$inv" "$backup"
+    chmod 600 "$backup"
+    dhis2_log_info "Backup: $backup"
+    [[ "$DHIS2_OPT_JSON" == true ]] && dhis2_json_emit backup="$backup"
+}
+
+_restore() {
+    local src="${1:-}"
+    [[ -z "$src" || ! -f "$src" ]] && { dhis2_log_error "Usage: dhis2-inventory restore BACKUP_PATH"; exit "$DHIS2_EXIT_USAGE"; }
+    local inv; inv=$(_inv)
+    dhis2_cli_confirm "Restore inventory from $src over $inv?"
+    dhis2_inventory_safe_write "$src" "$inv"
+}
+
+_export() {
+    local fmt=ini
+    while (( $# )); do
+        case "$1" in
+            --format) fmt="${2:-ini}"; shift ;;
+            --format=*) fmt="${1#*=}" ;;
+        esac
+        shift || true
+    done
+    local inv; inv=$(_inv)
+    case "$fmt" in
+        ini) cat "$inv" | dhis2_log_redact ;;
+        json) dhis2_inventory_json | dhis2_log_redact ;;
+        *) dhis2_log_error "Unknown --format: $fmt"; exit "$DHIS2_EXIT_USAGE" ;;
+    esac
+}
+
+_template() {
+    local tmpl="${DHIS2_CLI_ROOT}/deploy/inventory/hosts.template"
+    [[ -f "$tmpl" ]] || { dhis2_log_error "Template not found: $tmpl"; exit "$DHIS2_EXIT_FAILURE"; }
+    cat "$tmpl"
+}
+
+_secrets() {
+    local inv; inv=$(_inv)
+    local hits
+    hits=$(grep -nE 'password|secret|token|api[-_]?key' "$inv" | grep -vE '^\s*#' || true)
+    if [[ -z "$hits" ]]; then
+        dhis2_status_ok "OK"; echo " - no obvious plaintext secret-like variables in $inv"
+        return 0
+    fi
+    dhis2_log_warn "Possible plaintext secrets found (values hidden):"
+    while IFS= read -r line; do
+        local ln key
+        ln=$(echo "$line" | cut -d: -f1)
+        key=$(echo "$line" | awk -F'[ =]' '{for(i=1;i<=NF;i++) if($i ~ /password|secret|token|api/) print $i}' | head -1)
+        printf '  %s: %s=***REDACTED***\n' "$ln" "${key:-?}"
+    done <<< "$hits"
+    exit "$DHIS2_EXIT_PARTIAL"
+}
+
+_tmp_copy() {
+    local inv; inv=$(_inv)
+    local td; td=$(mktemp -d)
+    cp -p "$inv" "$td/hosts"
+    echo "$td/hosts"
+}
+
+_commit() {
+    local staged="$1"
+    local inv; inv=$(_inv)
+    dhis2_inventory_safe_write "$staged" "$inv"
+}
+
+_add_host() {
+    local group="${1:-}" host="${2:-}"; shift 2 || true
+    [[ -z "$group" || -z "$host" ]] && { dhis2_log_error "Usage: dhis2-inventory add-host GROUP HOST [KEY=VALUE ...]"; exit "$DHIS2_EXIT_USAGE"; }
+    local staged; staged=$(_tmp_copy)
+    if ! grep -q "^\[$group\]" "$staged"; then
+        printf '\n[%s]\n' "$group" >> "$staged"
+    fi
+    awk -v g="$group" -v h="$host" -v kv="$*" '
+        BEGIN { done=0 }
+        /^\[.*\]/ && insect { print ""; }
+        { insect = ($0 == "[" g "]") || (insect && $0 !~ /^\[/) }
+        { print }
+        $0 == "[" g "]" && !done { print h (kv ? "  " kv : ""); done=1 }
+    ' "$staged" > "${staged}.new"
+    mv "${staged}.new" "$staged"
+    _commit "$staged"
+}
+
+_remove_host() {
+    local host="${1:-}"
+    [[ -z "$host" ]] && { dhis2_log_error "Usage: dhis2-inventory remove-host HOST"; exit "$DHIS2_EXIT_USAGE"; }
+    local staged; staged=$(_tmp_copy)
+    awk -v h="$host" '$1==h {next} {print}' "$staged" > "${staged}.new"
+    mv "${staged}.new" "$staged"
+    _commit "$staged"
+}
+
+_add_instance() {
+    local name="${1:-}"; shift || true
+    [[ -z "$name" ]] && { dhis2_log_error "Usage: dhis2-inventory add-instance NAME [KEY=VALUE ...]"; exit "$DHIS2_EXIT_USAGE"; }
+    _add_host instances "$name" "$@"
+}
+
+_remove_instance() {
+    local name="${1:-}"
+    [[ -z "$name" ]] && { dhis2_log_error "Usage: dhis2-inventory remove-instance NAME"; exit "$DHIS2_EXIT_USAGE"; }
+    _remove_host "$name"
+}
+
+_set() {
+    local host="${1:-}" key="${2:-}" value="${3:-}"
+    [[ -z "$host" || -z "$key" ]] && { dhis2_log_error "Usage: dhis2-inventory set HOST KEY VALUE"; exit "$DHIS2_EXIT_USAGE"; }
+    local staged; staged=$(_tmp_copy)
+    python3 - "$staged" "$host" "$key" "$value" <<'PY'
+import sys, re
+path, host, key, value = sys.argv[1:5]
+out=[]
+pat = re.compile(r'(\b' + re.escape(key) + r')=\S+')
+with open(path) as f:
+    for raw in f:
+        line = raw.rstrip('\n')
+        toks = line.strip().split()
+        if toks and toks[0] == host:
+            if pat.search(line):
+                line = pat.sub(f'{key}={value}', line)
+            else:
+                line = line + f'  {key}={value}'
+        out.append(line)
+with open(path,'w') as f:
+    f.write('\n'.join(out)+'\n')
+PY
+    _commit "$staged"
+}
+
+_unset() {
+    local host="${1:-}" key="${2:-}"
+    [[ -z "$host" || -z "$key" ]] && { dhis2_log_error "Usage: dhis2-inventory unset HOST KEY"; exit "$DHIS2_EXIT_USAGE"; }
+    local staged; staged=$(_tmp_copy)
+    python3 - "$staged" "$host" "$key" <<'PY'
+import sys, re
+path, host, key = sys.argv[1:4]
+out=[]
+pat = re.compile(r'\s*\b' + re.escape(key) + r'=\S+')
+with open(path) as f:
+    for raw in f:
+        line = raw.rstrip('\n')
+        toks = line.strip().split()
+        if toks and toks[0] == host:
+            line = pat.sub('', line)
+        out.append(line)
+with open(path,'w') as f:
+    f.write('\n'.join(out)+'\n')
+PY
+    _commit "$staged"
+}
+
+main "$@"

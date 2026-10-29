@@ -1,0 +1,141 @@
+#!/usr/bin/env bash
+# USAGE_START
+# dhis2-status - fast environment overview
+#
+# Usage:
+#   dhis2-status [--json] [--details] [--services] [--versions]
+#                [--health-only] [--watch SECONDS]
+#                [--environment NAME] [--inventory PATH]
+#
+# Reports configured instances, hosts, groups, and (when --details is
+# supplied) their reachable health state. Does NOT create database load
+# in watch mode by default.
+# USAGE_END
+set -Eeuo pipefail
+
+# shellcheck source=../lib/common.sh
+. "$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")/.." && pwd)/lib/common.sh"
+
+_mode_details=false
+_mode_services=false
+_mode_versions=false
+_mode_health_only=false
+_watch=0
+
+main() {
+    dhis2_cli_parse_globals "$@"
+    set -- "${DHIS2_CLI_REMAINING[@]}"
+    while (( $# )); do
+        case "$1" in
+            --details) _mode_details=true ;;
+            --services) _mode_services=true ;;
+            --versions) _mode_versions=true ;;
+            --health-only) _mode_health_only=true ;;
+            --watch) _watch="${2:-5}"; shift ;;
+            --help|-h) dhis2_cli_show_help "$0"; exit 0 ;;
+            *) dhis2_log_error "Unknown argument: $1"; exit "$DHIS2_EXIT_USAGE" ;;
+        esac
+        shift || true
+    done
+
+    if (( _watch > 0 )); then
+        while true; do
+            clear 2>/dev/null || true
+            _emit_status
+            sleep "$_watch"
+        done
+    else
+        _emit_status
+    fi
+}
+
+_emit_status() {
+    local inv instances dbs webs mons dorises wgs backups
+    inv=$(dhis2_config_resolve_inventory)
+    if [[ ! -r "$inv" ]]; then
+        if [[ "$DHIS2_OPT_JSON" == true ]]; then
+            dhis2_json_emit command=dhis2-status success=false error="inventory-not-readable:$inv"
+        else
+            dhis2_log_error "Inventory not readable: $inv"
+        fi
+        exit "$DHIS2_EXIT_PREFLIGHT"
+    fi
+    instances=$(dhis2_inventory_group_hosts instances | wc -l | tr -d ' ')
+    dbs=$(dhis2_inventory_group_hosts databases | wc -l | tr -d ' ')
+    webs=$(dhis2_inventory_group_hosts web | wc -l | tr -d ' ')
+    mons=$(dhis2_inventory_group_hosts monitoring | wc -l | tr -d ' ')
+    dorises=$(dhis2_inventory_group_hosts apache_doris | wc -l | tr -d ' ')
+    wgs=$(dhis2_inventory_group_hosts wireguard_hub | wc -l | tr -d ' ')
+    backups=$(dhis2_inventory_group_hosts backup_servers | wc -l | tr -d ' ')
+
+    if [[ "$DHIS2_OPT_JSON" == true ]]; then
+        local inst_json="[]"
+        if [[ "$_mode_details" == true || "$_mode_health_only" == true ]]; then
+            inst_json=$(_instance_details_json)
+        fi
+        dhis2_json_emit \
+            command=dhis2-status \
+            schema=1 \
+            success=true \
+            inventory="$inv" \
+            environment="${DHIS2_OPT_ENVIRONMENT:-default}" \
+            instances="$inst_json" \
+            counts="{\"instances\":$instances,\"databases\":$dbs,\"proxies\":$webs,\"monitoring\":$mons,\"doris\":$dorises,\"wireguard\":$wgs,\"backups\":$backups}"
+        return 0
+    fi
+
+    dhis2_c_bold "DHIS2 server tools status"; echo
+    printf '  inventory:      %s\n' "$inv"
+    printf '  environment:    %s\n' "${DHIS2_OPT_ENVIRONMENT:-default}"
+    printf '  tool version:   %s\n' "$DHIS2_CLI_VERSION"
+    echo
+    dhis2_c_bold "Infrastructure"; echo
+    dhis2_output_table "COMPONENT|HOSTS" \
+        "PostgreSQL|$dbs" \
+        "Proxy|$webs" \
+        "Monitoring|$mons" \
+        "Doris|$dorises" \
+        "WireGuard|$wgs" \
+        "Backup|$backups"
+    echo
+    dhis2_c_bold "Instances"; echo
+    if (( instances == 0 )); then
+        echo "  (none)"
+        return 0
+    fi
+    local rows=()
+    local host
+    while IFS= read -r host; do
+        [[ -z "$host" ]] && continue
+        if [[ "$_mode_details" == true ]]; then
+            rows+=("$(_instance_row "$host")")
+        else
+            rows+=("$host|configured|-|-|-")
+        fi
+    done < <(dhis2_inventory_group_hosts instances)
+    dhis2_output_table "INSTANCE|STATE|HOST|PROXY|DB" "${rows[@]}"
+}
+
+_instance_row() {
+    local host="$1"
+    local vars
+    vars=$(dhis2_inventory_host_vars_redacted "$host" 2>/dev/null || true)
+    local db proxy_host
+    db=$(echo "$vars" | awk -F'[" ]+' '/"database_host"/ {print $(NF-1); exit}')
+    proxy_host=$(dhis2_inventory_group_hosts web | head -n1)
+    echo "$host|configured|$host|${proxy_host:-?}|${db:-?}"
+}
+
+_instance_details_json() {
+    local host first=true
+    printf '['
+    while IFS= read -r host; do
+        [[ -z "$host" ]] && continue
+        $first || printf ','
+        first=false
+        printf '{"name":"%s","state":"configured"}' "$host"
+    done < <(dhis2_inventory_group_hosts instances)
+    printf ']'
+}
+
+main "$@"

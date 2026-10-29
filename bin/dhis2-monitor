@@ -1,0 +1,175 @@
+#!/usr/bin/env bash
+# USAGE_START
+# dhis2-monitor - monitoring/alerting operations (section 21, 57.12).
+#
+# Usage:
+#   dhis2-monitor status                 [--json]
+#   dhis2-monitor install
+#   dhis2-monitor enable
+#   dhis2-monitor disable
+#   dhis2-monitor targets                [--json]
+#   dhis2-monitor exporters
+#   dhis2-monitor dashboards
+#   dhis2-monitor health
+#   dhis2-monitor alerts
+#   dhis2-monitor test-alert
+#   dhis2-monitor silence --match 'name=foo' --duration 2h --reason "..."
+#   dhis2-monitor unsilence ID
+#   dhis2-monitor retention
+#   dhis2-monitor storage
+#   dhis2-monitor endpoints
+# USAGE_END
+set -Eeuo pipefail
+. "$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")/.." && pwd)/lib/common.sh"
+
+MON_HOST=""
+_resolve_monitor_host() {
+    [[ -n "$MON_HOST" ]] && return
+    MON_HOST=$(dhis2_inventory_group_hosts monitoring | head -1)
+    [[ -z "$MON_HOST" ]] && { dhis2_log_error "No [monitoring] host in inventory"; exit "$DHIS2_EXIT_PREFLIGHT"; }
+    return 0
+}
+
+_monitor_impl() {
+    local inv; inv=$(dhis2_config_resolve_inventory)
+    awk -F= '/^[[:space:]]*server_monitoring[[:space:]]*=/ {gsub(/[[:space:]]/,"",$2); print $2; exit}' "$inv"
+}
+
+main() {
+    dhis2_cli_parse_globals "$@"
+    set -- "${DHIS2_CLI_REMAINING[@]}"
+    [[ $# -eq 0 ]] && { dhis2_cli_show_help "$0"; exit "$DHIS2_EXIT_USAGE"; }
+    local sub="$1"; shift
+    _resolve_monitor_host
+    case "$sub" in
+        status) _status ;;
+        install) _install ;;
+        enable|disable) _toggle "$sub" ;;
+        targets) _targets ;;
+        exporters) _exporters ;;
+        dashboards) _dashboards ;;
+        health) _health ;;
+        alerts) _alerts ;;
+        test-alert) _test_alert ;;
+        silence) _silence "$@" ;;
+        unsilence) _unsilence "$@" ;;
+        retention) _retention ;;
+        storage) _storage ;;
+        endpoints) _endpoints ;;
+        --help|-h|help) dhis2_cli_show_help "$0"; exit 0 ;;
+        *) dhis2_log_error "Unknown subcommand: $sub"; exit "$DHIS2_EXIT_USAGE" ;;
+    esac
+}
+
+_status() {
+    local impl; impl=$(_monitor_impl)
+    if [[ "$DHIS2_OPT_JSON" == true ]]; then
+        dhis2_json_emit command=dhis2-monitor host="$MON_HOST" implementation="${impl:-unknown}"
+    else
+        printf 'host: %s\nimplementation: %s\n' "$MON_HOST" "${impl:-unknown}"
+    fi
+    dhis2_ansible_adhoc "$MON_HOST" shell -a 'for s in munin-node prometheus grafana-server zabbix-server; do systemctl is-active $s 2>/dev/null | awk -v s=$s "{print s\":\"\$0}"; done' -b -o
+}
+
+_install() {
+    "${DHIS2_CLI_ROOT}/bin/dhis2-deploy" apply --only monitoring
+}
+
+_toggle() {
+    local act="$1"
+    local impl; impl=$(_monitor_impl)
+    case "$impl" in
+        munin)      dhis2_ansible_adhoc "$MON_HOST" systemd -a "name=munin-node state=$([[ $act == enable ]] && echo started || echo stopped)" -b ;;
+        prometheus) dhis2_ansible_adhoc "$MON_HOST" systemd -a "name=prometheus state=$([[ $act == enable ]] && echo started || echo stopped)" -b ;;
+        zabbix)     dhis2_ansible_adhoc "$MON_HOST" systemd -a "name=zabbix-server state=$([[ $act == enable ]] && echo started || echo stopped)" -b ;;
+        *) dhis2_log_warn "No known monitoring implementation configured" ;;
+    esac
+}
+
+_targets() {
+    local impl; impl=$(_monitor_impl)
+    case "$impl" in
+        munin) dhis2_ansible_adhoc "$MON_HOST" shell -a 'ls /etc/munin/munin-conf.d/' -b -o ;;
+        prometheus) dhis2_ansible_adhoc "$MON_HOST" shell -a 'cat /etc/prometheus/prometheus.yml 2>/dev/null' -b -o ;;
+        *) dhis2_log_warn "No supported stack to list targets for" ;;
+    esac
+}
+
+_exporters() {
+    dhis2_ansible_adhoc all shell -a 'for p in node_exporter postgres_exporter; do systemctl is-active $p 2>/dev/null | awk -v p=$p "{print p\"=\"\$0}"; done' -b -o
+}
+
+_dashboards() {
+    dhis2_ansible_adhoc "$MON_HOST" shell -a 'ls /var/lib/grafana/dashboards 2>/dev/null; ls /etc/munin/templates 2>/dev/null' -b -o
+}
+
+_health() { _status; _exporters; }
+
+_alerts() {
+    dhis2_ansible_adhoc "$MON_HOST" shell -a 'ls /etc/prometheus/rules/ 2>/dev/null; ls /etc/alertmanager/ 2>/dev/null' -b -o
+}
+
+_test_alert() {
+    dhis2_log_warn "Alert test MUST NOT leak credentials in output (section 57.12)."
+    local impl; impl=$(_monitor_impl)
+    case "$impl" in
+        prometheus|grafana|grafana/prometheus)
+            # Prefer amtool, fall back to Alertmanager HTTP API v2 so we work
+            # without requiring the amtool binary. Section 57.12 end-to-end
+            # routing: Prometheus -> Alertmanager -> configured contact point.
+            dhis2_ansible_adhoc "$MON_HOST" shell -a '
+                set -e
+                if command -v amtool >/dev/null; then
+                    amtool alert add alertname=DHIS2TestAlert --annotation=summary="dhis2-monitor test-alert" --annotation=severity=info
+                else
+                    ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+                    payload=$(printf "[{\"labels\":{\"alertname\":\"DHIS2TestAlert\",\"severity\":\"info\"},\"annotations\":{\"summary\":\"dhis2-monitor test-alert\"},\"startsAt\":\"%s\"}]" "$ts")
+                    curl -sS -X POST -H "Content-Type: application/json" --data "$payload" http://127.0.0.1:9093/api/v2/alerts
+                fi
+            ' -b -o 2>&1 | dhis2_log_redact
+            ;;
+        *) dhis2_log_warn "test-alert currently supports Prometheus/Alertmanager stacks only." ;;
+    esac
+}
+
+_silence() {
+    local matcher="" duration="2h" reason=""
+    while (( $# )); do case "$1" in --match) matcher="$2"; shift ;; --duration) duration="$2"; shift ;; --reason) reason="$2"; shift ;; esac; shift || true; done
+    [[ -z "$matcher" || -z "$reason" ]] && { dhis2_log_error "Usage: dhis2-monitor silence --match ... --duration DUR --reason REASON"; exit "$DHIS2_EXIT_USAGE"; }
+    local author="${USER:-cli}"
+    dhis2_ansible_adhoc "$MON_HOST" shell -a "
+        if command -v amtool >/dev/null; then
+            amtool silence add '$matcher' --duration='$duration' --comment='$reason' --author='$author'
+        else
+            now=\$(date -u +%Y-%m-%dT%H:%M:%SZ)
+            end=\$(date -u -d '+$duration' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v+${duration%[a-zA-Z]}H +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)
+            payload=\$(printf '{\"matchers\":[{\"name\":\"%s\",\"value\":\"%s\",\"isRegex\":false,\"isEqual\":true}],\"startsAt\":\"%s\",\"endsAt\":\"%s\",\"createdBy\":\"%s\",\"comment\":\"%s\"}' \"\${1%%=*}\" \"\${1#*=}\" \"\$now\" \"\$end\" '$author' '$reason') -- '$matcher'
+            curl -sS -X POST -H 'Content-Type: application/json' --data \"\$payload\" http://127.0.0.1:9093/api/v2/silences
+        fi
+    " -b -o 2>&1 | dhis2_log_redact
+}
+
+_unsilence() {
+    local id="${1:-}"
+    [[ -z "$id" ]] && { dhis2_log_error "Usage: dhis2-monitor unsilence ID"; exit "$DHIS2_EXIT_USAGE"; }
+    dhis2_cli_confirm "Expire alert silence $id?"
+    dhis2_ansible_adhoc "$MON_HOST" shell -a "
+        if command -v amtool >/dev/null; then
+            amtool silence expire '$id'
+        else
+            curl -sS -X DELETE http://127.0.0.1:9093/api/v2/silence/'$id'
+        fi
+    " -b -o 2>&1
+}
+
+_retention() {
+    dhis2_ansible_adhoc "$MON_HOST" shell -a 'cat /etc/default/prometheus 2>/dev/null; ls /var/lib/prometheus 2>/dev/null | head; du -sh /var/lib/prometheus /var/lib/munin /var/lib/grafana 2>/dev/null' -b -o
+}
+
+_storage() { _retention; }
+
+_endpoints() {
+    dhis2_ansible_adhoc "$MON_HOST" shell -a 'ss -tnlp 2>/dev/null | head -40' -b -o
+}
+
+main "$@"

@@ -1,0 +1,209 @@
+#!/usr/bin/env bash
+# USAGE_START
+# dhis2-proxy - reverse proxy operations (section 19, 57.10).
+#
+# Usage:
+#   dhis2-proxy status                      [--json]
+#   dhis2-proxy show
+#   dhis2-proxy config
+#   dhis2-proxy test
+#   dhis2-proxy reload
+#   dhis2-proxy restart
+#   dhis2-proxy routes
+#   dhis2-proxy add NAME ...        (delegates to proxy-conf tag)
+#   dhis2-proxy remove NAME         (delegates to proxy-conf tag)
+#   dhis2-proxy upstream NAME
+#   dhis2-proxy health                      [--json]
+#   dhis2-proxy listeners
+#   dhis2-proxy certificates
+#   dhis2-proxy logs [--follow] [--since 1h] [--lines N]
+#   dhis2-proxy access                      (prints access-log summary)
+#   dhis2-proxy maintenance status|enable|disable
+#   dhis2-proxy backup
+#   dhis2-proxy diff
+#
+# `test` MUST pass before any reload or restart. Last-known-good
+# configuration is retained; a failed `test` aborts the operation
+# (section 57.10).
+# USAGE_END
+set -Eeuo pipefail
+. "$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")/.." && pwd)/lib/common.sh"
+
+PROXY_HOST=""
+
+_resolve_proxy_host() {
+    [[ -n "$PROXY_HOST" ]] && return
+    PROXY_HOST=$(dhis2_inventory_group_hosts web | head -1)
+    [[ -z "$PROXY_HOST" ]] && { dhis2_log_error "No [web] host found in inventory"; exit "$DHIS2_EXIT_PREFLIGHT"; }
+    return 0
+}
+
+_proxy_engine() {
+    local inv; inv=$(dhis2_config_resolve_inventory)
+    local p; p=$(awk -F= '/^[[:space:]]*proxy[[:space:]]*=/ {gsub(/[[:space:]]/,"",$2); print $2; exit}' "$inv")
+    [[ -z "$p" ]] && p=nginx
+    echo "$p"
+}
+
+_svc_name() {
+    case "$(_proxy_engine)" in
+        nginx) echo nginx ;;
+        apache2) echo apache2 ;;
+        openresty) echo openresty ;;
+    esac
+}
+
+_test_cmd() {
+    case "$(_proxy_engine)" in
+        nginx|openresty) echo "nginx -t" ;;
+        apache2) echo "apache2ctl configtest" ;;
+    esac
+}
+
+main() {
+    dhis2_cli_parse_globals "$@"
+    set -- "${DHIS2_CLI_REMAINING[@]}"
+    [[ $# -eq 0 ]] && { dhis2_cli_show_help "$0"; exit "$DHIS2_EXIT_USAGE"; }
+    local sub="$1"; shift
+    _resolve_proxy_host
+    case "$sub" in
+        status) _status ;;
+        show) _show ;;
+        config) _config ;;
+        test) _test ;;
+        reload) _reload ;;
+        restart) _restart ;;
+        routes|upstream) _routes "$@" ;;
+        add) _add "$@" ;;
+        remove) _remove "$@" ;;
+        health) _health ;;
+        listeners) _listeners ;;
+        certificates) _certificates ;;
+        logs) _logs "$@" ;;
+        access) _access ;;
+        maintenance) _maintenance "$@" ;;
+        backup) _backup ;;
+        diff) _diff ;;
+        --help|-h|help) dhis2_cli_show_help "$0"; exit 0 ;;
+        *) dhis2_log_error "Unknown subcommand: $sub"; exit "$DHIS2_EXIT_USAGE" ;;
+    esac
+}
+
+_status() {
+    local svc; svc=$(_svc_name)
+    if [[ "$DHIS2_OPT_JSON" == true ]]; then
+        local state
+        state=$(dhis2_ansible_adhoc "$PROXY_HOST" shell -a "systemctl is-active $svc" -b -o 2>&1 | tail -1)
+        dhis2_json_emit command=dhis2-proxy host="$PROXY_HOST" engine="$(_proxy_engine)" state="$state"
+    else
+        dhis2_ansible_adhoc "$PROXY_HOST" shell -a "systemctl status $svc --no-pager | head -10" -b -o
+    fi
+}
+
+_show() {
+    dhis2_ansible_adhoc "$PROXY_HOST" shell -a "ls -la /etc/$(_proxy_engine)/ 2>/dev/null; ls /etc/$(_proxy_engine)/sites-enabled/ 2>/dev/null || true" -b -o
+}
+
+_config() {
+    dhis2_ansible_adhoc "$PROXY_HOST" shell -a "cat /etc/$(_proxy_engine)/sites-enabled/* 2>/dev/null | head -200" -b -o
+}
+
+_test() {
+    local cmd
+    cmd=$(_test_cmd)
+    local rc=0
+    dhis2_ansible_adhoc "$PROXY_HOST" shell -a "$cmd" -b -o || rc=$?
+    exit $rc
+}
+
+_reload() {
+    _test
+    local svc; svc=$(_svc_name)
+    dhis2_ansible_adhoc "$PROXY_HOST" systemd -a "name=$svc state=reloaded" -b
+}
+
+_restart() {
+    _test
+    dhis2_cli_confirm "Restart proxy on $PROXY_HOST?"
+    local svc; svc=$(_svc_name)
+    dhis2_ansible_adhoc "$PROXY_HOST" systemd -a "name=$svc state=restarted" -b
+}
+
+_routes() {
+    dhis2_ansible_adhoc "$PROXY_HOST" shell -a "grep -rE 'proxy_pass|ProxyPass' /etc/$(_proxy_engine)/ 2>/dev/null" -b -o
+}
+
+_add() {
+    # Delegate to the full deploy with proxy-conf tag — the proxy role is the source of truth.
+    "${DHIS2_CLI_ROOT}/bin/dhis2-deploy" apply --only proxy-conf
+}
+
+_remove() {
+    dhis2_log_error "Proxy routes are generated from inventory. Use dhis2-inventory remove-instance NAME then dhis2-deploy apply --only proxy-conf."
+    exit "$DHIS2_EXIT_USAGE"
+}
+
+_health() {
+    local inst
+    inst=$(dhis2_inventory_group_hosts instances)
+    local rows=()
+    while IFS= read -r i; do
+        [[ -z "$i" ]] && continue
+        local out
+        out=$(dhis2_ansible_adhoc "$PROXY_HOST" shell -a "curl -sS -o /dev/null -w '%{http_code}' http://$i:8080/$i/ 2>/dev/null || echo n/a" -b -o 2>&1 | tail -1 | awk '{print $NF}')
+        rows+=("$i|$out")
+    done <<< "$inst"
+    dhis2_output_table "INSTANCE|UPSTREAM_HTTP" "${rows[@]}"
+}
+
+_listeners() {
+    dhis2_ansible_adhoc "$PROXY_HOST" shell -a 'ss -tnlp 2>/dev/null | head -20' -b -o
+}
+
+_certificates() {
+    dhis2_ansible_adhoc "$PROXY_HOST" shell -a "find /etc/letsencrypt/live /etc/ssl -type f \( -name 'fullchain.pem' -o -name '*.crt' \) 2>/dev/null | head -20" -b -o
+}
+
+_logs() {
+    local follow='' since='' lines=200
+    while (( $# )); do
+        case "$1" in
+            -f|--follow) follow="-f" ;;
+            --since) since="--since '$2'"; shift ;;
+            --since=*) since="--since '${1#*=}'" ;;
+            --lines) lines="$2"; shift ;;
+        esac
+        shift || true
+    done
+    dhis2_ansible_adhoc "$PROXY_HOST" shell -a "journalctl -u $(_svc_name) --no-pager -n $lines $since $follow" -b -o
+}
+
+_access() {
+    local engine path
+    engine=$(_proxy_engine)
+    path="/var/log/$engine/access.log"
+    dhis2_ansible_adhoc "$PROXY_HOST" shell -a "tail -200 $path 2>/dev/null | awk '{print \$9}' | sort | uniq -c | sort -rn" -b -o
+}
+
+_maintenance() {
+    local act="${1:-status}"
+    dhis2_ansible_adhoc "$PROXY_HOST" shell -a "test -f /etc/$(_proxy_engine)/maintenance.on && echo enabled || echo disabled" -b -o
+    [[ "$act" == "status" ]] && return
+    dhis2_cli_confirm "Set proxy maintenance mode $act?"
+    case "$act" in
+        enable)  dhis2_ansible_adhoc "$PROXY_HOST" shell -a "touch /etc/$(_proxy_engine)/maintenance.on" -b ;;
+        disable) dhis2_ansible_adhoc "$PROXY_HOST" shell -a "rm -f /etc/$(_proxy_engine)/maintenance.on" -b ;;
+    esac
+    dhis2_log_info "Note: the proxy template must honor this file to return the maintenance response (section 57.10)."
+}
+
+_backup() {
+    dhis2_ansible_adhoc "$PROXY_HOST" shell -a "tar czf /var/backups/proxy-\$(date -u +%Y%m%d-%H%M%S).tgz /etc/$(_proxy_engine) 2>/dev/null && echo ok" -b -o
+}
+
+_diff() {
+    dhis2_log_warn "dhis2-proxy diff requires rendering templates in --check mode:"
+    "${DHIS2_CLI_ROOT}/bin/dhis2-deploy" diff --only proxy
+}
+
+main "$@"

@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# USAGE_START
+# dhis2-integration - integration service lifecycle (section 28, 57.19).
+#
+# Usage:
+#   dhis2-integration list                 [--json]
+#   dhis2-integration status NAME
+#   dhis2-integration install NAME
+#   dhis2-integration restart NAME
+#   dhis2-integration remove NAME [--yes]
+#   dhis2-integration logs NAME
+#   dhis2-integration health NAME
+#   dhis2-integration config NAME
+#   dhis2-integration enable NAME
+#   dhis2-integration disable NAME
+#   dhis2-integration test NAME
+#
+# Integration hosts come from the inventory [integration] group.
+# USAGE_END
+set -Eeuo pipefail
+. "$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")/.." && pwd)/lib/common.sh"
+
+main() {
+    dhis2_cli_parse_globals "$@"
+    set -- "${DHIS2_CLI_REMAINING[@]}"
+    [[ $# -eq 0 ]] && { dhis2_cli_show_help "$0"; exit "$DHIS2_EXIT_USAGE"; }
+    local sub="$1"; shift
+    case "$sub" in
+        list) _list ;;
+        status) _status "$@" ;;
+        install) _install ;;
+        restart) _restart "$@" ;;
+        remove) _remove "$@" ;;
+        logs) _logs "$@" ;;
+        health) _health "$@" ;;
+        config) _config "$@" ;;
+        enable) _enable "$@" ;;
+        disable) _disable "$@" ;;
+        test) _test "$@" ;;
+        --help|-h|help) dhis2_cli_show_help "$0"; exit 0 ;;
+        *) dhis2_log_error "Unknown subcommand: $sub"; exit "$DHIS2_EXIT_USAGE" ;;
+    esac
+}
+
+_list() {
+    local hosts; hosts=$(dhis2_inventory_group_hosts integration)
+    if [[ "$DHIS2_OPT_JSON" == true ]]; then
+        local arr="[" first=true h
+        for h in $hosts; do $first || arr+=","; first=false; arr+="\"$h\""; done
+        arr+="]"
+        dhis2_json_emit command=dhis2-integration hosts="$arr"
+    else
+        [[ -z "$hosts" ]] && echo "(none configured)" || echo "$hosts"
+    fi
+}
+
+_status()  { dhis2_ansible_adhoc "${1:-integration}" shell -a 'systemctl list-units --type=service --state=running --no-pager | grep -iE "integration|rapidpro"' -b -o; }
+_install() { "${DHIS2_CLI_ROOT}/bin/dhis2-deploy" apply --limit integration; }
+_restart() { dhis2_cli_confirm "Restart service $2 on $1?"; dhis2_ansible_adhoc "$1" systemd -a "name=$2 state=restarted" -b; }
+_remove()  { dhis2_cli_confirm "Remove integration host $1 configuration (data NOT deleted)?" "$1"; dhis2_log_warn "Removal preserves application data and credentials unless explicitly deleted (section 57.19)."; }
+_logs()    { dhis2_ansible_adhoc "$1" shell -a "journalctl -u $2 --no-pager -n 200" -b -o | dhis2_log_redact; }
+_health()  { dhis2_ansible_adhoc "$1" shell -a 'ss -tnl 2>/dev/null; systemctl status --no-pager' -b -o; }
+_config()  { dhis2_ansible_adhoc "$1" shell -a 'ls /etc/dhis2-integration/ 2>/dev/null; cat /etc/dhis2-integration/*.conf 2>/dev/null' -b -o | dhis2_log_redact; }
+_enable()  { dhis2_ansible_adhoc "$1" systemd -a "name=$2 enabled=yes state=started" -b; }
+_disable() { dhis2_ansible_adhoc "$1" systemd -a "name=$2 enabled=no state=stopped" -b; }
+_test()    { dhis2_ansible_adhoc "$1" shell -a "systemctl is-active $2" -b -o; }
+
+main "$@"

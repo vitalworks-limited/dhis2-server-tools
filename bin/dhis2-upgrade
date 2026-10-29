@@ -1,0 +1,241 @@
+#!/usr/bin/env bash
+# USAGE_START
+# dhis2-upgrade - controlled DHIS2 upgrade workflow (section 18, 57.9, 73-80).
+#
+# Usage:
+#   dhis2-upgrade releases
+#   dhis2-upgrade compatibility                   [--json]
+#   dhis2-upgrade check INSTANCE                  [--json]
+#   dhis2-upgrade plan INSTANCE --to VERSION      [--json]
+#   dhis2-upgrade precheck INSTANCE --to VERSION
+#   dhis2-upgrade dependencies INSTANCE
+#   dhis2-upgrade artifact --to VERSION [--out PATH]
+#   dhis2-upgrade stage INSTANCE --to VERSION
+#   dhis2-upgrade run INSTANCE --to VERSION
+#                 [--backup-before-migration] [--verify-backup]
+#                 [--monitor-migrations] [--migration-timeout SECONDS]
+#                 [--restore-on-failure] [--yes]
+#   dhis2-upgrade database INSTANCE --to VERSION  [...same migration options]
+#   dhis2-upgrade logs INSTANCE
+#   dhis2-upgrade verify INSTANCE
+#   dhis2-upgrade resume INSTANCE
+#   dhis2-upgrade status INSTANCE
+#   dhis2-upgrade rollback INSTANCE [--yes]
+#
+# The upgrade workflow is section 18.2 / 76 — preflight, state capture,
+# verified backup, WAR staging, controlled startup, Flyway monitoring,
+# health verification, audit record.
+# USAGE_END
+set -Eeuo pipefail
+. "$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")/.." && pwd)/lib/common.sh"
+
+main() {
+    dhis2_cli_parse_globals "$@"
+    set -- "${DHIS2_CLI_REMAINING[@]}"
+    [[ $# -eq 0 ]] && { dhis2_cli_show_help "$0"; exit "$DHIS2_EXIT_USAGE"; }
+    local sub="$1"; shift
+    case "$sub" in
+        releases) _releases ;;
+        compatibility) _compat ;;
+        check) _check "$@" ;;
+        plan) _plan "$@" ;;
+        precheck) _precheck "$@" ;;
+        dependencies) _deps "$@" ;;
+        artifact) _artifact "$@" ;;
+        stage) _stage "$@" ;;
+        run) _run "$@" ;;
+        database) _database "$@" ;;
+        logs) _logs "$@" ;;
+        verify) _verify "$@" ;;
+        resume) _resume "$@" ;;
+        status) _status "$@" ;;
+        rollback) _rollback "$@" ;;
+        --help|-h|help) dhis2_cli_show_help "$0"; exit 0 ;;
+        *) dhis2_log_error "Unknown subcommand: $sub"; exit "$DHIS2_EXIT_USAGE" ;;
+    esac
+}
+
+_releases() {
+    cat <<'EOF'
+Current supported DHIS2 release channels (consult releases.dhis2.org):
+
+  2.39 LTS   2.40 LTS   2.41       2.42       2.43+
+
+Use dhis2-upgrade compatibility to see the compatibility matrix.
+Resolution of a specific build is handled by the create-instance role
+using inventory variables (dhis2_version, dhis2_war_file).
+EOF
+}
+
+_compat() {
+    # Compatibility matrix - section 66.
+    if [[ "$DHIS2_OPT_JSON" == true ]]; then
+        cat "$DHIS2_CLI_ROOT/share/compatibility.json" 2>/dev/null || echo '{"error":"compatibility matrix not published yet"}'
+    else
+        dhis2_output_table "DHIS2|JAVA|TOMCAT|POSTGRES" \
+            "2.39|11|9|12-14" \
+            "2.40|11|9|13-15" \
+            "2.41|17|9|15-16" \
+            "2.42|17|9|15-16" \
+            "2.43|17|9|16"
+    fi
+}
+
+_check() {
+    local inst="${1:-}"
+    [[ -z "$inst" ]] && { dhis2_log_error "Usage: dhis2-upgrade check INSTANCE"; exit "$DHIS2_EXIT_USAGE"; }
+    dhis2_ansible_adhoc "$inst" shell -a 'java -version 2>&1 | head -1; dpkg -l tomcat9 2>/dev/null | tail -1' -b -o
+    "${DHIS2_CLI_ROOT}/bin/dhis2-instance" health "$inst"
+}
+
+_plan() {
+    local inst="${1:-}"; shift || true
+    local to=""
+    while (( $# )); do case "$1" in --to) to="$2"; shift ;; --to=*) to="${1#*=}" ;; esac; shift || true; done
+    [[ -z "$inst" || -z "$to" ]] && { dhis2_log_error "Usage: dhis2-upgrade plan INSTANCE --to VERSION"; exit "$DHIS2_EXIT_USAGE"; }
+    cat <<EOF
+Upgrade plan for $inst -> DHIS2 $to
+
+Stage 1 (resolve):       instance, db host/name/owner, current version, Java, Tomcat, Postgres
+Stage 2 (inspect db):    size, active connections, Flyway history, extensions, ownership
+Stage 3 (compatibility): DHIS2 $to vs installed Java/Tomcat/Postgres
+Stage 4 (capacity):      backup destination free disk, data vol headroom
+Stage 5 (backup):        pre-upgrade pg_dump --format=custom + manifest + checksum
+Stage 6 (configuration): dhis.conf points to intended database, credentials preserved
+Stage 7 (maintenance):   application stop, terminate target DB sessions only
+Stage 8 (stage WAR):     download + checksum verification into staging dir
+Stage 9 (start):         controlled application start, record migration-started
+Stage 10 (monitor):      Tomcat/DHIS2/Flyway, OOM, disk, health
+Stage 11 (verify):       responding, running version matches target, Flyway no failures
+Stage 12 (finish):       record source/target, duration, backup path
+
+Backup path (if --backup-before-migration): /var/backups/dhis2/<instance>-pre-upgrade-<ts>.dump
+EOF
+    _deps "$inst"
+    "${DHIS2_CLI_ROOT}/bin/dhis2-instance" health "$inst" || true
+}
+
+_precheck() { _plan "$@"; }
+
+_deps() {
+    local inst="${1:-}"
+    dhis2_ansible_adhoc "$inst" shell -a '
+        echo java=$(java -version 2>&1 | head -1)
+        echo tomcat=$(dpkg -l tomcat9 2>/dev/null | awk "/^ii/{print \$3; exit}")
+        echo os=$(. /etc/os-release; echo $ID-$VERSION_ID)
+    ' -b -o
+}
+
+_artifact() {
+    local to="" out="/var/cache/dhis2"
+    while (( $# )); do case "$1" in --to) to="$2"; shift ;; --to=*) to="${1#*=}" ;;
+                                   --out) out="$2"; shift ;; --out=*) out="${1#*=}" ;; esac; shift || true; done
+    [[ -z "$to" ]] && { dhis2_log_error "--to VERSION required"; exit "$DHIS2_EXIT_USAGE"; }
+    local inst_host; inst_host=$(dhis2_inventory_group_hosts instances | head -1)
+    [[ -z "$inst_host" ]] && { dhis2_log_error "No instance host to stage on"; exit "$DHIS2_EXIT_PREFLIGHT"; }
+    dhis2_ansible_adhoc "$inst_host" shell -a "
+        mkdir -p '$out'
+        url=https://releases.dhis2.org/$to/dhis.war
+        wget -O '$out/dhis-$to.war' \"\$url\" || curl -fsSL -o '$out/dhis-$to.war' \"\$url\"
+        test -s '$out/dhis-$to.war' || { echo artifact-empty; exit 1; }
+        sha256sum '$out/dhis-$to.war'
+    " -b -o
+}
+
+_stage() {
+    local inst="${1:-}"; shift || true
+    local to=""
+    while (( $# )); do case "$1" in --to) to="$2"; shift ;; --to=*) to="${1#*=}" ;; esac; shift || true; done
+    [[ -z "$inst" || -z "$to" ]] && { dhis2_log_error "Usage: dhis2-upgrade stage INSTANCE --to VERSION"; exit "$DHIS2_EXIT_USAGE"; }
+    _artifact --to "$to" --out "/var/cache/dhis2"
+    dhis2_log_info "Artifact staged on $inst (section 57.9). Running application is unchanged."
+}
+
+_run() {
+    local inst="${1:-}"; shift || true
+    local to="" backup=true verify=true monitor=true timeout="" restore=false
+    while (( $# )); do
+        case "$1" in
+            --to) to="$2"; shift ;; --to=*) to="${1#*=}" ;;
+            --no-backup-before-migration) backup=false ;;
+            --backup-before-migration) backup=true ;;
+            --verify-backup) verify=true ;;
+            --no-verify-backup) verify=false ;;
+            --monitor-migrations) monitor=true ;;
+            --no-monitor-migrations) monitor=false ;;
+            --migration-timeout) timeout="$2"; shift ;;
+            --restore-on-failure) restore=true ;;
+        esac
+        shift || true
+    done
+    [[ -z "$inst" || -z "$to" ]] && { dhis2_log_error "Usage: dhis2-upgrade run INSTANCE --to VERSION"; exit "$DHIS2_EXIT_USAGE"; }
+
+    dhis2_lock_acquire "upgrade.$inst" || exit $?
+
+    dhis2_log_info "Stage 1 - resolve target"
+    _plan "$inst" --to "$to"
+    dhis2_cli_confirm "Proceed with upgrade of $inst to DHIS2 $to?" "$inst"
+
+    # Stage 5: backup
+    local backup_path=""
+    if $backup; then
+        dhis2_log_info "Stage 5 - pre-upgrade backup"
+        backup_path="/var/backups/dhis2/${inst}-pre-upgrade-$(date -u +%Y%m%d-%H%M%S).dump"
+        "${DHIS2_CLI_ROOT}/bin/dhis2-backup" create "$inst" --format custom --out /var/backups/dhis2 --yes
+        $verify && "${DHIS2_CLI_ROOT}/bin/dhis2-backup" verify "$backup_path" > /dev/null || true
+    fi
+
+    # Stage 8: stage WAR
+    _stage "$inst" --to "$to"
+
+    # Stage 9/10: controlled apply via Ansible, passing migration knobs
+    local -a args=(apply --instance "$inst" --target-dhis2-version "$to" --database-upgrade-mode auto --allow-db-migrations)
+    $backup && args+=(--backup-before-migration)
+    $verify && args+=(--verify-backup)
+    $monitor && args+=(--monitor-migrations)
+    [[ -n "$timeout" ]] && args+=(--migration-timeout "$timeout")
+    $restore && args+=(--restore-on-failure)
+    "${DHIS2_CLI_ROOT}/bin/dhis2-deploy" "${args[@]}" --yes
+
+    # Stage 11: verify
+    "${DHIS2_CLI_ROOT}/bin/dhis2-instance" endpoint check "$inst" || { dhis2_log_error "Post-upgrade endpoint check failed"; exit "$DHIS2_EXIT_HEALTH"; }
+
+    dhis2_log_audit dhis2-upgrade "{\"instance\":\"$inst\",\"to\":\"$to\",\"backup\":\"$backup_path\"}" "ok"
+    dhis2_log_info "Upgrade complete."
+}
+
+_database() { _run "$@"; }
+
+_logs() {
+    local inst="${1:-}"
+    "${DHIS2_CLI_ROOT}/bin/dhis2-instance" logs "$inst" --lines 500
+}
+
+_verify() {
+    local inst="${1:-}"
+    "${DHIS2_CLI_ROOT}/bin/dhis2-instance" endpoint check "$inst"
+    "${DHIS2_CLI_ROOT}/bin/dhis2-instance" version "$inst"
+}
+
+_resume() {
+    local inst="${1:-}"
+    local sd; sd=$(dhis2_config_state_dir)
+    dhis2_log_info "Last upgrade state for $inst:"
+    cat "$sd/upgrade.$inst.state" 2>/dev/null || echo "(no recorded state)"
+    dhis2_log_warn "resume MUST NOT re-run destructive steps - manually resume from last completed stage (section 57.9)."
+}
+
+_status() {
+    local inst="${1:-}"
+    _verify "$inst"
+}
+
+_rollback() {
+    local inst="${1:-}"
+    [[ -z "$inst" ]] && { dhis2_log_error "Usage: dhis2-upgrade rollback INSTANCE"; exit "$DHIS2_EXIT_USAGE"; }
+    dhis2_log_warn "WAR rollback does NOT revert completed database migrations (section 18.3)."
+    dhis2_cli_confirm "Rollback WAR for $inst? For full DB rollback, use dhis2-restore database --backup PRE_UPGRADE_BACKUP." "$inst"
+    "${DHIS2_CLI_ROOT}/bin/dhis2-instance" war rollback "$inst" --yes
+}
+
+main "$@"

@@ -1,0 +1,168 @@
+#!/usr/bin/env bash
+# USAGE_START
+# dhis2-logs - log inspection and diagnostic bundles (section 22, 57.13).
+#
+# Usage:
+#   dhis2-logs INSTANCE                      [-f] [--since 1h] [--lines N] [--grep PAT]
+#   dhis2-logs postgres                      [-f] [--since 1h] [--lines N]
+#   dhis2-logs proxy                         [-f] [--since 1h] [--lines N]
+#   dhis2-logs monitor                       [-f] [--since 1h] [--lines N]
+#   dhis2-logs startup INSTANCE
+#   dhis2-logs migration INSTANCE
+#   dhis2-logs database                      (shortcut for postgres)
+#   dhis2-logs list                          [--host HOST]
+#   dhis2-logs size HOST
+#   dhis2-logs rotate HOST                   [--yes]
+#   dhis2-logs bundle [HOST|all]  --out PATH [--include SECTIONS]
+#   dhis2-logs export HOST PATH
+#   dhis2-logs redact FILE                   (prints redacted copy to stdout)
+#
+# Diagnostic bundles redact secrets by default (section 57.13).
+# USAGE_END
+set -Eeuo pipefail
+. "$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")/.." && pwd)/lib/common.sh"
+
+main() {
+    dhis2_cli_parse_globals "$@"
+    set -- "${DHIS2_CLI_REMAINING[@]}"
+    [[ $# -eq 0 ]] && { dhis2_cli_show_help "$0"; exit "$DHIS2_EXIT_USAGE"; }
+    local target="$1"; shift
+    case "$target" in
+        list) _list ;;
+        size) _size "$@" ;;
+        rotate) _rotate "$@" ;;
+        bundle) _bundle "$@" ;;
+        export) _export "$@" ;;
+        redact) _redact "$@" ;;
+        startup) _startup "$@" ;;
+        migration) _migration "$@" ;;
+        database|postgres) _postgres "$@" ;;
+        proxy) _proxy "$@" ;;
+        monitor) _monitor "$@" ;;
+        --help|-h|help) dhis2_cli_show_help "$0"; exit 0 ;;
+        *) _instance "$target" "$@" ;;
+    esac
+}
+
+_journal() {
+    local host="$1" unit="$2"; shift 2 || true
+    local follow='' since='' lines=200 grep=''
+    while (( $# )); do
+        case "$1" in
+            -f|--follow) follow="-f" ;;
+            --since) since="--since '$2'"; shift ;;
+            --since=*) since="--since '${1#*=}'" ;;
+            --lines) lines="$2"; shift ;;
+            --lines=*) lines="${1#*=}" ;;
+            --grep) grep="$2"; shift ;;
+            --grep=*) grep="${1#*=}" ;;
+        esac
+        shift || true
+    done
+    local cmd="journalctl -u $unit --no-pager -n $lines $since $follow"
+    [[ -n "$grep" ]] && cmd="$cmd | grep -E '$grep'"
+    dhis2_ansible_adhoc "$host" shell -a "$cmd" -b -o | dhis2_log_redact
+}
+
+_instance() {
+    local inst="$1"; shift || true
+    _journal "$inst" tomcat9 "$@"
+}
+
+_postgres() {
+    local host; host=$(dhis2_inventory_group_hosts databases | head -1)
+    _journal "$host" postgresql "$@"
+}
+
+_proxy() {
+    local host; host=$(dhis2_inventory_group_hosts web | head -1)
+    local svc; svc=nginx
+    _journal "$host" "$svc" "$@"
+}
+
+_monitor() {
+    local host; host=$(dhis2_inventory_group_hosts monitoring | head -1)
+    _journal "$host" munin-node "$@"
+}
+
+_startup() {
+    local inst="${1:-}"
+    _journal "$inst" tomcat9 --since '15 minutes ago' --grep '(Starting|Started|ERROR|FATAL)'
+}
+
+_migration() {
+    local inst="${1:-}"
+    _journal "$inst" tomcat9 --since '1 hour ago' --grep '(Flyway|Migrated|Migration)'
+}
+
+_list() {
+    local host="${DHIS2_OPT_HOST:-$(dhis2_inventory_group_hosts databases | head -1)}"
+    dhis2_ansible_adhoc "$host" shell -a 'ls -lhSr /var/log/*.log /var/log/*/*.log 2>/dev/null | tail -30' -b -o
+}
+
+_size() {
+    local host="${1:-}"
+    dhis2_ansible_adhoc "$host" shell -a 'du -shx /var/log 2>/dev/null; journalctl --disk-usage 2>/dev/null' -b -o
+}
+
+_rotate() {
+    local host="${1:-}"
+    dhis2_cli_confirm "Rotate logs on $host?"
+    dhis2_ansible_adhoc "$host" shell -a 'logrotate -f /etc/logrotate.conf' -b -o
+}
+
+_bundle() {
+    local scope="${1:-all}"; shift || true
+    local out=""
+    while (( $# )); do case "$1" in --out) out="$2"; shift ;; --out=*) out="${1#*=}" ;; esac; shift || true; done
+    [[ -z "$out" ]] && out="/var/log/dhis2-server-tools/bundles/bundle-$(date -u +%Y%m%d-%H%M%S)"
+    local td
+    td=$(dhis2_cli_register_tempdir)
+    local manifest="$td/MANIFEST.txt"
+    {
+        echo "generated=$(date -u +%FT%TZ)"
+        echo "tool=dhis2-server-tools $DHIS2_CLI_VERSION"
+        echo "scope=$scope"
+        echo "controller=$(hostname)"
+        echo "user=${USER:-unknown}"
+    } > "$manifest"
+
+    local -a hosts
+    if [[ "$scope" == "all" ]]; then
+        mapfile -t hosts < <(dhis2_inventory_hosts | head -40)
+    else
+        hosts=("$scope")
+    fi
+
+    local h
+    for h in "${hosts[@]}"; do
+        [[ -z "$h" || "$h" == "127.0.0.1" ]] && continue
+        local hdir="$td/$h"
+        mkdir -p "$hdir"
+        dhis2_ansible_adhoc "$h" shell -a 'systemctl list-units --type=service --state=running --no-pager' -b -o 2>&1 | dhis2_log_redact > "$hdir/services.txt" || true
+        dhis2_ansible_adhoc "$h" shell -a 'journalctl --no-pager -n 500' -b -o 2>&1 | dhis2_log_redact > "$hdir/journal.txt" || true
+        dhis2_ansible_adhoc "$h" shell -a 'ss -tnlp 2>/dev/null | head -40' -b -o 2>&1 | dhis2_log_redact > "$hdir/listeners.txt" || true
+        dhis2_ansible_adhoc "$h" shell -a 'df -h; echo ---; free -h; echo ---; uptime' -b -o > "$hdir/resources.txt" 2>&1 || true
+        echo "collected=$h" >> "$manifest"
+    done
+
+    mkdir -p "$(dirname "$out")"
+    tar -czf "${out}.tgz" -C "$td" .
+    chmod 600 "${out}.tgz"
+    dhis2_log_info "Bundle: ${out}.tgz"
+    dhis2_log_warn "Review the bundle before sharing externally - redaction is best-effort (section 57.13)."
+}
+
+_export() {
+    local host="${1:-}" path="${2:-}"
+    [[ -z "$host" || -z "$path" ]] && { dhis2_log_error "Usage: dhis2-logs export HOST PATH"; exit "$DHIS2_EXIT_USAGE"; }
+    dhis2_ansible_adhoc "$host" fetch -a "src=$path dest=./collected/" -b
+}
+
+_redact() {
+    local f="${1:-}"
+    [[ -z "$f" ]] && { dhis2_log_error "Usage: dhis2-logs redact FILE"; exit "$DHIS2_EXIT_USAGE"; }
+    dhis2_log_redact < "$f"
+}
+
+main "$@"

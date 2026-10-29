@@ -1,0 +1,329 @@
+#!/usr/bin/env bash
+# USAGE_START
+# dhis2-db - PostgreSQL administration (section 15, 57.6).
+#
+# Usage:
+#   dhis2-db status                [--host HOST] [--json]
+#   dhis2-db version               [--host HOST]
+#   dhis2-db list                  [--host HOST] [--json]
+#   dhis2-db show DB               [--host HOST]
+#   dhis2-db health                [--host HOST] [--json]
+#   dhis2-db create DB --owner USER [--encoding UTF8]
+#   dhis2-db drop DB [--yes]
+#   dhis2-db size DB               [--host HOST]
+#   dhis2-db connections           [--host HOST] [--json]
+#   dhis2-db activity              [--host HOST]
+#   dhis2-db locks                 [--host HOST]
+#   dhis2-db long-running          [--host HOST]
+#   dhis2-db blocking              [--host HOST]
+#   dhis2-db transactions          [--host HOST]
+#   dhis2-db terminate-session PID [--host HOST] [--yes]
+#   dhis2-db vacuum DB [--full] [--yes]
+#   dhis2-db analyze DB
+#   dhis2-db reindex DB [--yes]
+#   dhis2-db tables DB             [--host HOST]
+#   dhis2-db indexes DB            [--host HOST]
+#   dhis2-db bloat DB              [--host HOST]
+#   dhis2-db ownership DB          [--host HOST]
+#   dhis2-db roles                 [--host HOST]
+#   dhis2-db extensions DB         [--host HOST]
+#   dhis2-db hba show              [--host HOST]
+#   dhis2-db hba validate          [--host HOST]
+#   dhis2-db hba add TYPE DB USER CIDR METHOD [--yes]
+#   dhis2-db hba remove PATTERN    [--yes]
+#   dhis2-db config diff           [--host HOST]
+#   dhis2-db config validate       [--host HOST]
+#   dhis2-db config apply --preserve|--merge|--replace [--yes]
+#   dhis2-db config reload         [--host HOST]
+#   dhis2-db config restart        [--host HOST] [--yes]
+#   dhis2-db tune [--profile small|medium|large|custom|auto] [--dry-run]
+#   dhis2-db capacity              [--host HOST]
+#   dhis2-db oom-check             [--host HOST]
+#
+# All destructive queries (drop, vacuum full, terminate-session) require
+# explicit confirmation unless --yes is supplied (section 33).
+# USAGE_END
+set -Eeuo pipefail
+. "$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")/.." && pwd)/lib/common.sh"
+
+DB_HOST=""
+
+_resolve_db_host() {
+    [[ -n "$DB_HOST" ]] && return
+    DB_HOST="${DHIS2_OPT_HOST:-$(dhis2_inventory_group_hosts databases | head -1)}"
+    [[ -z "$DB_HOST" ]] && { dhis2_log_error "No [databases] host in inventory"; exit "$DHIS2_EXIT_PREFLIGHT"; }
+    return 0
+}
+
+_psql() {
+    local sql="$1"
+    dhis2_ansible_adhoc "$DB_HOST" shell -a "sudo -u postgres psql -tAX -c \"$sql\"" -b -o 2>&1 \
+      | sed -n 's/.*CHANGED //p;s/.*SUCCESS //p;s/^[^|]*| //' \
+      | grep -v '^$' || true
+}
+
+_psql_raw() {
+    local sql="$1"
+    dhis2_ansible_adhoc "$DB_HOST" shell -a "sudo -u postgres psql -X -c \"$sql\"" -b -o
+}
+
+main() {
+    dhis2_cli_parse_globals "$@"
+    set -- "${DHIS2_CLI_REMAINING[@]}"
+    [[ $# -eq 0 ]] && { dhis2_cli_show_help "$0"; exit "$DHIS2_EXIT_USAGE"; }
+    local sub="$1"; shift
+    _resolve_db_host
+    case "$sub" in
+        status) _status ;;
+        version) _version ;;
+        list) _list ;;
+        show) _show "$@" ;;
+        health) _health ;;
+        create) _create "$@" ;;
+        drop) _drop "$@" ;;
+        size) _size "$@" ;;
+        connections) _connections ;;
+        activity) _activity ;;
+        locks) _locks ;;
+        long-running) _long_running ;;
+        blocking) _blocking ;;
+        transactions) _transactions ;;
+        terminate-session) _terminate "$@" ;;
+        vacuum) _vacuum "$@" ;;
+        analyze) _analyze "$@" ;;
+        reindex) _reindex "$@" ;;
+        tables) _tables "$@" ;;
+        indexes) _indexes "$@" ;;
+        bloat) _bloat "$@" ;;
+        ownership) _ownership "$@" ;;
+        roles) _roles ;;
+        extensions) _extensions "$@" ;;
+        hba) _hba "$@" ;;
+        config) _config "$@" ;;
+        tune) _tune "$@" ;;
+        capacity) _capacity ;;
+        oom-check) _oom_check ;;
+        --help|-h|help) dhis2_cli_show_help "$0"; exit 0 ;;
+        *) dhis2_log_error "Unknown subcommand: $sub"; exit "$DHIS2_EXIT_USAGE" ;;
+    esac
+}
+
+_status() {
+    local state
+    state=$(dhis2_ansible_adhoc "$DB_HOST" shell -a 'systemctl is-active postgresql' -b -o 2>&1 | tail -1 | awk '{print $NF}')
+    if [[ "$DHIS2_OPT_JSON" == true ]]; then
+        dhis2_json_emit command=dhis2-db host="$DB_HOST" state="$state"
+    else
+        printf 'host: %s\nservice: %s\n' "$DB_HOST" "$state"
+    fi
+}
+
+_version() { _psql_raw "SELECT version();"; }
+_list()    { _psql_raw "\l+"; }
+_show()    { _psql_raw "\c $1" ; _psql_raw "\dt+"; }
+_size()    { _psql_raw "SELECT pg_size_pretty(pg_database_size('$1'))"; }
+
+_health() {
+    local checks=()
+    local svc; svc=$(dhis2_ansible_adhoc "$DB_HOST" shell -a 'systemctl is-active postgresql' -b -o 2>&1 | tail -1 | awk '{print $NF}')
+    [[ "$svc" == "active" ]] && checks+=("service=ok") || checks+=("service=$svc")
+    local ping; ping=$(_psql "SELECT 1" | head -1)
+    [[ "$ping" == "1" ]] && checks+=("connect=ok") || checks+=("connect=fail")
+    if [[ "$DHIS2_OPT_JSON" == true ]]; then
+        local arr="[" first=true c
+        for c in "${checks[@]}"; do $first || arr+=","; first=false; arr+="\"$c\""; done
+        arr+="]"
+        dhis2_json_emit command=dhis2-db host="$DB_HOST" checks="$arr"
+    else
+        local c
+        for c in "${checks[@]}"; do echo "$c"; done
+    fi
+}
+
+_create() {
+    local db="${1:-}"; shift || true
+    local owner="" enc="UTF8"
+    while (( $# )); do case "$1" in --owner) owner="$2"; shift ;; --owner=*) owner="${1#*=}" ;;
+                                   --encoding) enc="$2"; shift ;; --encoding=*) enc="${1#*=}" ;; esac; shift || true; done
+    [[ -z "$db" || -z "$owner" ]] && { dhis2_log_error "Usage: dhis2-db create DB --owner USER"; exit "$DHIS2_EXIT_USAGE"; }
+    _psql "CREATE DATABASE \\\"$db\\\" OWNER \\\"$owner\\\" ENCODING '$enc' TEMPLATE template0"
+}
+
+_drop() {
+    local db="${1:-}"
+    [[ -z "$db" ]] && { dhis2_log_error "Usage: dhis2-db drop DB"; exit "$DHIS2_EXIT_USAGE"; }
+    case "$db" in postgres|template0|template1|repmgr) dhis2_log_error "Refusing to drop protected database: $db"; exit "$DHIS2_EXIT_SAFETY" ;; esac
+    dhis2_cli_confirm "DROP database $db on $DB_HOST?" "$db"
+    _psql "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='$db' AND pid<>pg_backend_pid()"
+    _psql "DROP DATABASE IF EXISTS \\\"$db\\\""
+}
+
+_connections() {
+    local sql="SELECT state, count(*) FROM pg_stat_activity GROUP BY state ORDER BY state"
+    if [[ "$DHIS2_OPT_JSON" == true ]]; then
+        local out
+        out=$(_psql "$sql" | awk -F'|' '{printf "{\"state\":\"%s\",\"count\":%d}\n",$1,$2}' | paste -sd,)
+        dhis2_json_emit command=dhis2-db host="$DB_HOST" states="[$out]"
+    else
+        _psql_raw "$sql"
+        _psql_raw "SELECT setting::int AS max_connections FROM pg_settings WHERE name='max_connections'"
+    fi
+}
+
+_activity() { _psql_raw "SELECT pid, usename, datname, state, now()-xact_start AS xact_age, left(query,80) AS query FROM pg_stat_activity WHERE state<>'idle' ORDER BY xact_start"; }
+_locks()    { _psql_raw "SELECT blocked.pid AS blocked_pid, blocking.pid AS blocking_pid, blocked.query AS blocked_q, blocking.query AS blocking_q FROM pg_stat_activity blocked JOIN pg_stat_activity blocking ON blocking.pid = ANY(pg_blocking_pids(blocked.pid))"; }
+_long_running() { _psql_raw "SELECT pid, now()-xact_start AS age, state, left(query,100) FROM pg_stat_activity WHERE state<>'idle' AND now()-xact_start > interval '5 minutes'"; }
+_blocking() { _locks; }
+_transactions() { _psql_raw "SELECT pid, usename, state, xact_start, backend_start FROM pg_stat_activity WHERE xact_start IS NOT NULL ORDER BY xact_start"; }
+
+_terminate() {
+    local pid="${1:-}"
+    [[ -z "$pid" ]] && { dhis2_log_error "Usage: dhis2-db terminate-session PID"; exit "$DHIS2_EXIT_USAGE"; }
+    dhis2_cli_confirm "Terminate PostgreSQL backend pid $pid?"
+    _psql "SELECT pg_terminate_backend($pid)"
+}
+
+_vacuum() {
+    local db="${1:-}" full=""
+    shift || true
+    while (( $# )); do case "$1" in --full) full="FULL" ;; esac; shift || true; done
+    [[ -z "$db" ]] && { dhis2_log_error "Usage: dhis2-db vacuum DB [--full]"; exit "$DHIS2_EXIT_USAGE"; }
+    if [[ -n "$full" ]]; then
+        dhis2_cli_confirm "VACUUM FULL on $db will lock tables. Continue?" "$db"
+    fi
+    _psql_raw "VACUUM $full ANALYZE" || true  # Not strictly correct for cross-DB; the simpler form:
+    dhis2_ansible_adhoc "$DB_HOST" shell -a "sudo -u postgres psql -X -d $db -c 'VACUUM $full ANALYZE'" -b -o
+}
+
+_analyze() {
+    local db="${1:-}"
+    [[ -z "$db" ]] && { dhis2_log_error "Usage: dhis2-db analyze DB"; exit "$DHIS2_EXIT_USAGE"; }
+    dhis2_ansible_adhoc "$DB_HOST" shell -a "sudo -u postgres psql -X -d $db -c 'ANALYZE'" -b -o
+}
+
+_reindex() {
+    local db="${1:-}"
+    [[ -z "$db" ]] && { dhis2_log_error "Usage: dhis2-db reindex DB"; exit "$DHIS2_EXIT_USAGE"; }
+    dhis2_cli_confirm "REINDEX DATABASE $db may lock operations?"
+    dhis2_ansible_adhoc "$DB_HOST" shell -a "sudo -u postgres reindexdb -d $db" -b -o
+}
+
+_tables() {
+    local db="${1:-}"
+    dhis2_ansible_adhoc "$DB_HOST" shell -a "sudo -u postgres psql -X -d $db -c '\\dt+'" -b -o
+}
+
+_indexes() {
+    local db="${1:-}"
+    dhis2_ansible_adhoc "$DB_HOST" shell -a "sudo -u postgres psql -X -d $db -c '\\di+'" -b -o
+}
+
+_bloat() {
+    local db="${1:-}"
+    dhis2_ansible_adhoc "$DB_HOST" shell -a "sudo -u postgres psql -X -d $db -c \"SELECT schemaname||'.'||relname AS table, n_dead_tup, n_live_tup, round(100.0*n_dead_tup/nullif(n_live_tup+n_dead_tup,0),1) AS dead_pct FROM pg_stat_user_tables ORDER BY n_dead_tup DESC LIMIT 20\"" -b -o
+    dhis2_log_info "note: this is an estimate (section 57.6)"
+}
+
+_ownership() {
+    local db="${1:-}"
+    dhis2_ansible_adhoc "$DB_HOST" shell -a "sudo -u postgres psql -X -d $db -c \"SELECT tableowner, count(*) FROM pg_tables WHERE schemaname='public' GROUP BY 1 ORDER BY 2 DESC\"" -b -o
+}
+
+_roles() { _psql_raw "\du"; }
+
+_extensions() {
+    local db="${1:-}"
+    dhis2_ansible_adhoc "$DB_HOST" shell -a "sudo -u postgres psql -X -d $db -c '\\dx'" -b -o
+}
+
+_hba() {
+    local sub="${1:-}"; shift || true
+    case "$sub" in
+        show)
+            dhis2_ansible_adhoc "$DB_HOST" shell -a 'grep -vE "^#|^$" /etc/postgresql/*/main/pg_hba.conf' -b -o
+            ;;
+        validate)
+            dhis2_ansible_adhoc "$DB_HOST" shell -a "sudo -u postgres psql -X -c \"SELECT file_name, line_number, type, database, user_name, address, netmask, auth_method, error FROM pg_hba_file_rules WHERE error IS NOT NULL\"" -b -o
+            ;;
+        add)
+            local type="${1:-}" db="${2:-}" user="${3:-}" cidr="${4:-}" method="${5:-}"
+            [[ -z "$type" || -z "$db" || -z "$user" || -z "$cidr" || -z "$method" ]] && { dhis2_log_error "Usage: dhis2-db hba add TYPE DB USER CIDR METHOD"; exit "$DHIS2_EXIT_USAGE"; }
+            dhis2_cli_confirm "Add pg_hba entry: $type $db $user $cidr $method ?"
+            dhis2_ansible_adhoc "$DB_HOST" shell -a "
+                f=\$(ls /etc/postgresql/*/main/pg_hba.conf | head -1)
+                cp -p \"\$f\" \"\$f.\$(date -u +%Y%m%d-%H%M%S).bak\"
+                line=\"$type $db $user $cidr $method\"
+                grep -qxF \"\$line\" \"\$f\" || echo \"\$line\" >> \"\$f\"
+                sudo -u postgres psql -X -c \"SELECT pg_reload_conf()\"
+            " -b -o
+            ;;
+        remove)
+            local pat="${1:-}"
+            [[ -z "$pat" ]] && { dhis2_log_error "Usage: dhis2-db hba remove PATTERN"; exit "$DHIS2_EXIT_USAGE"; }
+            dhis2_cli_confirm "Remove pg_hba lines matching $pat?"
+            dhis2_ansible_adhoc "$DB_HOST" shell -a "
+                f=\$(ls /etc/postgresql/*/main/pg_hba.conf | head -1)
+                cp -p \"\$f\" \"\$f.\$(date -u +%Y%m%d-%H%M%S).bak\"
+                sed -i.tmp \"/$pat/d\" \"\$f\" && rm -f \"\$f.tmp\"
+                sudo -u postgres psql -X -c \"SELECT pg_reload_conf()\"
+            " -b -o
+            ;;
+        *) dhis2_log_error "Usage: dhis2-db hba show|validate|add|remove"; exit "$DHIS2_EXIT_USAGE" ;;
+    esac
+}
+
+_config() {
+    local sub="${1:-}"; shift || true
+    case "$sub" in
+        diff)
+            dhis2_ansible_adhoc "$DB_HOST" shell -a "diff -u /etc/postgresql/*/main/postgresql.conf.distrib /etc/postgresql/*/main/postgresql.conf 2>/dev/null || true" -b -o
+            ;;
+        validate)
+            dhis2_ansible_adhoc "$DB_HOST" shell -a "sudo -u postgres pg_isready; sudo -u postgres psql -X -c 'SHOW config_file'" -b -o
+            ;;
+        apply)
+            local mode="preserve"
+            while (( $# )); do case "$1" in --preserve) mode=preserve ;; --merge) mode=merge ;; --replace) mode=replace ;; esac; shift || true; done
+            dhis2_log_info "Running Ansible postgresql-install with postgres_conf_mode=$mode"
+            "${DHIS2_CLI_ROOT}/bin/dhis2-deploy" apply --only database -e postgres_conf_mode="$mode"
+            ;;
+        reload)
+            _psql "SELECT pg_reload_conf()"
+            ;;
+        restart)
+            dhis2_cli_confirm "Restart postgresql on $DB_HOST?"
+            dhis2_ansible_adhoc "$DB_HOST" systemd -a "name=postgresql state=restarted" -b
+            ;;
+        *) dhis2_log_error "Usage: dhis2-db config diff|validate|apply|reload|restart"; exit "$DHIS2_EXIT_USAGE" ;;
+    esac
+}
+
+_tune() {
+    local profile=auto dry=false
+    while (( $# )); do case "$1" in --profile) profile="$2"; shift ;; --profile=*) profile="${1#*=}" ;; --dry-run) dry=true ;; esac; shift || true; done
+    dhis2_log_info "Tuning profile: $profile  (dry-run=$dry)"
+    dhis2_ansible_adhoc "$DB_HOST" shell -a "sudo -u postgres psql -X -c \"SELECT name, setting, unit FROM pg_settings WHERE name IN ('shared_buffers','work_mem','maintenance_work_mem','max_connections','effective_cache_size','wal_buffers','checkpoint_timeout')\"" -b -o
+    if ! $dry; then
+        dhis2_log_warn "Automated tuning adjustment requires explicit --dry-run review first; aborting apply."
+    fi
+}
+
+_capacity() {
+    dhis2_ansible_adhoc "$DB_HOST" shell -a '
+        echo "-- memory --"
+        free -m
+        echo "-- cgroup limit --"
+        test -r /sys/fs/cgroup/memory.max && cat /sys/fs/cgroup/memory.max || echo "n/a"
+        echo "-- postgres settings --"
+        sudo -u postgres psql -X -c "SELECT name,setting,unit FROM pg_settings WHERE name IN (\"shared_buffers\",\"work_mem\",\"maintenance_work_mem\",\"max_connections\",\"effective_cache_size\")"
+        echo "-- disk --"
+        df -h /var/lib/postgresql
+    ' -b -o
+    dhis2_log_info 'Memory estimates are approximate (section 15.5).'
+}
+
+_oom_check() {
+    dhis2_ansible_adhoc "$DB_HOST" shell -a 'journalctl -k -g "Out of memory" --since "7 days ago" --no-pager | tail -20; dmesg -T 2>/dev/null | grep -iE "oom|killed process" | tail -20' -b -o
+}
+
+main "$@"

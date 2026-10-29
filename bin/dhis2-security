@@ -1,0 +1,169 @@
+#!/usr/bin/env bash
+# USAGE_START
+# dhis2-security - security posture checks (section 25, 57.16).
+#
+# Usage:
+#   dhis2-security audit                   [--json]
+#   dhis2-security firewall HOST
+#   dhis2-security ssh HOST
+#   dhis2-security permissions
+#   dhis2-security secrets                 (delegates to dhis2-inventory secrets)
+#   dhis2-security harden HOST [--yes]
+#   dhis2-security ports HOST
+#   dhis2-security tls
+#   dhis2-security database
+#   dhis2-security config
+#   dhis2-security packages HOST
+#   dhis2-security report                  [--json]
+#
+# Secret values are never printed. Findings use INFO/LOW/MEDIUM/HIGH/CRITICAL.
+# USAGE_END
+set -Eeuo pipefail
+. "$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")/.." && pwd)/lib/common.sh"
+
+FINDINGS=()
+
+_f() { FINDINGS+=("$1|$2"); }
+
+main() {
+    dhis2_cli_parse_globals "$@"
+    set -- "${DHIS2_CLI_REMAINING[@]}"
+    [[ $# -eq 0 ]] && { dhis2_cli_show_help "$0"; exit "$DHIS2_EXIT_USAGE"; }
+    local sub="$1"; shift
+    case "$sub" in
+        audit|report) _audit ;;
+        firewall) _firewall "$@" ;;
+        ssh) _ssh "$@" ;;
+        permissions) _permissions ;;
+        secrets) "${DHIS2_CLI_ROOT}/bin/dhis2-inventory" secrets ;;
+        harden) _harden "$@" ;;
+        ports) _ports "$@" ;;
+        tls) "${DHIS2_CLI_ROOT}/bin/dhis2-tls" verify ;;
+        database) _database ;;
+        config) _config ;;
+        packages) _packages "$@" ;;
+        --help|-h|help) dhis2_cli_show_help "$0"; exit 0 ;;
+        *) dhis2_log_error "Unknown subcommand: $sub"; exit "$DHIS2_EXIT_USAGE" ;;
+    esac
+    _report
+}
+
+_audit() {
+    _permissions
+    _database
+    _config
+    for h in $(dhis2_inventory_hosts); do
+        [[ "$h" == "127.0.0.1" ]] && continue
+        _ports "$h"
+    done
+}
+
+_firewall() {
+    local h="${1:-}"; [[ -z "$h" ]] && { dhis2_log_error "Usage: dhis2-security firewall HOST"; exit "$DHIS2_EXIT_USAGE"; }
+    dhis2_ansible_adhoc "$h" shell -a 'ufw status verbose 2>/dev/null || iptables -L -n' -b -o
+}
+
+_ssh() {
+    local h="${1:-}"
+    local out
+    out=$(dhis2_ansible_adhoc "$h" shell -a "grep -E '^(PermitRootLogin|PasswordAuthentication|PubkeyAuthentication)' /etc/ssh/sshd_config" -b -o 2>&1 | tail -n +2)
+    echo "$out"
+    echo "$out" | grep -qE 'PermitRootLogin\s+(yes|without-password)' && _f HIGH "$h: SSH root login permitted"
+    echo "$out" | grep -qE 'PasswordAuthentication\s+yes' && _f MEDIUM "$h: SSH password auth enabled"
+}
+
+_permissions() {
+    local inst; inst=$(dhis2_inventory_group_hosts instances)
+    for i in $inst; do
+        local out
+        out=$(dhis2_ansible_adhoc "$i" shell -a 'stat -c "%a %U %G %n" /opt/dhis2/dhis.conf 2>/dev/null' -b -o 2>&1 | tail -1)
+        case "$out" in
+            600*)                            : ;;
+            6??*|4??*|7??*)                  _f LOW  "$i: dhis.conf permissions=$out" ;;
+            *) if [[ -n "$out" ]]; then     _f HIGH "$i: dhis.conf unexpected permissions: $out"; fi ;;
+        esac
+    done
+    local db; db=$(dhis2_inventory_group_hosts databases | head -1)
+    [[ -n "$db" ]] && {
+        local pgo
+        pgo=$(dhis2_ansible_adhoc "$db" shell -a 'stat -c "%a %U %G %n" /etc/postgresql/*/main/pg_hba.conf 2>/dev/null' -b -o 2>&1 | tail -1)
+        _f INFO "$db: $pgo"
+    }
+}
+
+_ports() {
+    local h="${1:-}"
+    local out
+    out=$(dhis2_ansible_adhoc "$h" shell -a 'ss -tnlp 2>/dev/null' -b -o 2>&1 | tail -n +2)
+    echo "$out" | grep -E '(0\.0\.0\.0|\[::\]).*:(5432|9090|3000|8080)' | while IFS= read -r line; do
+        local port; port=$(echo "$line" | grep -oE ':(5432|9090|3000|8080)' | head -1 | tr -d :)
+        case "$port" in
+            5432) _f HIGH "$h: PostgreSQL listening on all interfaces" ;;
+            9090|3000) _f MEDIUM "$h: monitoring UI listening on all interfaces (port $port)" ;;
+            8080) _f INFO "$h: Tomcat listening on all interfaces (expected behind proxy)" ;;
+        esac
+    done
+}
+
+_database() {
+    local h; h=$(dhis2_inventory_group_hosts databases | head -1)
+    [[ -z "$h" ]] && return
+    local hba
+    hba=$(dhis2_ansible_adhoc "$h" shell -a 'grep -vE "^(#|$)" /etc/postgresql/*/main/pg_hba.conf 2>/dev/null | tail -40' -b -o 2>&1 | tail -n +2)
+    echo "$hba" | grep -qE '\btrust\b' && _f HIGH "pg_hba.conf uses trust auth"
+    echo "$hba" | grep -qE '0\.0\.0\.0/0' && _f CRITICAL "pg_hba.conf allows all IPv4 addresses"
+}
+
+_config() {
+    local inst; inst=$(dhis2_inventory_group_hosts instances)
+    for i in $inst; do
+        local v
+        v=$(dhis2_ansible_adhoc "$i" shell -a 'grep -c "^encryption.password" /opt/dhis2/dhis.conf 2>/dev/null || echo 0' -b -o 2>&1 | tail -1 | awk '{print $NF}')
+        [[ "$v" == "0" ]] && _f MEDIUM "$i: encryption.password is not set in dhis.conf"
+    done
+}
+
+_packages() {
+    local h="${1:-}"
+    dhis2_ansible_adhoc "$h" shell -a 'apt list --upgradable 2>/dev/null | grep -i "security" | head -40' -b -o
+}
+
+_harden() {
+    local h="${1:-}"
+    [[ -z "$h" ]] && { dhis2_log_error "Usage: dhis2-security harden HOST"; exit "$DHIS2_EXIT_USAGE"; }
+    dhis2_cli_confirm "Apply low-risk hardening on $h (chmod 600 for sensitive files, no SSH changes)?" "$h"
+    dhis2_ansible_adhoc "$h" shell -a 'chmod 600 /opt/dhis2/dhis.conf /etc/postgresql/*/main/pg_hba.conf 2>/dev/null; echo done' -b -o
+}
+
+_report() {
+    if (( ${#FINDINGS[@]} == 0 )); then
+        [[ "$DHIS2_OPT_JSON" == true ]] && dhis2_json_emit command=dhis2-security success=true findings='[]'
+        return
+    fi
+    if [[ "$DHIS2_OPT_JSON" == true ]]; then
+        local arr="[" first=true f sev msg
+        for f in "${FINDINGS[@]}"; do
+            sev="${f%%|*}"; msg="${f#*|}"
+            $first || arr+=","; first=false
+            arr+="{\"severity\":\"$sev\",\"message\":\"${msg//\"/\\\"}\"}"
+        done
+        arr+="]"
+        dhis2_json_emit command=dhis2-security success=true findings="$arr"
+    else
+        echo
+        dhis2_c_bold "Security findings"; echo
+        local f
+        for f in "${FINDINGS[@]}"; do
+            local sev="${f%%|*}" msg="${f#*|}"
+            case "$sev" in
+                CRITICAL) dhis2_c_red "$sev"; echo "  $msg" ;;
+                HIGH)     dhis2_c_red "$sev"; echo "      $msg" ;;
+                MEDIUM)   dhis2_c_yellow "$sev"; echo "    $msg" ;;
+                LOW|INFO) echo "  $sev   $msg" ;;
+            esac
+        done
+    fi
+    for f in "${FINDINGS[@]}"; do [[ "${f%%|*}" == CRITICAL || "${f%%|*}" == HIGH ]] && exit "$DHIS2_EXIT_PARTIAL"; done
+}
+
+main "$@"

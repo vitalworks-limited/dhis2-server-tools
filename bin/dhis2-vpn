@@ -1,0 +1,169 @@
+#!/usr/bin/env bash
+# USAGE_START
+# dhis2-vpn - WireGuard operations (section 26, 57.17).
+#
+# Usage:
+#   dhis2-vpn status                              [--json]
+#   dhis2-vpn enable
+#   dhis2-vpn disable
+#   dhis2-vpn peers                               [--json]
+#   dhis2-vpn add-peer NAME [--ip 10.0.0.X] [--yes]
+#   dhis2-vpn remove-peer NAME [--yes]
+#   dhis2-vpn test
+#   dhis2-vpn lockdown                            [--yes]
+#   dhis2-vpn rotate-key                          [--yes]
+#   dhis2-vpn handshake                           [--json]
+#   dhis2-vpn config
+#   dhis2-vpn export-peer NAME --to PATH
+#   dhis2-vpn revoke-peer NAME [--yes]
+#   dhis2-vpn routes
+#   dhis2-vpn firewall
+#   dhis2-vpn data-plane                          (verifies wireguard_data_plane routing)
+#
+# Private keys are never logged.
+# USAGE_END
+set -Eeuo pipefail
+. "$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")/.." && pwd)/lib/common.sh"
+
+HUB=""
+_resolve_hub() {
+    [[ -n "$HUB" ]] && return
+    HUB=$(dhis2_inventory_group_hosts wireguard_hub | head -1)
+    [[ -z "$HUB" ]] && { dhis2_log_error "No [wireguard_hub] host in inventory"; exit "$DHIS2_EXIT_PREFLIGHT"; }
+    return 0
+}
+
+main() {
+    dhis2_cli_parse_globals "$@"
+    set -- "${DHIS2_CLI_REMAINING[@]}"
+    [[ $# -eq 0 ]] && { dhis2_cli_show_help "$0"; exit "$DHIS2_EXIT_USAGE"; }
+    local sub="$1"; shift
+    _resolve_hub
+    case "$sub" in
+        status) _status ;;
+        enable|disable) _toggle "$sub" ;;
+        peers) _peers ;;
+        add-peer) _add_peer "$@" ;;
+        remove-peer|revoke-peer) _remove_peer "$@" ;;
+        export-peer) _export_peer "$@" ;;
+        test) _test ;;
+        lockdown) _lockdown ;;
+        rotate-key) _rotate_key ;;
+        handshake) _handshake ;;
+        config) _config ;;
+        routes) _routes ;;
+        firewall) _firewall ;;
+        data-plane) _data_plane ;;
+        --help|-h|help) dhis2_cli_show_help "$0"; exit 0 ;;
+        *) dhis2_log_error "Unknown subcommand: $sub"; exit "$DHIS2_EXIT_USAGE" ;;
+    esac
+}
+
+_status() {
+    if [[ "$DHIS2_OPT_JSON" == true ]]; then
+        local state; state=$(dhis2_ansible_adhoc "$HUB" shell -a 'wg show interfaces 2>/dev/null | tr "\n" " "' -b -o 2>&1 | tail -1)
+        dhis2_json_emit command=dhis2-vpn hub="$HUB" interfaces="$state"
+    else
+        dhis2_ansible_adhoc "$HUB" shell -a 'wg show 2>/dev/null | sed "s|PrivateKey.*|PrivateKey: ***REDACTED***|; s|PresharedKey.*|PresharedKey: ***REDACTED***|"' -b -o
+    fi
+}
+
+_toggle() {
+    local act="$1"
+    local sstate; [[ "$act" == enable ]] && sstate=started || sstate=stopped
+    dhis2_ansible_adhoc "$HUB" systemd -a "name=wg-quick@wg0 state=$sstate" -b
+}
+
+_peers() {
+    dhis2_ansible_adhoc "$HUB" shell -a 'wg show wg0 peers 2>/dev/null' -b -o
+}
+
+_add_peer() {
+    local name="${1:-}"; shift || true
+    local ip=""
+    while (( $# )); do case "$1" in --ip) ip="$2"; shift ;; --ip=*) ip="${1#*=}" ;; esac; shift || true; done
+    [[ -z "$name" ]] && { dhis2_log_error "Usage: dhis2-vpn add-peer NAME [--ip 10.0.0.X]"; exit "$DHIS2_EXIT_USAGE"; }
+    dhis2_cli_confirm "Add WireGuard peer '$name'? (grants VPN access)"
+    "${DHIS2_CLI_ROOT}/bin/dhis2-deploy" apply --limit "$HUB" --only wireguard -e wireguard_add_peer="$name" ${ip:+-e wireguard_peer_ip="$ip"} || true
+    dhis2_log_warn "Use 'dhis2-vpn export-peer $name --to <PATH>' to export the peer config (private key not logged)."
+}
+
+_remove_peer() {
+    local name="${1:-}"
+    [[ -z "$name" ]] && { dhis2_log_error "Usage: dhis2-vpn remove-peer NAME"; exit "$DHIS2_EXIT_USAGE"; }
+    dhis2_cli_confirm "Revoke WireGuard peer '$name'?" "$name"
+    dhis2_ansible_adhoc "$HUB" shell -a "
+        pub=\$(wg show wg0 peers | while read p; do grep -l \"$name\" /etc/wireguard/*.conf 2>/dev/null && echo \$p; done | head -1)
+        [ -n \"\$pub\" ] && wg set wg0 peer \"\$pub\" remove
+        rm -f /etc/wireguard/peers/$name.conf 2>/dev/null
+        wg-quick save wg0 2>/dev/null || true
+        echo removed=$name
+    " -b -o
+}
+
+_export_peer() {
+    local name="${1:-}"; shift || true
+    local to=""
+    while (( $# )); do case "$1" in --to) to="$2"; shift ;; --to=*) to="${1#*=}" ;; esac; shift || true; done
+    [[ -z "$name" || -z "$to" ]] && { dhis2_log_error "Usage: dhis2-vpn export-peer NAME --to PATH"; exit "$DHIS2_EXIT_USAGE"; }
+    dhis2_cli_confirm "Export peer config for '$name' to $to? File contains PRIVATE key material." "$name"
+    local td; td=$(dhis2_cli_register_tempdir)
+    dhis2_ansible_adhoc "$HUB" fetch -a "src=/etc/wireguard/peers/$name.conf dest=$td/" -b
+    local found; found=$(find "$td" -name '*.conf' | head -1)
+    [[ -z "$found" ]] && { dhis2_log_error "Peer config not found"; exit "$DHIS2_EXIT_FAILURE"; }
+    install -m 600 "$found" "$to"
+    dhis2_log_info "Peer config written: $to (chmod 600)"
+}
+
+_test() {
+    dhis2_ansible_adhoc all shell -a 'wg show interfaces 2>/dev/null; ip -4 route | grep 10.0.0 || true' -b -o
+}
+
+_lockdown() {
+    dhis2_cli_confirm "Enable WireGuard service lockdown firewall rules? (requires VPN to administer)"
+    "${DHIS2_CLI_ROOT}/bin/dhis2-deploy" apply --only wireguard -e wireguard_lockdown=true
+}
+
+_rotate_key() {
+    dhis2_cli_confirm "Rotate WireGuard hub key? All peers will need updated config."
+    dhis2_ansible_adhoc "$HUB" shell -a '
+        newkey=$(wg genkey)
+        pub=$(echo "$newkey" | wg pubkey)
+        echo "$newkey" > /etc/wireguard/privatekey.new
+        chmod 600 /etc/wireguard/privatekey.new
+        mv /etc/wireguard/privatekey /etc/wireguard/privatekey.$(date -u +%s).old
+        mv /etc/wireguard/privatekey.new /etc/wireguard/privatekey
+        echo "new_pub=$pub"
+    ' -b -o | dhis2_log_redact
+    dhis2_log_warn "Reconfigure WireGuard with the new key via dhis2-deploy apply --only wireguard."
+}
+
+_handshake() {
+    dhis2_ansible_adhoc "$HUB" shell -a 'wg show wg0 latest-handshakes 2>/dev/null' -b -o
+}
+
+_config() {
+    dhis2_ansible_adhoc "$HUB" shell -a 'cat /etc/wireguard/wg0.conf 2>/dev/null' -b -o | dhis2_log_redact
+}
+
+_routes() {
+    dhis2_ansible_adhoc all shell -a 'ip -4 route | grep -E "^10\." || true' -b -o
+}
+
+_firewall() {
+    dhis2_ansible_adhoc "$HUB" shell -a 'ufw status verbose' -b -o
+}
+
+_data_plane() {
+    local inv; inv=$(dhis2_config_resolve_inventory)
+    local dp; dp=$(awk -F= '/^[[:space:]]*wireguard_data_plane[[:space:]]*=/ {gsub(/[[:space:]]/,"",$2); print $2; exit}' "$inv")
+    if [[ "$dp" != "true" && "$dp" != "True" ]]; then
+        dhis2_log_warn "wireguard_data_plane is not enabled - nothing to verify."
+        return
+    fi
+    local inst; inst=$(dhis2_inventory_group_hosts instances | head -1)
+    local db; db=$(dhis2_inventory_group_hosts databases | head -1)
+    dhis2_ansible_adhoc "$inst" shell -a "getent hosts $db | awk '{print \$1}'" -b -o
+}
+
+main "$@"

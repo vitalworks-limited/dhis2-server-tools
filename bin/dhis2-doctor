@@ -1,0 +1,232 @@
+#!/usr/bin/env bash
+# USAGE_START
+# dhis2-doctor - cross-stack diagnostics (section 23, 57.14).
+#
+# Usage:
+#   dhis2-doctor                              (full default check)
+#   dhis2-doctor --quick                      (controller + inventory only)
+#   dhis2-doctor --full                       (every check)
+#   dhis2-doctor network                      (hosts, DNS, ports)
+#   dhis2-doctor database                     (postgres health)
+#   dhis2-doctor proxy                        (proxy & TLS)
+#   dhis2-doctor memory                       (host + container limits)
+#   dhis2-doctor instance NAME                (full stack per instance)
+#   dhis2-doctor config                       (consistency cross-check)
+#   dhis2-doctor storage
+#   dhis2-doctor services
+#   dhis2-doctor tls
+#   dhis2-doctor backup
+#   dhis2-doctor upgrade-readiness
+#   dhis2-doctor snapshot                     (operational state snapshot)
+#   dhis2-doctor compare SNAP_A SNAP_B
+#   dhis2-doctor bundle --out PATH            (shortcut for dhis2-logs bundle)
+#
+# All checks are read-only unless --fix is passed; only well-understood
+# low-risk fixes are applied with --fix (section 23.2).
+# USAGE_END
+set -Eeuo pipefail
+. "$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")/.." && pwd)/lib/common.sh"
+
+FAILS=()
+WARNS=()
+
+_record_ok()   { if [[ "$DHIS2_OPT_JSON" != true ]]; then printf '  '; dhis2_status_ok "ok"; printf '  %s\n' "$*"; fi }
+_record_warn() { WARNS+=("$*"); if [[ "$DHIS2_OPT_JSON" != true ]]; then printf '  '; dhis2_status_warn "warn"; printf ' %s\n' "$*"; fi }
+_record_fail() { FAILS+=("$*"); if [[ "$DHIS2_OPT_JSON" != true ]]; then printf '  '; dhis2_status_fail "FAIL"; printf '  %s\n' "$*"; fi }
+
+main() {
+    dhis2_cli_parse_globals "$@"
+    set -- "${DHIS2_CLI_REMAINING[@]}"
+    local scope="all" extra_arg=""
+    if (( $# > 0 )); then
+        case "$1" in
+            --quick) scope=quick ;;
+            --full) scope=full ;;
+            network|database|proxy|memory|config|storage|services|tls|backup|upgrade-readiness|snapshot|compare|bundle|instance) scope="$1"; shift || true; extra_arg="${1:-}" ;;
+            --help|-h|help) dhis2_cli_show_help "$0"; exit 0 ;;
+        esac
+    fi
+    case "$scope" in
+        quick) _controller; _inventory_check ;;
+        full|all) _controller; _inventory_check; _network; _services; _database; _proxy; _memory; _tls; _backup; _config ;;
+        network) _network ;;
+        database) _database ;;
+        proxy) _proxy ;;
+        memory) _memory ;;
+        services) _services ;;
+        tls) _tls ;;
+        backup) _backup ;;
+        config) _config ;;
+        storage) _storage ;;
+        upgrade-readiness) _upgrade_readiness ;;
+        instance) _instance "$extra_arg" ;;
+        snapshot) _snapshot ;;
+        compare) _compare "$@" ;;
+        bundle) "${DHIS2_CLI_ROOT}/bin/dhis2-logs" bundle all "$@"; return ;;
+    esac
+    _summary
+}
+
+_summary() {
+    if [[ "$DHIS2_OPT_JSON" == true ]]; then
+        local fails_arr="[" first=true f
+        for f in "${FAILS[@]:-}"; do [[ -z "$f" ]] && continue; $first || fails_arr+=","; first=false; fails_arr+="\"${f//\"/\\\"}\""; done
+        fails_arr+="]"
+        local warns_arr="[" first=true f
+        for f in "${WARNS[@]:-}"; do [[ -z "$f" ]] && continue; $first || warns_arr+=","; first=false; warns_arr+="\"${f//\"/\\\"}\""; done
+        warns_arr+="]"
+        local succ; if (( ${#FAILS[@]} == 0 )); then succ=true; else succ=false; fi
+        dhis2_json_emit command=dhis2-doctor success="$succ" failures="$fails_arr" warnings="$warns_arr"
+    else
+        echo
+        printf 'Summary: %d warnings, %d failures\n' "${#WARNS[@]}" "${#FAILS[@]}"
+    fi
+    (( ${#FAILS[@]} > 0 )) && exit "$DHIS2_EXIT_HEALTH"
+    (( ${#WARNS[@]} > 0 )) && exit "$DHIS2_EXIT_PARTIAL"
+    exit 0
+}
+
+_controller() {
+    dhis2_c_bold "Controller"; echo
+    dhis2_validate_ubuntu_release >/dev/null && _record_ok "ubuntu release supported" || _record_warn "running on non-ubuntu or old release"
+    dhis2_validate_ansible_present && _record_ok "ansible installed" || _record_fail "ansible-playbook missing"
+    dhis2_validate_python_present && _record_ok "python3 present" || _record_fail "python3 missing"
+    local inv; inv=$(dhis2_config_resolve_inventory)
+    [[ -r "$inv" ]] && _record_ok "inventory readable: $inv" || _record_fail "inventory unreadable: $inv"
+}
+
+_inventory_check() {
+    dhis2_c_bold "Inventory"; echo
+    local inv; inv=$(dhis2_config_resolve_inventory)
+    dhis2_inventory_validate_syntax "$inv" >/dev/null 2>&1 && _record_ok "inventory syntax valid" || _record_fail "inventory syntax invalid"
+    dhis2_validate_database_refs "$inv" >/dev/null 2>&1 && _record_ok "database_host references resolve" || _record_fail "unresolved database_host"
+    local dupes
+    dupes=$(dhis2_validate_inventory_duplicates "$inv" || true)
+    [[ -z "$dupes" ]] && _record_ok "no duplicate hosts" || _record_fail "duplicate hosts: $dupes"
+}
+
+_network() {
+    dhis2_c_bold "Network"; echo
+    local inst; inst=$(dhis2_inventory_group_hosts instances)
+    local h
+    for h in $inst; do
+        local rc=0
+        dhis2_ansible_adhoc "$h" ping -o >/dev/null 2>&1 || rc=$?
+        (( rc == 0 )) && _record_ok "reachable: $h" || _record_fail "unreachable: $h"
+    done
+}
+
+_services() {
+    dhis2_c_bold "Services"; echo
+    local h out state
+    for h in $(dhis2_inventory_hosts); do
+        [[ "$h" == "127.0.0.1" ]] && continue
+        out=$(dhis2_ansible_adhoc "$h" shell -a 'systemctl is-system-running --quiet 2>&1 || true; systemctl is-system-running 2>/dev/null' -b -o 2>&1 | tail -1)
+        _record_ok "systemd: $h: $out"
+    done
+}
+
+_database() {
+    dhis2_c_bold "Database"; echo
+    local h; h=$(dhis2_inventory_group_hosts databases | head -1)
+    [[ -z "$h" ]] && { _record_fail "no [databases] host"; return; }
+    local state
+    state=$(dhis2_ansible_adhoc "$h" shell -a 'systemctl is-active postgresql 2>/dev/null' -b -o 2>&1 | tail -1 | awk '{print $NF}')
+    [[ "$state" == "active" ]] && _record_ok "postgresql active on $h" || _record_fail "postgresql: $state on $h"
+    dhis2_ansible_adhoc "$h" shell -a 'sudo -u postgres psql -X -tAc "SELECT 1"' -b -o >/dev/null 2>&1 && _record_ok "connect ok" || _record_warn "psql connect check failed"
+}
+
+_proxy() {
+    dhis2_c_bold "Proxy"; echo
+    local h; h=$(dhis2_inventory_group_hosts web | head -1)
+    [[ -z "$h" ]] && { _record_warn "no [web] host"; return; }
+    local engine; engine=$("${DHIS2_CLI_ROOT}/bin/dhis2-proxy" status 2>&1 | awk '/engine:/{print $2}' | head -1)
+    [[ -n "$engine" ]] && _record_ok "proxy host: $h, engine: $engine" || _record_warn "could not detect proxy engine"
+    "${DHIS2_CLI_ROOT}/bin/dhis2-proxy" test >/dev/null 2>&1 && _record_ok "proxy config test ok" || _record_fail "proxy config test failed"
+}
+
+_memory() {
+    dhis2_c_bold "Memory"; echo
+    local h
+    for h in $(dhis2_inventory_hosts); do
+        [[ "$h" == "127.0.0.1" ]] && continue
+        local line
+        line=$(dhis2_ansible_adhoc "$h" shell -a 'free -m | awk "NR==2{printf \"total=%dMB free=%dMB\n\",\$2,\$7}"' -b -o 2>&1 | tail -1)
+        _record_ok "$h $line"
+    done
+}
+
+_tls() {
+    dhis2_c_bold "TLS"; echo
+    "${DHIS2_CLI_ROOT}/bin/dhis2-tls" verify 2>&1 | sed 's/^/  /'
+}
+
+_backup() {
+    dhis2_c_bold "Backup"; echo
+    local h; h=$(dhis2_inventory_group_hosts databases | head -1)
+    local newest
+    newest=$(dhis2_ansible_adhoc "$h" shell -a 'ls -1t /var/backups/dhis2/*.dump /var/backups/dhis2/*.sql* 2>/dev/null | head -1' -b -o 2>&1 | tail -1)
+    [[ -n "$newest" && "$newest" != *"no such file"* ]] && _record_ok "latest backup: $newest" || _record_warn "no backup found in /var/backups/dhis2"
+}
+
+_config() {
+    dhis2_c_bold "Config consistency"; echo
+    local inv; inv=$(dhis2_config_resolve_inventory)
+    local fqdn; fqdn=$(awk -F= '/^[[:space:]]*fqdn[[:space:]]*=/ {gsub(/[[:space:]]/,"",$2); print $2; exit}' "$inv")
+    [[ -n "$fqdn" ]] && _record_ok "fqdn set in inventory: $fqdn" || _record_warn "fqdn is empty (self-signed TLS will be used)"
+    local inst; inst=$(dhis2_inventory_group_hosts instances)
+    local i
+    for i in $inst; do
+        local vars; vars=$(dhis2_inventory_host_vars_redacted "$i")
+        local dbhost; dbhost=$(echo "$vars" | awk -F'[" ]+' '/"database_host"/ {print $(NF-1); exit}')
+        if dhis2_inventory_hosts | grep -qx "${dbhost:-__none__}"; then
+            _record_ok "instance $i database_host=$dbhost resolves"
+        else
+            _record_fail "instance $i database_host=$dbhost does not resolve in inventory"
+        fi
+    done
+}
+
+_storage() {
+    dhis2_c_bold "Storage"; echo
+    local h
+    for h in $(dhis2_inventory_hosts); do
+        [[ "$h" == "127.0.0.1" ]] && continue
+        local out
+        out=$(dhis2_ansible_adhoc "$h" shell -a 'df -h / /var/lib /var/backups 2>/dev/null | tail -n +2' -b -o 2>&1 | tail -n +2)
+        echo "$h:"; echo "$out" | sed 's/^/    /'
+    done
+}
+
+_upgrade_readiness() {
+    dhis2_c_bold "Upgrade readiness"; echo
+    _backup; _storage; _database; _memory
+}
+
+_instance() {
+    local inst="${1:-}"
+    [[ -z "$inst" ]] && { dhis2_log_error "Usage: dhis2-doctor instance NAME"; exit "$DHIS2_EXIT_USAGE"; }
+    dhis2_c_bold "Instance $inst"; echo
+    "${DHIS2_CLI_ROOT}/bin/dhis2-instance" status "$inst"      | sed 's/^/  /' || true
+    "${DHIS2_CLI_ROOT}/bin/dhis2-instance" endpoint check "$inst" | sed 's/^/  /' || true
+}
+
+_snapshot() {
+    local out
+    out="$(dhis2_config_snapshot_dir)/doctor-$(date -u +%Y%m%d-%H%M%S)"
+    mkdir -p "$out"; chmod 700 "$out"
+    "${DHIS2_CLI_ROOT}/bin/dhis2-status" --json > "$out/status.json" 2>/dev/null || true
+    for h in $(dhis2_inventory_hosts); do
+        [[ "$h" == "127.0.0.1" ]] && continue
+        dhis2_ansible_adhoc "$h" setup 2>&1 | dhis2_log_redact > "$out/$h.facts" || true
+    done
+    dhis2_log_info "Snapshot: $out"
+}
+
+_compare() {
+    local a="$1" b="$2"
+    [[ -z "$a" || -z "$b" ]] && { dhis2_log_error "Usage: dhis2-doctor compare SNAP_A SNAP_B"; exit "$DHIS2_EXIT_USAGE"; }
+    diff -ruN "$a" "$b" | dhis2_log_redact
+}
+
+main "$@"

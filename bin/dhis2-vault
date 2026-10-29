@@ -1,0 +1,140 @@
+#!/usr/bin/env bash
+# USAGE_START
+# dhis2-vault - Ansible Vault helpers (section 29, 57.20).
+#
+# Usage:
+#   dhis2-vault init                       (create a project vault password file)
+#   dhis2-vault edit FILE
+#   dhis2-vault view FILE
+#   dhis2-vault check FILE                 (verify encryption header)
+#   dhis2-vault scan                       (search for plaintext secret-like values)
+#   dhis2-vault list                       (list vault files)
+#   dhis2-vault validate                   (ansible-vault-aware syntax check)
+#   dhis2-vault rotate [--yes]             (re-encrypt with new password)
+#   dhis2-vault permissions                (fix 0600 on vault files)
+#   dhis2-vault references NAME            (where is secret NAME used?)
+#
+# Discovered secret values are NEVER printed.
+# USAGE_END
+set -Eeuo pipefail
+. "$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")/.." && pwd)/lib/common.sh"
+
+VAULT_PASS_FILE_DEFAULT="/opt/ansible/secrets/vault_pass"
+
+main() {
+    dhis2_cli_parse_globals "$@"
+    set -- "${DHIS2_CLI_REMAINING[@]}"
+    [[ $# -eq 0 ]] && { dhis2_cli_show_help "$0"; exit "$DHIS2_EXIT_USAGE"; }
+    local sub="$1"; shift
+    case "$sub" in
+        init) _init ;;
+        edit) _edit "$@" ;;
+        view) _view "$@" ;;
+        check) _check "$@" ;;
+        scan) _scan ;;
+        list) _list ;;
+        validate) _validate ;;
+        rotate) _rotate "$@" ;;
+        permissions) _permissions ;;
+        references) _references "$@" ;;
+        --help|-h|help) dhis2_cli_show_help "$0"; exit 0 ;;
+        *) dhis2_log_error "Unknown subcommand: $sub"; exit "$DHIS2_EXIT_USAGE" ;;
+    esac
+}
+
+_init() {
+    local f="$VAULT_PASS_FILE_DEFAULT"
+    if [[ -f "$f" ]]; then
+        dhis2_log_warn "Vault password file already exists: $f (not overwriting)"
+        return
+    fi
+    mkdir -p "$(dirname "$f")"
+    chmod 700 "$(dirname "$f")"
+    umask 0177
+    openssl rand -base64 32 > "$f"
+    chmod 600 "$f"
+    dhis2_log_info "Vault password file created: $f (0600). Store a copy securely."
+}
+
+_edit() {
+    local f="${1:-}"
+    [[ -z "$f" ]] && { dhis2_log_error "Usage: dhis2-vault edit FILE"; exit "$DHIS2_EXIT_USAGE"; }
+    ANSIBLE_VAULT_PASSWORD_FILE="$VAULT_PASS_FILE_DEFAULT" ansible-vault edit "$f"
+}
+
+_view() {
+    local f="${1:-}"
+    [[ -z "$f" ]] && { dhis2_log_error "Usage: dhis2-vault view FILE"; exit "$DHIS2_EXIT_USAGE"; }
+    ANSIBLE_VAULT_PASSWORD_FILE="$VAULT_PASS_FILE_DEFAULT" ansible-vault view "$f" | dhis2_log_redact
+}
+
+_check() {
+    local f="${1:-}"
+    [[ -z "$f" ]] && { dhis2_log_error "Usage: dhis2-vault check FILE"; exit "$DHIS2_EXIT_USAGE"; }
+    head -1 "$f" | grep -q '^\$ANSIBLE_VAULT' && echo "encrypted" || echo "not-encrypted"
+}
+
+_scan() {
+    local deploy_dir; deploy_dir=$(dhis2_config_deploy_dir)
+    local hits
+    hits=$(grep -rnE '(password|secret|token|api[-_]?key)[[:space:]]*[:=][[:space:]]*[^$][^[:space:]]+' "$deploy_dir" 2>/dev/null | grep -v '^Binary' | grep -vE '(^#|ANSIBLE_VAULT)' || true)
+    if [[ -z "$hits" ]]; then
+        dhis2_status_ok "OK"; echo " - no obvious plaintext secret-like values found."
+        return
+    fi
+    dhis2_log_warn "Possible plaintext secret-like values found (values hidden):"
+    while IFS= read -r line; do
+        local loc key
+        loc=$(echo "$line" | cut -d: -f1-2)
+        key=$(echo "$line" | awk -F'[: =]' '{for(i=1;i<=NF;i++) if($i ~ /password|secret|token|api/) {print $i; exit}}')
+        printf '  %s: %s=***REDACTED***\n' "$loc" "${key:-?}"
+    done <<< "$hits"
+    exit "$DHIS2_EXIT_PARTIAL"
+}
+
+_list() {
+    local deploy_dir; deploy_dir=$(dhis2_config_deploy_dir)
+    grep -rlE '^\$ANSIBLE_VAULT' "$deploy_dir" 2>/dev/null
+}
+
+_validate() {
+    local deploy_dir; deploy_dir=$(dhis2_config_deploy_dir)
+    local rc=0
+    while IFS= read -r f; do
+        [[ -z "$f" ]] && continue
+        head -1 "$f" | grep -q '^\$ANSIBLE_VAULT' || { echo "$f: not encrypted"; rc=1; continue; }
+        echo "$f: ok"
+    done < <(_list)
+    exit $rc
+}
+
+_rotate() {
+    dhis2_cli_confirm "Rotate vault password? All vault files will be re-encrypted (make a backup first)."
+    local td; td=$(dhis2_cli_register_tempdir)
+    openssl rand -base64 32 > "$td/new"
+    chmod 600 "$td/new"
+    while IFS= read -r f; do
+        [[ -z "$f" ]] && continue
+        ANSIBLE_VAULT_PASSWORD_FILE="$VAULT_PASS_FILE_DEFAULT" ansible-vault rekey --new-vault-password-file "$td/new" "$f"
+    done < <(_list)
+    mv "$td/new" "$VAULT_PASS_FILE_DEFAULT"
+    chmod 600 "$VAULT_PASS_FILE_DEFAULT"
+    dhis2_log_info "Vault password rotated. Store the new password securely."
+}
+
+_permissions() {
+    local vp="$VAULT_PASS_FILE_DEFAULT"
+    [[ -f "$vp" ]] && chmod 600 "$vp"
+    while IFS= read -r f; do [[ -n "$f" ]] && chmod 600 "$f"; done < <(_list)
+    dhis2_log_info "Vault files set to 0600"
+}
+
+_references() {
+    local name="${1:-}"
+    [[ -z "$name" ]] && { dhis2_log_error "Usage: dhis2-vault references NAME"; exit "$DHIS2_EXIT_USAGE"; }
+    local deploy_dir; deploy_dir=$(dhis2_config_deploy_dir)
+    dhis2_log_info "Files referencing logical secret '$name' (secret values are NOT displayed):"
+    grep -rln "$name" "$deploy_dir" 2>/dev/null || true
+}
+
+main "$@"

@@ -1,0 +1,249 @@
+#!/usr/bin/env bash
+# USAGE_START
+# dhis2-host - host-level operations (section 12, 57.2, 57.3).
+#
+# Usage:
+#   dhis2-host list                   [--json]
+#   dhis2-host show HOST              [--json]
+#   dhis2-host ping [HOST|GROUP]      [--json]
+#   dhis2-host facts HOST             [--json]
+#   dhis2-host check [HOST]
+#   dhis2-host bootstrap HOST [--user USER] [--yes]
+#   dhis2-host ssh-install-key HOST --user USER
+#   dhis2-host sudo-check HOST
+#   dhis2-host firewall HOST status
+#   dhis2-host services HOST          [--json]
+#   dhis2-host services status HOST
+#   dhis2-host services restart HOST SERVICE
+#   dhis2-host ports HOST             [--json]
+#   dhis2-host listeners HOST
+#   dhis2-host disk HOST              [--json]
+#   dhis2-host memory HOST            [--json]
+#   dhis2-host cpu HOST
+#   dhis2-host time HOST
+#   dhis2-host updates HOST
+#   dhis2-host reboot-required HOST
+#   dhis2-host reboot HOST [--yes]
+#   dhis2-host network HOST
+#
+#   dhis2-host lxd list
+#   dhis2-host lxd show CONTAINER
+#   dhis2-host lxd start CONTAINER
+#   dhis2-host lxd stop CONTAINER
+#   dhis2-host lxd restart CONTAINER
+#   dhis2-host lxd exec CONTAINER -- COMMAND
+#   dhis2-host lxd storage
+#   dhis2-host lxd network
+#   dhis2-host lxd snapshots CONTAINER
+#   dhis2-host lxd snapshot CONTAINER NAME
+#   dhis2-host lxd restore-snapshot CONTAINER NAME
+# USAGE_END
+set -Eeuo pipefail
+. "$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")/.." && pwd)/lib/common.sh"
+
+main() {
+    dhis2_cli_parse_globals "$@"
+    set -- "${DHIS2_CLI_REMAINING[@]}"
+    [[ $# -eq 0 ]] && { dhis2_cli_show_help "$0"; exit "$DHIS2_EXIT_USAGE"; }
+    local sub="$1"; shift
+    case "$sub" in
+        list) _list ;;
+        show) _show "$@" ;;
+        ping) _ping "$@" ;;
+        facts) _facts "$@" ;;
+        check) _check "$@" ;;
+        bootstrap) _bootstrap "$@" ;;
+        ssh-install-key) _ssh_install_key "$@" ;;
+        sudo-check) _sudo_check "$@" ;;
+        firewall) _firewall "$@" ;;
+        services) _services "$@" ;;
+        ports|listeners) _ports "$@" ;;
+        disk) _disk "$@" ;;
+        memory) _memory "$@" ;;
+        cpu) _cpu "$@" ;;
+        time) _time "$@" ;;
+        updates) _updates "$@" ;;
+        reboot-required) _reboot_required "$@" ;;
+        reboot) _reboot "$@" ;;
+        network) _network "$@" ;;
+        lxd) _lxd "$@" ;;
+        --help|-h|help) dhis2_cli_show_help "$0"; exit 0 ;;
+        *) dhis2_log_error "Unknown subcommand: $sub"; exit "$DHIS2_EXIT_USAGE" ;;
+    esac
+}
+
+_list() {
+    if [[ "$DHIS2_OPT_JSON" == true ]]; then
+        local arr="[" first=true h
+        while IFS= read -r h; do
+            [[ -z "$h" ]] && continue
+            $first || arr+=","; first=false
+            arr+="\"$h\""
+        done < <(dhis2_inventory_hosts)
+        arr+="]"
+        dhis2_json_emit command=dhis2-host hosts="$arr"
+    else
+        dhis2_inventory_hosts
+    fi
+}
+
+_show() {
+    local h="${1:-}"
+    [[ -z "$h" ]] && { dhis2_log_error "Usage: dhis2-host show HOST"; exit "$DHIS2_EXIT_USAGE"; }
+    dhis2_inventory_host_vars_redacted "$h"
+}
+
+_ping() {
+    local target="${1:-all}"
+    local rc=0
+    dhis2_ansible_adhoc "$target" ping -o 2>&1 || rc=$?
+    exit $rc
+}
+
+_facts() {
+    local h="${1:-}"
+    [[ -z "$h" ]] && { dhis2_log_error "Usage: dhis2-host facts HOST"; exit "$DHIS2_EXIT_USAGE"; }
+    dhis2_ansible_facts "$h"
+}
+
+_check() {
+    local h="${1:-all}"
+    dhis2_ansible_adhoc "$h" shell -a 'uname -a; uptime; df -h /; free -m' -o
+}
+
+_bootstrap() {
+    local h="${1:-}"
+    [[ -z "$h" ]] && { dhis2_log_error "Usage: dhis2-host bootstrap HOST"; exit "$DHIS2_EXIT_USAGE"; }
+    dhis2_cli_confirm "Install Python+SSH prereqs on $h?"
+    dhis2_ansible_adhoc "$h" raw -a 'command -v python3 >/dev/null || { apt-get update -qq && apt-get install -yq python3; }' \
+        || { dhis2_log_error "Bootstrap failed"; exit "$DHIS2_EXIT_ANSIBLE"; }
+    dhis2_log_info "Bootstrap complete on $h"
+}
+
+_ssh_install_key() {
+    local h="${1:-}"; shift || true
+    local user="${DHIS2_OPT_USER:-}"
+    while (( $# )); do
+        case "$1" in --user) user="$2"; shift ;; --user=*) user="${1#*=}" ;; esac
+        shift || true
+    done
+    [[ -z "$h" || -z "$user" ]] && { dhis2_log_error "Usage: dhis2-host ssh-install-key HOST --user USER"; exit "$DHIS2_EXIT_USAGE"; }
+    if command -v ssh-copy-id >/dev/null 2>&1; then
+        ssh-copy-id "$user@$h"
+    else
+        dhis2_log_error "ssh-copy-id not available on this controller"
+        exit "$DHIS2_EXIT_FAILURE"
+    fi
+}
+
+_sudo_check() {
+    local h="${1:-}"
+    [[ -z "$h" ]] && { dhis2_log_error "Usage: dhis2-host sudo-check HOST"; exit "$DHIS2_EXIT_USAGE"; }
+    dhis2_ansible_adhoc "$h" shell -a 'sudo -n true && echo passwordless-sudo-ok || echo sudo-password-required' -o
+}
+
+_firewall() {
+    local h="${1:-}"
+    [[ -z "$h" ]] && { dhis2_log_error "Usage: dhis2-host firewall HOST [status]"; exit "$DHIS2_EXIT_USAGE"; }
+    # Only 'status' is supported here; mutating firewall operations are intentionally
+    # left to the Ansible roles (section 23.2 - automatic fixes stay low-risk).
+    dhis2_ansible_adhoc "$h" shell -a "ufw status verbose || firewall-cmd --list-all" -o
+}
+
+_services() {
+    local a="${1:-}" b="${2:-}" c="${3:-}"
+    if [[ "$a" == "status" ]]; then
+        [[ -z "$b" ]] && { dhis2_log_error "Usage: dhis2-host services status HOST"; exit "$DHIS2_EXIT_USAGE"; }
+        dhis2_ansible_adhoc "$b" shell -a 'systemctl list-units --type=service --state=running --no-pager' -o
+        return
+    fi
+    if [[ "$a" == "restart" ]]; then
+        [[ -z "$b" || -z "$c" ]] && { dhis2_log_error "Usage: dhis2-host services restart HOST SERVICE"; exit "$DHIS2_EXIT_USAGE"; }
+        dhis2_cli_confirm "Restart systemd unit $c on $b?"
+        dhis2_ansible_adhoc "$b" systemd -a "name=$c state=restarted" -b
+        return
+    fi
+    [[ -z "$a" ]] && { dhis2_log_error "Usage: dhis2-host services HOST | status HOST | restart HOST SERVICE"; exit "$DHIS2_EXIT_USAGE"; }
+    local svcs='tomcat9 tomcat postgresql nginx apache2 openresty munin-node prometheus grafana-server zabbix-server wireguard-wg0 alertmanager glowroot'
+    dhis2_ansible_adhoc "$a" shell -a "for s in $svcs; do systemctl is-active \$s 2>/dev/null | awk -v s=\$s '{print s\"\t\"\$0}'; done" -o
+}
+
+_ports() {
+    local h="${1:-}"
+    [[ -z "$h" ]] && { dhis2_log_error "Usage: dhis2-host ports HOST"; exit "$DHIS2_EXIT_USAGE"; }
+    dhis2_ansible_adhoc "$h" shell -a 'ss -tunlp 2>/dev/null || netstat -tunlp 2>/dev/null' -b -o
+}
+
+_disk() {
+    local h="${1:-}"
+    [[ -z "$h" ]] && { dhis2_log_error "Usage: dhis2-host disk HOST"; exit "$DHIS2_EXIT_USAGE"; }
+    dhis2_ansible_adhoc "$h" shell -a 'df -h; echo ---; df -i' -o
+}
+
+_memory() {
+    local h="${1:-}"
+    [[ -z "$h" ]] && { dhis2_log_error "Usage: dhis2-host memory HOST"; exit "$DHIS2_EXIT_USAGE"; }
+    dhis2_ansible_adhoc "$h" shell -a 'free -h; echo ---; test -r /sys/fs/cgroup/memory.max && cat /sys/fs/cgroup/memory.max || true' -o
+}
+
+_cpu() {
+    local h="${1:-}"
+    dhis2_ansible_adhoc "$h" shell -a 'nproc; uptime; grep MHz /proc/cpuinfo 2>/dev/null | head -1' -o
+}
+
+_time() {
+    local h="${1:-}"
+    dhis2_ansible_adhoc "$h" shell -a 'timedatectl status 2>/dev/null || date' -o
+}
+
+_updates() {
+    local h="${1:-}"
+    local act="${2:-check}"
+    case "$act" in
+        check)
+            dhis2_ansible_adhoc "$h" shell -a 'apt list --upgradable 2>/dev/null | tail -n +2 | wc -l; apt list --upgradable 2>/dev/null | head -40' -o
+            ;;
+        *) dhis2_log_error "Only read-only 'check' supported here (section 57.2)."; exit "$DHIS2_EXIT_USAGE" ;;
+    esac
+}
+
+_reboot_required() {
+    local h="${1:-}"
+    dhis2_ansible_adhoc "$h" stat -a "path=/var/run/reboot-required" | dhis2_log_redact
+}
+
+_reboot() {
+    local h="${1:-}"
+    [[ -z "$h" ]] && { dhis2_log_error "Usage: dhis2-host reboot HOST"; exit "$DHIS2_EXIT_USAGE"; }
+    dhis2_cli_confirm "Reboot host $h NOW?" "$h"
+    dhis2_ansible_adhoc "$h" reboot -b || true
+}
+
+_network() {
+    local h="${1:-}"
+    dhis2_ansible_adhoc "$h" shell -a 'ip -brief addr; echo ---; ip -brief route' -o
+}
+
+_lxd() {
+    local a="${1:-}"; shift || true
+    case "$a" in
+        list)   lxc list 2>/dev/null || dhis2_log_error "lxc not available" ;;
+        show)   lxc info "${1:?container required}" ;;
+        start)  lxc start "${1:?container required}" ;;
+        stop)   dhis2_cli_confirm "Stop LXD container $1?" "$1"; lxc stop "$1" ;;
+        restart) dhis2_cli_confirm "Restart LXD container $1?" "$1"; lxc restart "$1" ;;
+        exec)
+            local c="${1:?container required}"; shift || true
+            [[ "${1:-}" == "--" ]] && shift || true
+            lxc exec "$c" -- "$@"
+            ;;
+        storage) lxc storage list ;;
+        network) lxc network list ;;
+        snapshots) lxc info "${1:?container required}" | awk '/Snapshots/{found=1} found' ;;
+        snapshot) dhis2_cli_confirm "Create snapshot ${2:?name required} on $1? (NOT a validated database backup)"; lxc snapshot "$1" "$2" ;;
+        restore-snapshot) dhis2_cli_confirm "Restore container $1 to snapshot $2?" "$1"; lxc restore "$1" "$2" ;;
+        *) dhis2_log_error "Unknown lxd subcommand: $a"; exit "$DHIS2_EXIT_USAGE" ;;
+    esac
+}
+
+main "$@"

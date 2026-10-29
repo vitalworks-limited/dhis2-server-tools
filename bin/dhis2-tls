@@ -1,0 +1,179 @@
+#!/usr/bin/env bash
+# USAGE_START
+# dhis2-tls - TLS certificate operations (section 20, 57.11).
+#
+# Usage:
+#   dhis2-tls status                                  [--json]
+#   dhis2-tls verify                                  [--json]
+#   dhis2-tls inspect [--fqdn FQDN]                   (fetch from live endpoint)
+#   dhis2-tls chain
+#   dhis2-tls csr INSTANCE --subject "/CN=..." [--san DNS:...]
+#   dhis2-tls issue [letsencrypt|customssl|selfsigned]
+#   dhis2-tls install [--cert PATH --key PATH --chain PATH]
+#   dhis2-tls renew
+#   dhis2-tls backup
+#   dhis2-tls expiry                                  [--json]
+#   dhis2-tls rotate                                  [--yes]
+#
+# Private-key contents are NEVER printed by this tool.
+# USAGE_END
+set -Eeuo pipefail
+. "$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")/.." && pwd)/lib/common.sh"
+
+PROXY_HOST=""
+_resolve_proxy_host() {
+    [[ -n "$PROXY_HOST" ]] && return
+    PROXY_HOST=$(dhis2_inventory_group_hosts web | head -1)
+    [[ -z "$PROXY_HOST" ]] && { dhis2_log_error "No [web] host in inventory"; exit "$DHIS2_EXIT_PREFLIGHT"; }
+    return 0
+}
+
+_tls_mode() {
+    local inv; inv=$(dhis2_config_resolve_inventory)
+    awk -F= '/^[[:space:]]*TLS_TYPE[[:space:]]*=/ {gsub(/[[:space:]]/,"",$2); print $2; exit}' "$inv"
+}
+
+main() {
+    dhis2_cli_parse_globals "$@"
+    set -- "${DHIS2_CLI_REMAINING[@]}"
+    [[ $# -eq 0 ]] && { dhis2_cli_show_help "$0"; exit "$DHIS2_EXIT_USAGE"; }
+    local sub="$1"; shift
+    _resolve_proxy_host
+    case "$sub" in
+        status) _status ;;
+        verify) _verify ;;
+        inspect) _inspect "$@" ;;
+        chain) _chain ;;
+        csr) _csr "$@" ;;
+        issue) _issue "$@" ;;
+        install) _install "$@" ;;
+        renew) _renew ;;
+        backup) _backup ;;
+        expiry) _expiry ;;
+        rotate) _rotate ;;
+        --help|-h|help) dhis2_cli_show_help "$0"; exit 0 ;;
+        *) dhis2_log_error "Unknown subcommand: $sub"; exit "$DHIS2_EXIT_USAGE" ;;
+    esac
+}
+
+_status() {
+    local mode; mode=$(_tls_mode)
+    if [[ "$DHIS2_OPT_JSON" == true ]]; then
+        dhis2_json_emit command=dhis2-tls mode="${mode:-unknown}" proxy="$PROXY_HOST"
+    else
+        printf 'proxy host: %s\nTLS mode:   %s\n' "$PROXY_HOST" "${mode:-unknown}"
+        dhis2_ansible_adhoc "$PROXY_HOST" shell -a 'ls -la /etc/letsencrypt/live/ 2>/dev/null; ls -la /etc/ssl/dhis/ 2>/dev/null' -b -o | dhis2_log_redact
+    fi
+}
+
+_verify() {
+    dhis2_ansible_adhoc "$PROXY_HOST" shell -a '
+        for cert in $(find /etc/letsencrypt/live /etc/ssl/dhis -name "fullchain.pem" -o -name "*.crt" 2>/dev/null); do
+            echo "-- $cert --"
+            openssl x509 -in "$cert" -noout -subject -issuer -enddate 2>/dev/null
+        done
+    ' -b -o
+}
+
+_inspect() {
+    local fqdn=""
+    while (( $# )); do case "$1" in --fqdn) fqdn="$2"; shift ;; --fqdn=*) fqdn="${1#*=}" ;; esac; shift || true; done
+    [[ -z "$fqdn" ]] && fqdn=$(awk -F= '/^[[:space:]]*fqdn[[:space:]]*=/ {gsub(/[[:space:]]/,"",$2); print $2; exit}' "$(dhis2_config_resolve_inventory)")
+    [[ -z "$fqdn" ]] && { dhis2_log_error "No FQDN resolved from inventory - pass --fqdn"; exit "$DHIS2_EXIT_USAGE"; }
+    dhis2_ansible_adhoc "$PROXY_HOST" shell -a "echo | openssl s_client -connect $fqdn:443 -servername $fqdn 2>/dev/null | openssl x509 -noout -subject -issuer -dates -ext subjectAltName" -b -o
+}
+
+_chain() {
+    dhis2_ansible_adhoc "$PROXY_HOST" shell -a '
+        for cert in /etc/letsencrypt/live/*/fullchain.pem /etc/ssl/dhis/*.crt; do
+            [ -f "$cert" ] || continue
+            key="${cert%fullchain.pem}privkey.pem"
+            [ ! -f "$key" ] && key="${cert%.crt}.key"
+            c=$(openssl x509 -noout -modulus -in "$cert" 2>/dev/null | sha256sum | cut -d" " -f1)
+            k=$(openssl rsa  -noout -modulus -in "$key" 2>/dev/null | sha256sum | cut -d" " -f1)
+            if [ "$c" = "$k" ]; then
+                echo "$cert: cert/key match OK"
+            else
+                echo "$cert: cert/key MISMATCH"
+            fi
+        done
+    ' -b -o
+}
+
+_csr() {
+    local inst="${1:-}"; shift || true
+    local subject="" sans=""
+    while (( $# )); do
+        case "$1" in --subject) subject="$2"; shift ;; --subject=*) subject="${1#*=}" ;;
+                     --san) sans+="DNS:$2,"; shift ;; --san=*) sans+="DNS:${1#*=},";; esac
+        shift || true
+    done
+    [[ -z "$inst" || -z "$subject" ]] && { dhis2_log_error 'Usage: dhis2-tls csr INSTANCE --subject "/CN=..." [--san DNS:...]'; exit "$DHIS2_EXIT_USAGE"; }
+    sans="${sans%,}"
+    local out="/etc/ssl/dhis/$inst"
+    dhis2_ansible_adhoc "$PROXY_HOST" shell -a "
+        set -e
+        mkdir -p '$out' && chmod 700 '$out'
+        openssl req -new -newkey rsa:2048 -nodes \
+            -keyout '$out/key.pem' -out '$out/csr.pem' \
+            -subj '$subject' ${sans:+-addext subjectAltName=$sans}
+        chmod 600 '$out/key.pem' '$out/csr.pem'
+        echo CSR_PATH=$out/csr.pem
+    " -b -o | dhis2_log_redact
+}
+
+_issue() {
+    local mode="${1:-$(_tls_mode)}"
+    case "$mode" in
+        letsencrypt|customssl|selfsigned) ;;
+        *) dhis2_log_error "Unknown TLS mode: $mode"; exit "$DHIS2_EXIT_USAGE" ;;
+    esac
+    "${DHIS2_CLI_ROOT}/bin/dhis2-deploy" apply --only proxy-conf -e TLS_TYPE="$mode"
+}
+
+_install() {
+    local cert="" key="" chain=""
+    while (( $# )); do
+        case "$1" in --cert) cert="$2"; shift ;; --cert=*) cert="${1#*=}" ;;
+                     --key)  key="$2";  shift ;; --key=*)  key="${1#*=}" ;;
+                     --chain) chain="$2"; shift ;; --chain=*) chain="${1#*=}" ;; esac
+        shift || true
+    done
+    [[ -z "$cert" || -z "$key" ]] && { dhis2_log_error "Usage: dhis2-tls install --cert PATH --key PATH [--chain PATH]"; exit "$DHIS2_EXIT_USAGE"; }
+    for f in "$cert" "$key" ${chain:-}; do [[ -r "$f" ]] || { dhis2_log_error "Unreadable: $f"; exit "$DHIS2_EXIT_USAGE"; }; done
+    dhis2_cli_confirm "Install new TLS cert on $PROXY_HOST?"
+    dhis2_ansible_adhoc "$PROXY_HOST" copy -a "src=$cert dest=/etc/ssl/dhis/cert.pem mode=0644" -b
+    dhis2_ansible_adhoc "$PROXY_HOST" copy -a "src=$key  dest=/etc/ssl/dhis/key.pem  mode=0600" -b
+    [[ -n "$chain" ]] && dhis2_ansible_adhoc "$PROXY_HOST" copy -a "src=$chain dest=/etc/ssl/dhis/chain.pem mode=0644" -b
+    # Validate before reload - section 57.11
+    "${DHIS2_CLI_ROOT}/bin/dhis2-proxy" test || { dhis2_log_error "Proxy config test failed - NOT reloading"; exit "$DHIS2_EXIT_PREFLIGHT"; }
+    "${DHIS2_CLI_ROOT}/bin/dhis2-proxy" reload
+}
+
+_renew() {
+    dhis2_ansible_adhoc "$PROXY_HOST" shell -a "certbot renew --no-random-sleep-on-renew --dry-run && certbot renew --no-random-sleep-on-renew" -b -o
+}
+
+_backup() {
+    dhis2_ansible_adhoc "$PROXY_HOST" shell -a 'tar czf /var/backups/tls-$(date -u +%Y%m%d-%H%M%S).tgz /etc/letsencrypt /etc/ssl/dhis 2>/dev/null && echo ok' -b -o
+}
+
+_expiry() {
+    dhis2_ansible_adhoc "$PROXY_HOST" shell -a '
+        for cert in $(find /etc/letsencrypt/live /etc/ssl/dhis -name "fullchain.pem" -o -name "*.crt" 2>/dev/null); do
+            end=$(openssl x509 -enddate -noout -in "$cert" | cut -d= -f2)
+            days=$(( ( $(date -d "$end" +%s) - $(date +%s) ) / 86400 ))
+            echo "$cert end=$end days_remaining=$days"
+        done
+    ' -b -o
+}
+
+_rotate() {
+    dhis2_cli_confirm "Rotate TLS cert on $PROXY_HOST? (previous cert retained)"
+    _backup
+    _renew
+    "${DHIS2_CLI_ROOT}/bin/dhis2-proxy" test || { dhis2_log_error "Proxy test failed after renew - NOT reloading"; exit "$DHIS2_EXIT_PREFLIGHT"; }
+    "${DHIS2_CLI_ROOT}/bin/dhis2-proxy" reload
+}
+
+main "$@"

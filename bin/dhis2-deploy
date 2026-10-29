@@ -1,0 +1,435 @@
+#!/usr/bin/env bash
+# USAGE_START
+# dhis2-deploy - deployment orchestration (section 11, 57.1).
+#
+# Usage:
+#   dhis2-deploy architectures
+#   dhis2-deploy init          [--architecture lxd|distributed|hybrid]
+#   dhis2-deploy preflight     [--json]
+#   dhis2-deploy plan          [--only COMPONENT] [--skip COMPONENT]
+#   dhis2-deploy diff          [--only COMPONENT]
+#   dhis2-deploy apply         [--only COMPONENT] [--skip COMPONENT]
+#                              [--limit HOST] [--instance NAME]
+#                              [--preserve-dhis-conf | --merge-dhis-conf | --replace-dhis-conf]
+#                              [--preserve-postgres-conf]
+#                              [--no-package-upgrades | --allow-package-upgrades]
+#                              [--skip-war-deploy] [--skip-restart]
+#                              [--database-upgrade-mode refuse|detect|prompt|auto|force]
+#                              [--source-dhis2-version VERSION] [--target-dhis2-version VERSION]
+#                              [--backup-before-migration] [--no-backup-before-migration]
+#                              [--verify-backup] [--monitor-migrations]
+#                              [--allow-db-migrations | --no-db-migrations]
+#                              [--yes]
+#   dhis2-deploy verify        [--instance NAME]
+#   dhis2-deploy snapshot
+#   dhis2-deploy show
+#   dhis2-deploy components
+#   dhis2-deploy history
+#   dhis2-deploy resume
+#
+# All operations preserve the existing Ansible tag/role model.
+# USAGE_END
+set -Eeuo pipefail
+
+. "$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")/.." && pwd)/lib/common.sh"
+
+# --- component → tag map (section 57.1 Component-level execution)
+declare -A COMPONENT_TAGS=(
+    [database]=postgresql-install
+    [proxy]=proxy-install
+    [monitoring]=monitoring
+    [instance]=create-instance
+    [alerting]=alerting
+    [backup]=backup-script
+    [doris]=doris-install
+    [unattended-upgrades]=unattended-upgrades
+    [war]=deploy-war
+    [proxy-conf]=proxy-conf
+    [set-url]=set-dhis2-url
+)
+
+ONLY=""
+SKIP=""
+DHIS_CONF_MODE=""   # preserve|merge|replace
+PG_CONF_MODE=""     # preserve|merge|replace
+PKG_UPGRADES="default"  # default|allow|no
+SKIP_WAR=false
+SKIP_RESTART=false
+DB_UPGRADE_MODE=""   # refuse|detect|prompt|auto|force
+DB_MIGRATIONS=""     # allow|no
+SRC_VERSION=""
+TGT_VERSION=""
+BACKUP_BEFORE_MIG=""   # true|false
+VERIFY_BACKUP=false
+MONITOR_MIG=false
+MIG_TIMEOUT=""
+RESTORE_ON_FAIL=false
+
+main() {
+    dhis2_cli_parse_globals "$@"
+    set -- "${DHIS2_CLI_REMAINING[@]}"
+    [[ $# -eq 0 ]] && { dhis2_cli_show_help "$0"; exit "$DHIS2_EXIT_USAGE"; }
+    local sub="$1"; shift
+    case "$sub" in
+        architectures) _architectures ;;
+        init) _init "$@" ;;
+        preflight) _preflight ;;
+        plan) _parse_apply_flags "$@"; _plan ;;
+        diff) _parse_apply_flags "$@"; _diff ;;
+        apply) _parse_apply_flags "$@"; _apply ;;
+        verify) _verify "$@" ;;
+        snapshot) _snapshot ;;
+        show) _show ;;
+        components) _components ;;
+        history) _history ;;
+        resume) _resume ;;
+        --help|-h|help) dhis2_cli_show_help "$0"; exit 0 ;;
+        *) dhis2_log_error "Unknown subcommand: $sub"; exit "$DHIS2_EXIT_USAGE" ;;
+    esac
+}
+
+_architectures() {
+    if [[ "$DHIS2_OPT_JSON" == true ]]; then
+        dhis2_json_emit \
+            command=dhis2-deploy \
+            architectures='[{"name":"lxd","state":"SUPPORTED"},{"name":"distributed","state":"SUPPORTED"},{"name":"hybrid","state":"SUPPORTED"},{"name":"docker","state":"NOT IMPLEMENTED"},{"name":"kubernetes","state":"NOT IMPLEMENTED"}]'
+        return 0
+    fi
+    dhis2_output_table "ARCHITECTURE|STATE" \
+        "lxd|SUPPORTED" \
+        "distributed|SUPPORTED" \
+        "hybrid|SUPPORTED" \
+        "docker|NOT IMPLEMENTED" \
+        "kubernetes|NOT IMPLEMENTED"
+}
+
+_init() {
+    local arch=lxd
+    while (( $# )); do
+        case "$1" in
+            --architecture) arch="${2:-lxd}"; shift ;;
+            --architecture=*) arch="${1#*=}" ;;
+            *) dhis2_log_warn "Ignoring: $1" ;;
+        esac
+        shift || true
+    done
+    local inv_dir="${DHIS2_CLI_ROOT}/deploy/inventory"
+    local inv="$inv_dir/hosts"
+    if [[ -f "$inv" ]]; then
+        dhis2_log_warn "Inventory already exists: $inv (not overwriting)"
+        return 0
+    fi
+    cp "$inv_dir/hosts.template" "$inv"
+    chown "${SUDO_USER:-$USER}" "$inv" 2>/dev/null || true
+    chmod 600 "$inv"
+    dhis2_log_info "Created $inv for architecture=$arch (edit this file next)"
+}
+
+_preflight() {
+    local inv findings=() rc=0
+    inv=$(dhis2_config_resolve_inventory)
+    local u; u=$(dhis2_validate_ubuntu_release) || findings+=("os: $u")
+    dhis2_validate_ansible_present || findings+=("ansible-playbook: missing")
+    dhis2_validate_python_present || findings+=("python3: missing")
+    [[ -r "$inv" ]] || findings+=("inventory: unreadable $inv")
+    dhis2_inventory_validate_syntax "$inv" >/dev/null 2>&1 || findings+=("inventory syntax: invalid")
+    local dupes
+    dupes=$(dhis2_validate_inventory_duplicates "$inv" || true)
+    [[ -n "$dupes" ]] && findings+=("duplicate hosts: $dupes")
+    dhis2_validate_database_refs "$inv" >/dev/null || findings+=("unresolved database_host references")
+    local p; p=$(dhis2_validate_proxy_choice "$inv")
+    [[ "$p" == invalid:* ]] && findings+=("$p")
+    # LXD if any lxd host present
+    if grep -qE 'ansible_connection=lxd' "$inv" || grep -qE '^[[:space:]]*ansible_connection[[:space:]]*=[[:space:]]*lxd' "$inv"; then
+        dhis2_validate_lxd_present || findings+=("lxd: not installed")
+    fi
+    (( ${#findings[@]} )) && rc=$DHIS2_EXIT_PREFLIGHT
+    if [[ "$DHIS2_OPT_JSON" == true ]]; then
+        local arr="[" first=true f
+        for f in "${findings[@]:-}"; do
+            [[ -z "$f" ]] && continue
+            $first || arr+=","
+            first=false
+            local safe="${f//\"/\\\"}"
+            arr+="\"$safe\""
+        done
+        arr+="]"
+        local succ; if (( rc == 0 )); then succ=true; else succ=false; fi
+        dhis2_json_emit command=dhis2-deploy action=preflight success="$succ" findings="$arr"
+    else
+        if (( rc == 0 )); then
+            dhis2_status_ok "OK"; echo " - preflight passed"
+        else
+            dhis2_status_fail "FAIL"; echo " - findings:"
+            local f
+            for f in "${findings[@]}"; do printf '  - %s\n' "$f"; done
+        fi
+    fi
+    exit $rc
+}
+
+_parse_apply_flags() {
+    while (( $# )); do
+        case "$1" in
+            --only) ONLY="${2:-}"; shift ;;
+            --only=*) ONLY="${1#*=}" ;;
+            --skip) SKIP="${2:-}"; shift ;;
+            --skip=*) SKIP="${1#*=}" ;;
+            --preserve-dhis-conf) DHIS_CONF_MODE=preserve ;;
+            --merge-dhis-conf)    DHIS_CONF_MODE=merge ;;
+            --replace-dhis-conf)  DHIS_CONF_MODE=replace ;;
+            --preserve-postgres-conf) PG_CONF_MODE=preserve ;;
+            --allow-package-upgrades) PKG_UPGRADES=allow ;;
+            --no-package-upgrades)    PKG_UPGRADES=no ;;
+            --skip-war-deploy) SKIP_WAR=true ;;
+            --skip-restart) SKIP_RESTART=true ;;
+            --database-upgrade-mode) DB_UPGRADE_MODE="${2:-}"; shift ;;
+            --database-upgrade-mode=*) DB_UPGRADE_MODE="${1#*=}" ;;
+            --allow-db-migrations) DB_MIGRATIONS=allow ;;
+            --no-db-migrations)    DB_MIGRATIONS=no ;;
+            --source-dhis2-version) SRC_VERSION="${2:-}"; shift ;;
+            --source-dhis2-version=*) SRC_VERSION="${1#*=}" ;;
+            --target-dhis2-version) TGT_VERSION="${2:-}"; shift ;;
+            --target-dhis2-version=*) TGT_VERSION="${1#*=}" ;;
+            --backup-before-migration) BACKUP_BEFORE_MIG=true ;;
+            --no-backup-before-migration) BACKUP_BEFORE_MIG=false ;;
+            --verify-backup) VERIFY_BACKUP=true ;;
+            --monitor-migrations) MONITOR_MIG=true ;;
+            --migration-timeout) MIG_TIMEOUT="${2:-}"; shift ;;
+            --migration-timeout=*) MIG_TIMEOUT="${1#*=}" ;;
+            --restore-on-failure) RESTORE_ON_FAIL=true ;;
+            --) shift; break ;;
+            *) dhis2_log_warn "Ignoring unknown apply option: $1" ;;
+        esac
+        shift || true
+    done
+}
+
+_resolve_tags() {
+    local -a tags=()
+    if [[ -n "$ONLY" ]]; then
+        IFS=',' read -r -a parts <<< "$ONLY"
+        local p
+        for p in "${parts[@]}"; do
+            if [[ -n "${COMPONENT_TAGS[$p]:-}" ]]; then
+                tags+=("${COMPONENT_TAGS[$p]}")
+            else
+                dhis2_log_error "Unknown component: $p"
+                exit "$DHIS2_EXIT_USAGE"
+            fi
+        done
+    fi
+    $SKIP_WAR && :
+    $SKIP_RESTART && :
+    (IFS=,; echo "${tags[*]}")
+}
+
+_resolve_skip_tags() {
+    local -a tags=()
+    if [[ -n "$SKIP" ]]; then
+        IFS=',' read -r -a parts <<< "$SKIP"
+        local p
+        for p in "${parts[@]}"; do
+            [[ -n "${COMPONENT_TAGS[$p]:-}" ]] && tags+=("${COMPONENT_TAGS[$p]}")
+        done
+    fi
+    $SKIP_WAR && tags+=(deploy-war)
+    (IFS=,; echo "${tags[*]}")
+}
+
+_extra_vars() {
+    local -a kv=()
+    [[ -n "$DHIS_CONF_MODE" ]] && kv+=("dhis2_conf_mode=$DHIS_CONF_MODE")
+    [[ -n "$PG_CONF_MODE"   ]] && kv+=("postgres_conf_mode=$PG_CONF_MODE")
+    [[ -n "$DB_UPGRADE_MODE" ]] && kv+=("dhis2_database_upgrade_mode=$DB_UPGRADE_MODE")
+    [[ -n "$SRC_VERSION" ]] && kv+=("dhis2_source_version=$SRC_VERSION")
+    [[ -n "$TGT_VERSION" ]] && kv+=("dhis2_version=$TGT_VERSION")
+    case "$PKG_UPGRADES" in
+        allow) kv+=("dhis2_allow_package_upgrades=true") ;;
+        no)    kv+=("dhis2_allow_package_upgrades=false") ;;
+    esac
+    [[ "$BACKUP_BEFORE_MIG" == "true"  ]] && kv+=("dhis2_backup_before_migration=true")
+    [[ "$BACKUP_BEFORE_MIG" == "false" ]] && kv+=("dhis2_backup_before_migration=false")
+    $VERIFY_BACKUP && kv+=("dhis2_verify_backup=true")
+    $MONITOR_MIG   && kv+=("dhis2_monitor_migrations=true")
+    if [[ -n "$DB_MIGRATIONS" ]]; then
+        if [[ "$DB_MIGRATIONS" == "allow" ]]; then kv+=("dhis2_allow_db_migrations=true"); else kv+=("dhis2_allow_db_migrations=false"); fi
+    fi
+    $SKIP_WAR && kv+=("dhis2_skip_war_deploy=true")
+    $SKIP_RESTART && kv+=("dhis2_skip_restart=true")
+    [[ -n "$MIG_TIMEOUT" ]] && kv+=("dhis2_migration_timeout=$MIG_TIMEOUT")
+    $RESTORE_ON_FAIL && kv+=("dhis2_restore_on_failure=true")
+    local out
+    out=$(printf '%s ' "${kv[@]:-}")
+    [[ -z "$out" ]] && return 0
+    printf -- '-e %s' "$out"
+}
+
+_plan() {
+    DHIS2_OPT_CHECK=true; DHIS2_OPT_DIFF=true
+    export DHIS2_OPT_CHECK DHIS2_OPT_DIFF
+    _apply --plan-only
+}
+
+_diff() {
+    DHIS2_OPT_CHECK=true; DHIS2_OPT_DIFF=true
+    export DHIS2_OPT_CHECK DHIS2_OPT_DIFF
+    _apply --plan-only
+}
+
+_apply() {
+    local plan_only=false
+    [[ "${1:-}" == "--plan-only" ]] && plan_only=true
+
+    # Preflight is required for apply unless --yes AND --no-check-preflight
+    if ! $plan_only; then
+        dhis2_log_info "Running preflight"
+        if ! ( DHIS2_OPT_JSON=false; _preflight ) >/dev/null; then
+            dhis2_log_error "Preflight failed - aborting apply (use dhis2-deploy preflight for details)"
+            exit "$DHIS2_EXIT_PREFLIGHT"
+        fi
+    fi
+
+    local lock_name="deploy"
+    [[ -n "${DHIS2_OPT_INSTANCE:-}" ]] && lock_name="deploy.${DHIS2_OPT_INSTANCE}"
+    dhis2_lock_acquire "$lock_name" || exit $?
+
+    local tags skip_tags
+    tags=$(_resolve_tags)
+    skip_tags=$(_resolve_skip_tags)
+
+    local -a extra=()
+    local ev
+    ev=$(_extra_vars) || true
+    [[ -n "$ev" ]] && read -r -a extra <<< "$ev"
+
+    local -a ans_args=()
+    [[ -n "$tags" ]]     && ans_args+=(--tags "$tags")
+    [[ -n "$skip_tags" ]] && ans_args+=(--skip-tags "$skip_tags")
+    [[ -n "${DHIS2_OPT_INSTANCE:-}" ]] && ans_args+=(--limit "$DHIS2_OPT_INSTANCE")
+
+    local history_dir rec
+    history_dir=$(dhis2_config_history_dir)
+    rec="$history_dir/apply.$(date -u +%Y%m%d-%H%M%S).log"
+    dhis2_log_info "Recording run to $rec"
+
+    local started; started=$(date -u +%s)
+    local rc=0
+    set +e
+    ANSIBLE_CONFIG="$(dhis2_ansible_cfg)" \
+      dhis2_ansible_playbook dhis2.yml "${extra[@]:-}" "${ans_args[@]:-}" 2>&1 | tee "$rec"
+    rc=${PIPESTATUS[0]}
+    set -e
+
+    local ended; ended=$(date -u +%s)
+    dhis2_log_audit dhis2-deploy "{\"only\":\"$ONLY\",\"skip\":\"$SKIP\",\"instance\":\"${DHIS2_OPT_INSTANCE:-}\",\"dhis_conf_mode\":\"$DHIS_CONF_MODE\",\"db_upgrade_mode\":\"$DB_UPGRADE_MODE\",\"plan_only\":$plan_only}" \
+        "rc=$rc,duration=$((ended-started))"
+
+    if (( rc != 0 )); then
+        dhis2_log_error "Deployment failed (rc=$rc). Transcript: $rec"
+        exit "$DHIS2_EXIT_ANSIBLE"
+    fi
+
+    if ! $plan_only; then
+        dhis2_log_info "Running post-deployment verification"
+        _verify >/dev/null 2>&1 || dhis2_log_warn "Post-deployment verification reported issues."
+    fi
+
+    if [[ "$DHIS2_OPT_JSON" == true ]]; then
+        dhis2_json_emit command=dhis2-deploy action="$([[ $plan_only == true ]] && echo plan || echo apply)" success=true duration="$((ended-started))" record="$rec"
+    else
+        dhis2_log_info "Deployment completed in $((ended-started))s"
+    fi
+}
+
+_verify() {
+    local inst="${DHIS2_OPT_INSTANCE:-}"
+    local target="all"
+    [[ -n "$inst" ]] && target="$inst"
+    # Minimal verification: ask Ansible to collect service facts; stop if unreachable.
+    if ! command -v ansible >/dev/null 2>&1; then
+        dhis2_log_warn "ansible not installed - skipping verification"
+        return 0
+    fi
+    local rc=0
+    dhis2_ansible_adhoc "$target" ping -o 2>&1 || rc=$?
+    if (( rc != 0 )); then
+        dhis2_log_error "Verification: host unreachable: $target"
+        exit "$DHIS2_EXIT_CONNECTIVITY"
+    fi
+    dhis2_log_info "Verification: hosts reachable."
+}
+
+_snapshot() {
+    local out
+    out="$(dhis2_config_snapshot_dir)/snap-$(date -u +%Y%m%d-%H%M%S)"
+    mkdir -p "$out"
+    chmod 700 "$out"
+    local inv deploy_dir
+    inv=$(dhis2_config_resolve_inventory)
+    deploy_dir=$(dhis2_config_deploy_dir)
+    cp -a "$inv" "$out/hosts"
+    [[ -d "$deploy_dir/inventory/host_vars" ]] && cp -a "$deploy_dir/inventory/host_vars" "$out/host_vars"
+    [[ -d "$deploy_dir/inventory/group_vars" ]] && cp -a "$deploy_dir/inventory/group_vars" "$out/group_vars"
+    echo "$DHIS2_CLI_VERSION" > "$out/TOOL_VERSION"
+    date -u +%FT%TZ > "$out/TIMESTAMP"
+    chmod -R go-rwx "$out"
+    dhis2_log_info "Snapshot: $out"
+    [[ "$DHIS2_OPT_JSON" == true ]] && dhis2_json_emit snapshot="$out"
+}
+
+_show() {
+    local inv; inv=$(dhis2_config_resolve_inventory)
+    local arch=lxd
+    grep -qE 'ansible_connection=ssh' "$inv" && arch=distributed
+    if grep -qE 'ansible_connection=lxd' "$inv" && grep -qE 'ansible_connection=ssh' "$inv"; then
+        arch=hybrid
+    fi
+    if [[ "$DHIS2_OPT_JSON" == true ]]; then
+        dhis2_json_emit command=dhis2-deploy inventory="$inv" architecture="$arch"
+    else
+        printf 'inventory:   %s\narchitecture: %s\n' "$inv" "$arch"
+    fi
+}
+
+_components() {
+    if [[ "$DHIS2_OPT_JSON" == true ]]; then
+        local arr="[" first=true k
+        for k in "${!COMPONENT_TAGS[@]}"; do
+            $first || arr+=","
+            first=false
+            arr+="{\"component\":\"$k\",\"tag\":\"${COMPONENT_TAGS[$k]}\"}"
+        done
+        arr+="]"
+        dhis2_json_emit command=dhis2-deploy components="$arr"
+    else
+        local k rows=() sorted=()
+        for k in "${!COMPONENT_TAGS[@]}"; do rows+=("$k|${COMPONENT_TAGS[$k]}"); done
+        mapfile -t sorted < <(printf '%s\n' "${rows[@]}" | sort)
+        dhis2_output_table "COMPONENT|ANSIBLE TAG" "${sorted[@]}"
+    fi
+}
+
+_history() {
+    local d; d=$(dhis2_config_history_dir)
+    if [[ "$DHIS2_OPT_JSON" == true ]]; then
+        local arr="[" first=true f
+        for f in "$d"/apply.*.log; do
+            [[ -f "$f" ]] || continue
+            $first || arr+=","
+            first=false
+            arr+="\"$(basename "$f")\""
+        done
+        arr+="]"
+        dhis2_json_emit command=dhis2-deploy history="$arr"
+    else
+        ls -1t "$d" 2>/dev/null | head -50 || echo "(no history)"
+    fi
+}
+
+_resume() {
+    dhis2_log_warn "resume is informational: a run that failed should be re-applied with the same --instance and --only once the root cause is resolved."
+    _history
+}
+
+main "$@"

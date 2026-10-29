@@ -1,0 +1,367 @@
+#!/usr/bin/env bash
+# USAGE_START
+# dhis2-instance - DHIS2 instance lifecycle (section 14, 57.5).
+#
+# Usage:
+#   dhis2-instance list                      [--json]
+#   dhis2-instance show NAME                 [--json]
+#   dhis2-instance create NAME --host HOST --database DBHOST
+#                              [--version VER] [--fqdn FQDN]
+#                              [--preserve-dhis-conf] [--yes]
+#   dhis2-instance delete NAME [--remove-app] [--remove-proxy]
+#                              [--remove-monitoring] [--remove-database]
+#                              [--remove-backups] [--yes]
+#   dhis2-instance start NAME
+#   dhis2-instance stop NAME
+#   dhis2-instance restart NAME
+#   dhis2-instance reload NAME
+#   dhis2-instance status NAME               [--json]
+#   dhis2-instance health NAME
+#   dhis2-instance logs NAME                 [-f] [--since 1h] [--lines N]
+#   dhis2-instance version NAME
+#   dhis2-instance system-info NAME
+#   dhis2-instance endpoint check NAME
+#   dhis2-instance jvm status NAME
+#   dhis2-instance jvm memory NAME
+#   dhis2-instance threads summary NAME
+#   dhis2-instance resources NAME
+#   dhis2-instance database inspect DB --host HOST
+#   dhis2-instance database attach NAME --database DB --host HOST
+#                                   [--source-dhis2-version V]
+#                                   [--upgrade-mode refuse|detect|prompt|auto]
+#                                   [--preserve-credentials]
+#   dhis2-instance maintenance NAME status|enable|disable
+#   dhis2-instance config show NAME                         [--json]
+#   dhis2-instance config diff NAME
+#   dhis2-instance config validate NAME
+#   dhis2-instance config backup NAME
+#   dhis2-instance config preserve NAME
+#   dhis2-instance config merge NAME
+#   dhis2-instance config replace NAME [--yes]
+#   dhis2-instance war status NAME                          [--json]
+#   dhis2-instance war deploy NAME --version VER [--yes]
+#   dhis2-instance war verify NAME
+#   dhis2-instance war backup NAME
+#   dhis2-instance war rollback NAME [--yes]
+# USAGE_END
+set -Eeuo pipefail
+. "$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")/.." && pwd)/lib/common.sh"
+
+main() {
+    dhis2_cli_parse_globals "$@"
+    set -- "${DHIS2_CLI_REMAINING[@]}"
+    [[ $# -eq 0 ]] && { dhis2_cli_show_help "$0"; exit "$DHIS2_EXIT_USAGE"; }
+    local sub="$1"; shift
+    case "$sub" in
+        list) _list ;;
+        show) _show "$@" ;;
+        create) _create "$@" ;;
+        delete) _delete "$@" ;;
+        start|stop|restart|reload) _service_action "$sub" "$@" ;;
+        status) _status "$@" ;;
+        health) _health "$@" ;;
+        logs) _logs "$@" ;;
+        version) _version "$@" ;;
+        system-info) _system_info "$@" ;;
+        endpoint) _endpoint "$@" ;;
+        jvm) _jvm "$@" ;;
+        threads) _threads "$@" ;;
+        resources) _resources "$@" ;;
+        database) _database "$@" ;;
+        maintenance) _maintenance "$@" ;;
+        config) _config "$@" ;;
+        war) _war "$@" ;;
+        clone) dhis2_log_error "clone: use 'dhis2-restore clone SRC DST --backup BACKUP' (section 57.8)"; exit "$DHIS2_EXIT_USAGE" ;;
+        --help|-h|help) dhis2_cli_show_help "$0"; exit 0 ;;
+        *) dhis2_log_error "Unknown subcommand: $sub"; exit "$DHIS2_EXIT_USAGE" ;;
+    esac
+}
+
+_list() {
+    if [[ "$DHIS2_OPT_JSON" == true ]]; then
+        local arr="[" first=true h
+        while IFS= read -r h; do
+            [[ -z "$h" ]] && continue
+            $first || arr+=","; first=false
+            arr+="\"$h\""
+        done < <(dhis2_inventory_group_hosts instances)
+        arr+="]"
+        dhis2_json_emit command=dhis2-instance instances="$arr"
+    else
+        dhis2_inventory_group_hosts instances
+    fi
+}
+
+_show() {
+    local name="${1:-}"
+    [[ -z "$name" ]] && { dhis2_log_error "Usage: dhis2-instance show NAME"; exit "$DHIS2_EXIT_USAGE"; }
+    dhis2_inventory_host_vars_redacted "$name"
+}
+
+_create() {
+    local name="${1:-}"; shift || true
+    [[ -z "$name" ]] && { dhis2_log_error "Usage: dhis2-instance create NAME --host HOST ..."; exit "$DHIS2_EXIT_USAGE"; }
+    local host="" db="" version="" fqdn="" preserve=""
+    while (( $# )); do
+        case "$1" in
+            --host) host="$2"; shift ;; --host=*) host="${1#*=}" ;;
+            --database) db="$2"; shift ;; --database=*) db="${1#*=}" ;;
+            --version) version="$2"; shift ;; --version=*) version="${1#*=}" ;;
+            --fqdn) fqdn="$2"; shift ;; --fqdn=*) fqdn="${1#*=}" ;;
+            --preserve-dhis-conf) preserve="--preserve-dhis-conf" ;;
+        esac
+        shift || true
+    done
+    # Validate unique name
+    if dhis2_inventory_group_hosts instances | grep -qx "$name"; then
+        dhis2_log_error "Instance '$name' already exists in inventory. Use dhis2-inventory add-instance for additive edits."
+        exit "$DHIS2_EXIT_USAGE"
+    fi
+    # Add inventory entry
+    local kv=""
+    [[ -n "$host" ]] && kv+="ansible_host=$host "
+    [[ -n "$db"   ]] && kv+="database_host=$db "
+    [[ -n "$version" ]] && kv+="dhis2_version=$version "
+    [[ -n "$fqdn" ]] && kv+="fqdn=$fqdn "
+    "${DHIS2_CLI_ROOT}/bin/dhis2-inventory" add-instance "$name" ${kv:-}
+    # Trigger the Ansible create-instance role
+    DHIS2_OPT_INSTANCE="$name" "${DHIS2_CLI_ROOT}/bin/dhis2-deploy" apply --only instance $preserve
+}
+
+_delete() {
+    local name="${1:-}"; shift || true
+    [[ -z "$name" ]] && { dhis2_log_error "Usage: dhis2-instance delete NAME [options]"; exit "$DHIS2_EXIT_USAGE"; }
+    local remove_db=false
+    local -a extras=()
+    while (( $# )); do
+        case "$1" in
+            --remove-database) remove_db=true; extras+=("-e" "instance_remove_database=true") ;;
+            --remove-app)      extras+=("-e" "instance_remove_app=true") ;;
+            --remove-proxy)    extras+=("-e" "instance_remove_proxy=true") ;;
+            --remove-monitoring) extras+=("-e" "instance_remove_monitoring=true") ;;
+            --remove-backups)  extras+=("-e" "instance_remove_backups=true") ;;
+        esac
+        shift || true
+    done
+    if $remove_db; then
+        dhis2_cli_confirm "DROPPING database for instance $name is destructive." "$name"
+    else
+        dhis2_cli_confirm "Delete instance $name (database kept)?" "$name"
+    fi
+    dhis2_ansible_playbook dhis2.yml --tags delete-instance --limit "$name" "${extras[@]:-}" \
+        || exit "$DHIS2_EXIT_ANSIBLE"
+}
+
+_resolve_connection() {
+    local name="$1"
+    local vars; vars=$(dhis2_inventory_host_vars_redacted "$name" 2>/dev/null || true)
+    if echo "$vars" | grep -qi 'ansible_connection.*ssh'; then
+        echo ssh
+    else
+        echo lxd
+    fi
+}
+
+_tomcat_unit() {
+    # dhis2-server-tools' create-instance role uses tomcat9 by default on current
+    # supported Ubuntu, but newer paths may differ. The CLI resolves at run-time
+    # (section 65) by querying systemd. We fall back to tomcat9.
+    echo tomcat9
+}
+
+_service_action() {
+    local action="$1" name="${2:-}"
+    [[ -z "$name" ]] && { dhis2_log_error "Usage: dhis2-instance $action NAME"; exit "$DHIS2_EXIT_USAGE"; }
+    local unit; unit=$(_tomcat_unit)
+    local sstate
+    case "$action" in
+        reload) sstate=reloaded ;;
+        start)  sstate=started ;;
+        stop)   sstate=stopped ;;
+        restart) sstate=restarted ;;
+    esac
+    dhis2_ansible_adhoc "$name" systemd -a "name=$unit state=$sstate" -b
+}
+
+_status() {
+    local name="${1:-}"
+    [[ -z "$name" ]] && { dhis2_log_error "Usage: dhis2-instance status NAME"; exit "$DHIS2_EXIT_USAGE"; }
+    local unit; unit=$(_tomcat_unit)
+    dhis2_ansible_adhoc "$name" shell -a "systemctl is-active $unit; systemctl show $unit -p ActiveState,SubState,MainPID,MemoryCurrent" -o -b
+}
+
+_health() {
+    local name="${1:-}"
+    [[ -z "$name" ]] && { dhis2_log_error "Usage: dhis2-instance health NAME"; exit "$DHIS2_EXIT_USAGE"; }
+    dhis2_ansible_adhoc "$name" shell -a "curl -sSf -o /dev/null -w 'http=%{http_code} ttfb=%{time_starttransfer}s total=%{time_total}s\n' http://127.0.0.1:8080/$name/api/system/info 2>/dev/null || echo 'local-check-failed'" -o
+}
+
+_logs() {
+    local name="${1:-}"; shift || true
+    [[ -z "$name" ]] && { dhis2_log_error "Usage: dhis2-instance logs NAME"; exit "$DHIS2_EXIT_USAGE"; }
+    local follow='' since='' lines=200 unit
+    unit=$(_tomcat_unit)
+    while (( $# )); do
+        case "$1" in
+            -f|--follow) follow="-f" ;;
+            --since) since="--since '$2'"; shift ;;
+            --since=*) since="--since '${1#*=}'" ;;
+            --lines) lines="$2"; shift ;;
+            --lines=*) lines="${1#*=}" ;;
+        esac
+        shift || true
+    done
+    dhis2_ansible_adhoc "$name" shell -a "journalctl -u $unit --no-pager -n $lines $since $follow" -b -o
+}
+
+_version() {
+    local name="${1:-}"
+    dhis2_ansible_adhoc "$name" shell -a "cat /var/lib/tomcat9/webapps/$name/META-INF/MANIFEST.MF 2>/dev/null | grep -E 'Implementation-Version|Build' || echo unknown" -b -o
+}
+
+_system_info() {
+    local name="${1:-}"
+    dhis2_ansible_adhoc "$name" shell -a 'uname -a; java -version 2>&1 | head -1; dpkg -l tomcat9 2>/dev/null | tail -1' -b -o
+}
+
+_endpoint() {
+    local sub="${1:-}" name="${2:-}"
+    [[ "$sub" != "check" || -z "$name" ]] && { dhis2_log_error "Usage: dhis2-instance endpoint check NAME"; exit "$DHIS2_EXIT_USAGE"; }
+    dhis2_ansible_adhoc "$name" shell -a "nc -z 127.0.0.1 8080 && echo 'tcp:ok' || echo 'tcp:fail'; curl -sS -o /dev/null -w 'http:%{http_code}\n' -L http://127.0.0.1:8080/$name/" -o
+}
+
+_jvm() {
+    local sub="${1:-}" name="${2:-}"
+    local unit; unit=$(_tomcat_unit)
+    case "$sub" in
+        status) dhis2_ansible_adhoc "$name" shell -a "systemctl status $unit --no-pager | head -20" -b -o ;;
+        memory) dhis2_ansible_adhoc "$name" shell -a "pid=\$(pgrep -f 'org.apache.catalina.startup.Bootstrap' | head -1); cat /proc/\$pid/status | grep -E '^(VmRSS|VmPeak|VmSize)'" -b -o ;;
+        *) dhis2_log_error "Usage: dhis2-instance jvm status|memory NAME"; exit "$DHIS2_EXIT_USAGE" ;;
+    esac
+}
+
+_threads() {
+    local sub="${1:-}" name="${2:-}"
+    [[ "$sub" != "summary" ]] && { dhis2_log_error "Usage: dhis2-instance threads summary NAME"; exit "$DHIS2_EXIT_USAGE"; }
+    dhis2_ansible_adhoc "$name" shell -a "pid=\$(pgrep -f 'org.apache.catalina.startup.Bootstrap' | head -1); ps -L -p \$pid | wc -l" -b -o
+}
+
+_resources() {
+    local name="${1:-}"
+    dhis2_ansible_adhoc "$name" shell -a 'uptime; free -m; df -h /opt /var/lib /var/log 2>/dev/null' -o
+}
+
+_database() {
+    local sub="${1:-}"; shift || true
+    case "$sub" in
+        inspect)
+            local db="${1:-}"; shift || true
+            local host=""
+            while (( $# )); do case "$1" in --host) host="$2"; shift ;; --host=*) host="${1#*=}" ;; esac; shift || true; done
+            [[ -z "$db" || -z "$host" ]] && { dhis2_log_error "Usage: dhis2-instance database inspect DB --host HOST"; exit "$DHIS2_EXIT_USAGE"; }
+            dhis2_ansible_adhoc "$host" shell -a "sudo -u postgres psql -tAc \"SELECT pg_size_pretty(pg_database_size('$db')), datcollate FROM pg_database WHERE datname='$db'\"" -b -o
+            ;;
+        attach)
+            local name="${1:-}"; shift || true
+            [[ -z "$name" ]] && { dhis2_log_error "Usage: dhis2-instance database attach NAME ..."; exit "$DHIS2_EXIT_USAGE"; }
+            local db="" host="" src="" mode="detect" preserve=true
+            while (( $# )); do
+                case "$1" in
+                    --database) db="$2"; shift ;; --database=*) db="${1#*=}" ;;
+                    --host) host="$2"; shift ;; --host=*) host="${1#*=}" ;;
+                    --source-dhis2-version) src="$2"; shift ;; --source-dhis2-version=*) src="${1#*=}" ;;
+                    --upgrade-mode) mode="$2"; shift ;; --upgrade-mode=*) mode="${1#*=}" ;;
+                    --preserve-credentials) preserve=true ;;
+                esac
+                shift || true
+            done
+            # Delegate: this writes database_host and runs apply --only instance with explicit upgrade mode.
+            "${DHIS2_CLI_ROOT}/bin/dhis2-inventory" set "$name" database_host "$host"
+            [[ -n "$db" ]] && "${DHIS2_CLI_ROOT}/bin/dhis2-inventory" set "$name" dhis2_db_name "$db"
+            local args=(--instance "$name" --only instance --database-upgrade-mode "$mode")
+            [[ -n "$src" ]] && args+=(--source-dhis2-version "$src")
+            $preserve && args+=(--preserve-dhis-conf)
+            "${DHIS2_CLI_ROOT}/bin/dhis2-deploy" apply "${args[@]}"
+            ;;
+        *) dhis2_log_error "Usage: dhis2-instance database inspect|attach ..."; exit "$DHIS2_EXIT_USAGE" ;;
+    esac
+}
+
+_maintenance() {
+    local name="${1:-}" act="${2:-status}"
+    [[ -z "$name" ]] && { dhis2_log_error "Usage: dhis2-instance maintenance NAME status|enable|disable"; exit "$DHIS2_EXIT_USAGE"; }
+    case "$act" in
+        status)
+            dhis2_ansible_adhoc "$name" shell -a "test -f /etc/dhis2-server-tools/maint/$name && echo enabled || echo disabled" -o -b
+            ;;
+        enable|disable)
+            dhis2_cli_confirm "Set maintenance mode $act on $name?"
+            # The flag file lives on the proxy host - the nginx template reads
+            # /etc/dhis2-server-tools/maint/<instance> and returns HTTP 503
+            # (section 57.10). Falls back to instance host for ssh deployments
+            # where proxy and app are co-located.
+            local proxy_host
+            proxy_host=$(dhis2_inventory_group_hosts web | head -1)
+            [[ -z "$proxy_host" ]] && proxy_host="$name"
+            if [[ "$act" == enable ]]; then
+                dhis2_ansible_adhoc "$proxy_host" shell -a "mkdir -p /etc/dhis2-server-tools/maint && touch /etc/dhis2-server-tools/maint/$name" -b
+            else
+                dhis2_ansible_adhoc "$proxy_host" shell -a "rm -f /etc/dhis2-server-tools/maint/$name" -b
+            fi
+            dhis2_log_info "Maintenance flag: /etc/dhis2-server-tools/maint/$name on $proxy_host. Proxy template honors it (nginx returns 503)."
+            ;;
+    esac
+}
+
+_config() {
+    local sub="${1:-}" name="${2:-}"
+    [[ -z "$sub" || -z "$name" ]] && { dhis2_log_error "Usage: dhis2-instance config SUB NAME"; exit "$DHIS2_EXIT_USAGE"; }
+    case "$sub" in
+        show) dhis2_ansible_adhoc "$name" shell -a "cat /opt/dhis2/dhis.conf 2>/dev/null || cat /opt/dhis2-$name/dhis.conf 2>/dev/null" -b | dhis2_log_redact ;;
+        diff)
+            local out="/tmp/dhis.conf.$name.$$"
+            dhis2_ansible_adhoc "$name" shell -a "cat /opt/dhis2/dhis.conf 2>/dev/null || cat /opt/dhis2-$name/dhis.conf 2>/dev/null" -b -o | dhis2_log_redact > "$out" || true
+            dhis2_log_info "Current config saved to $out (redacted). Re-run deploy with --diff to see would-be changes."
+            ;;
+        validate) dhis2_ansible_adhoc "$name" shell -a "test -f /opt/dhis2/dhis.conf && grep -c '^connection\.' /opt/dhis2/dhis.conf" -b -o ;;
+        backup)
+            dhis2_ansible_adhoc "$name" shell -a "cp -p /opt/dhis2/dhis.conf /opt/dhis2/dhis.conf.\$(date -u +%Y%m%d-%H%M%S).bak" -b
+            ;;
+        preserve) "${DHIS2_CLI_ROOT}/bin/dhis2-deploy" apply --instance "$name" --only instance --preserve-dhis-conf --skip-war-deploy ;;
+        merge)    "${DHIS2_CLI_ROOT}/bin/dhis2-deploy" apply --instance "$name" --only instance --merge-dhis-conf    --skip-war-deploy ;;
+        replace)  dhis2_cli_confirm "Replace dhis.conf on $name (backup will be created)" "$name"; \
+                  "${DHIS2_CLI_ROOT}/bin/dhis2-deploy" apply --instance "$name" --only instance --replace-dhis-conf --yes ;;
+        *) dhis2_log_error "Unknown config sub: $sub"; exit "$DHIS2_EXIT_USAGE" ;;
+    esac
+}
+
+_war() {
+    local sub="${1:-}" name="${2:-}"
+    [[ -z "$sub" || -z "$name" ]] && { dhis2_log_error "Usage: dhis2-instance war SUB NAME"; exit "$DHIS2_EXIT_USAGE"; }
+    case "$sub" in
+        status)
+            dhis2_ansible_adhoc "$name" shell -a "stat -c '%y %s %n' /var/lib/tomcat9/webapps/$name.war 2>/dev/null; sha256sum /var/lib/tomcat9/webapps/$name.war 2>/dev/null | cut -d' ' -f1" -b -o
+            ;;
+        deploy)
+            shift 2
+            local version=""
+            while (( $# )); do case "$1" in --version) version="$2"; shift ;; --version=*) version="${1#*=}" ;; esac; shift || true; done
+            [[ -z "$version" ]] && { dhis2_log_error "--version required"; exit "$DHIS2_EXIT_USAGE"; }
+            dhis2_cli_confirm "Deploy DHIS2 $version WAR to $name? (previous WAR backed up)"
+            "${DHIS2_CLI_ROOT}/bin/dhis2-deploy" apply --instance "$name" --only war -e dhis2_version="$version"
+            ;;
+        verify)
+            dhis2_ansible_adhoc "$name" shell -a "unzip -l /var/lib/tomcat9/webapps/$name.war >/dev/null 2>&1 && echo ok || echo bad" -b -o
+            ;;
+        backup)
+            dhis2_ansible_adhoc "$name" shell -a "cp -p /var/lib/tomcat9/webapps/$name.war /var/lib/tomcat9/webapps/$name.war.\$(date -u +%Y%m%d-%H%M%S).bak" -b
+            ;;
+        rollback)
+            dhis2_cli_confirm "Rolling back WAR on $name - most recent *.bak will be restored. Database migrations NOT reverted." "$name"
+            dhis2_ansible_adhoc "$name" shell -a "latest=\$(ls -1t /var/lib/tomcat9/webapps/$name.war.*.bak 2>/dev/null | head -1); [ -n \"\$latest\" ] && cp -p \"\$latest\" /var/lib/tomcat9/webapps/$name.war && systemctl restart tomcat9 || echo 'no-backup-found'" -b
+            ;;
+        *) dhis2_log_error "Unknown war sub: $sub"; exit "$DHIS2_EXIT_USAGE" ;;
+    esac
+}
+
+main "$@"

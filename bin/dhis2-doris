@@ -1,0 +1,124 @@
+#!/usr/bin/env bash
+# USAGE_START
+# dhis2-doris - Apache Doris operations (section 27, 57.18).
+#
+# Usage:
+#   dhis2-doris status                     [--json]
+#   dhis2-doris health
+#   dhis2-doris install
+#   dhis2-doris databases
+#   dhis2-doris catalogs
+#   dhis2-doris connect-postgres
+#   dhis2-doris version
+#   dhis2-doris resources
+#   dhis2-doris frontend                   (FE status)
+#   dhis2-doris backend                    (BE status)
+#   dhis2-doris connectivity
+#   dhis2-doris logs
+#
+# Doris is only supported in LXD deployments today. The CLI reports the
+# limitation rather than attempting unsupported behavior (section 27).
+# USAGE_END
+set -Eeuo pipefail
+. "$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")/.." && pwd)/lib/common.sh"
+
+DORIS=""
+_resolve_doris() {
+    [[ -n "$DORIS" ]] && return
+    DORIS=$(dhis2_inventory_group_hosts apache_doris | head -1)
+}
+
+main() {
+    dhis2_cli_parse_globals "$@"
+    set -- "${DHIS2_CLI_REMAINING[@]}"
+    [[ $# -eq 0 ]] && { dhis2_cli_show_help "$0"; exit "$DHIS2_EXIT_USAGE"; }
+    local sub="$1"; shift
+    _resolve_doris
+    if [[ -z "$DORIS" && "$sub" != "install" && "$sub" != "--help" ]]; then
+        if [[ "$DHIS2_OPT_JSON" == true ]]; then
+            dhis2_json_emit command=dhis2-doris supported=false reason="no [apache_doris] host in inventory"
+        else
+            dhis2_log_warn "Apache Doris is not configured (no [apache_doris] host)."
+        fi
+        exit 0
+    fi
+    case "$sub" in
+        status) _status ;;
+        health) _health ;;
+        install) _install ;;
+        databases) _databases ;;
+        catalogs) _catalogs ;;
+        connect-postgres) _connect_pg ;;
+        version) _version ;;
+        resources) _resources ;;
+        frontend) _frontend ;;
+        backend) _backend ;;
+        connectivity) _connectivity ;;
+        logs) _logs ;;
+        --help|-h|help) dhis2_cli_show_help "$0"; exit 0 ;;
+        *) dhis2_log_error "Unknown subcommand: $sub"; exit "$DHIS2_EXIT_USAGE" ;;
+    esac
+}
+
+_status() {
+    local fe be fe_http be_http
+    fe=$(dhis2_ansible_adhoc "$DORIS" shell -a 'ps -ef | grep -E "DorisFE|Palo" | grep -v grep | wc -l' -b -o 2>&1 | tail -1 | awk '{print $NF}')
+    be=$(dhis2_ansible_adhoc "$DORIS" shell -a 'ps -ef | grep -E "palo_be|doris_be" | grep -v grep | wc -l' -b -o 2>&1 | tail -1 | awk '{print $NF}')
+    # FE HTTP :8030 /api/health is the authoritative frontend health signal.
+    fe_http=$(dhis2_ansible_adhoc "$DORIS" shell -a 'curl -sS -o /dev/null -w "%{http_code}" -m 3 http://127.0.0.1:8030/api/health 2>/dev/null || echo n/a' -b -o 2>&1 | tail -1 | awk '{print $NF}')
+    be_http=$(dhis2_ansible_adhoc "$DORIS" shell -a 'curl -sS -o /dev/null -w "%{http_code}" -m 3 http://127.0.0.1:8040/api/health 2>/dev/null || echo n/a' -b -o 2>&1 | tail -1 | awk '{print $NF}')
+    if [[ "$DHIS2_OPT_JSON" == true ]]; then
+        dhis2_json_emit command=dhis2-doris host="$DORIS" fe_running="$fe" be_running="$be" fe_http="$fe_http" be_http="$be_http"
+    else
+        printf 'host: %s\nFE running: %s (http=%s)\nBE running: %s (http=%s)\n' "$DORIS" "$fe" "$fe_http" "$be" "$be_http"
+    fi
+}
+
+_health() { _status; _resources; }
+_install() { "${DHIS2_CLI_ROOT}/bin/dhis2-deploy" apply --only doris; }
+
+_databases() {
+    dhis2_ansible_adhoc "$DORIS" shell -a 'mysql -h127.0.0.1 -P9030 -uroot -e "SHOW DATABASES" 2>/dev/null' -b -o | dhis2_log_redact
+}
+
+_catalogs() {
+    dhis2_ansible_adhoc "$DORIS" shell -a 'mysql -h127.0.0.1 -P9030 -uroot -e "SHOW CATALOGS" 2>/dev/null' -b -o | dhis2_log_redact
+    dhis2_log_info "A JDBC catalog is an external catalog bridge, NOT a materialized copy of the source database (section 57.18)."
+}
+
+_connect_pg() {
+    dhis2_log_info "PostgreSQL catalog in Doris is a federated bridge. See docs/apache-doris-playbook.md."
+}
+
+_version() {
+    dhis2_ansible_adhoc "$DORIS" shell -a 'mysql -h127.0.0.1 -P9030 -uroot -e "SELECT VERSION()" 2>/dev/null' -b -o
+}
+
+_resources() {
+    dhis2_ansible_adhoc "$DORIS" shell -a 'free -h; echo ---; df -h /opt/doris 2>/dev/null' -b -o
+}
+
+_frontend() {
+    dhis2_ansible_adhoc "$DORIS" shell -a '
+        systemctl status doris-fe --no-pager 2>/dev/null | head -10
+        echo --- fe-http ---
+        curl -sS -m 5 http://127.0.0.1:8030/api/health 2>/dev/null
+    ' -b -o | dhis2_log_redact
+}
+_backend() {
+    dhis2_ansible_adhoc "$DORIS" shell -a '
+        systemctl status doris-be --no-pager 2>/dev/null | head -10
+        echo --- be-http ---
+        curl -sS -m 5 http://127.0.0.1:8040/api/health 2>/dev/null
+    ' -b -o | dhis2_log_redact
+}
+
+_connectivity() {
+    dhis2_ansible_adhoc "$DORIS" shell -a 'ss -tnl 2>/dev/null | grep -E ":8030|:9030|:8040"' -b -o
+}
+
+_logs() {
+    dhis2_ansible_adhoc "$DORIS" shell -a 'tail -200 /opt/doris/fe/log/fe.log 2>/dev/null; echo "---BE---"; tail -200 /opt/doris/be/log/be.INFO 2>/dev/null' -b -o | dhis2_log_redact
+}
+
+main "$@"
