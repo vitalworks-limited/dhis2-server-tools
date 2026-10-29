@@ -1,0 +1,40 @@
+---
+- name: Prepare - stub tomcat9 systemd and Flyway log
+  hosts: all
+  gather_facts: true
+  tasks:
+    - name: Copy repository (role tasks need to be reachable)
+      ansible.posix.synchronize:
+        src: "{{ lookup('env', 'MOLECULE_PROJECT_DIRECTORY') | default(playbook_dir ~ '/../..', true) }}/"
+        dest: /opt/dhis2-server-tools/
+        rsync_opts:
+          - "--exclude=.git"
+
+    - name: Create log directory
+      ansible.builtin.file:
+        path: /var/log/tomcat9
+        state: directory
+        mode: "0755"
+
+    - name: Install a 'tomcat9' systemd placeholder unit
+      ansible.builtin.copy:
+        content: |
+          [Unit]
+          Description=Mock tomcat9 for molecule
+          [Service]
+          Type=oneshot
+          ExecStart=/bin/true
+          RemainAfterExit=yes
+          [Install]
+          WantedBy=multi-user.target
+        dest: /etc/systemd/system/tomcat9.service
+        mode: "0644"
+
+    - name: Reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: Create tomcat group (role may chown state files to it)
+      ansible.builtin.group:
+        name: tomcat
+        state: present

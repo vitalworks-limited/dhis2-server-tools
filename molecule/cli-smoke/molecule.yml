@@ -1,0 +1,48 @@
+---
+# molecule/cli-smoke
+#
+# Runs the dhis2-* CLI inside a disposable Ubuntu container to prove the
+# scripts execute, parse arguments, read a known-good inventory, and
+# produce the expected machine-readable output. No DHIS2 deployment is
+# attempted. This is the single scenario required to pass in CI before
+# any live-infrastructure validation (section 46 CI requirements, scenario
+# AA controller-only CLI).
+dependency:
+  name: galaxy
+  options:
+    ignore-certs: true
+    ignore-errors: true
+driver:
+  name: docker
+platforms:
+  - name: dhis2-cli-smoke
+    image: geerlingguy/docker-ubuntu2204-ansible:latest
+    pre_build_image: true
+    command: ""
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+    privileged: true
+    cgroupns_mode: host
+provisioner:
+  name: ansible
+  config_options:
+    defaults:
+      interpreter_python: auto_silent
+      stdout_callback: yaml
+    ssh_connection:
+      pipelining: true
+verifier:
+  name: testinfra
+  options:
+    v: true
+    junitxml: junit.xml
+scenario:
+  test_sequence:
+    - dependency
+    - destroy
+    - syntax
+    - create
+    - prepare
+    - converge
+    - verify
+    - destroy

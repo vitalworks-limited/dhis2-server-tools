@@ -1,0 +1,100 @@
+---
+#
+# Three converge passes, each with a different mock catalina.out.
+# After each pass the test asserts the task-level outcome.
+#
+
+- name: Case 1 - successful Flyway migration (task should succeed)
+  hosts: all
+  gather_facts: true
+  vars:
+    dhis2_monitor_migrations: true
+    dhis2_allow_db_migrations: true
+    dhis2_version: 2.43.2
+    tomcat_version: 9
+    dhis2_catalina_log: /var/log/tomcat9/catalina.out
+    dhis2_migration_timeout: 10
+  tasks:
+    - name: Reset catalina.out with a successful Flyway sequence
+      ansible.builtin.copy:
+        content: |
+          INFO Starting Flyway Community Edition
+          INFO Database: jdbc:postgresql://postgres:5432/hmis
+          INFO Migrating schema "public"
+          INFO Successfully applied 42 migrations to schema "public"
+          INFO Server startup in 56123 ms
+        dest: /var/log/tomcat9/catalina.out
+        mode: "0644"
+
+    - name: Run monitor-migrations task
+      ansible.builtin.include_tasks: /opt/dhis2-server-tools/deploy/roles/create-instance/tasks/monitor-migrations.yml
+
+    - name: Case 1 state file must mark completion
+      ansible.builtin.command: grep -c 'flyway=completed\|flyway=noop' "/var/lib/dhis2-server-tools/state/upgrade.{{ inventory_hostname }}.state"
+      register: s1
+      changed_when: false
+      failed_when: s1.stdout | int != 1
+
+- name: Case 2 - Flyway failure (task must fail fast)
+  hosts: all
+  gather_facts: false
+  vars:
+    dhis2_monitor_migrations: true
+    dhis2_allow_db_migrations: true
+    dhis2_version: 2.43.2
+    tomcat_version: 9
+    dhis2_catalina_log: /var/log/tomcat9/catalina.out
+    dhis2_migration_timeout: 10
+    # Record the pre-upgrade backup path so the error guidance can show it
+    dhis2_pre_upgrade_backup: /var/backups/dhis2/hmis-pre-upgrade-TEST.dump
+    dhis2_db_name: hmis
+  tasks:
+    - name: Overwrite catalina.out with a Flyway failure
+      ansible.builtin.copy:
+        content: |
+          INFO Starting Flyway Community Edition
+          ERROR Flyway Migration V2_43__add_column.sql failed
+          ERROR FlywayException: statement failed
+        dest: /var/log/tomcat9/catalina.out
+        mode: "0644"
+
+    - name: Run monitor-migrations task - expect it to fail
+      block:
+        - ansible.builtin.include_tasks: /opt/dhis2-server-tools/deploy/roles/create-instance/tasks/monitor-migrations.yml
+      rescue:
+        - name: Case 2 - task fail was observed, which is required
+          ansible.builtin.set_fact:
+            case2_failed_as_expected: true
+
+    - name: Case 2 - assert failure was raised
+      ansible.builtin.assert:
+        that: case2_failed_as_expected | default(false)
+        fail_msg: "monitor-migrations did NOT fail on FlywayException output"
+
+- name: Case 3 - no migration activity, server starts (noop success)
+  hosts: all
+  gather_facts: false
+  vars:
+    dhis2_monitor_migrations: true
+    dhis2_allow_db_migrations: true
+    dhis2_version: 2.43.2
+    tomcat_version: 9
+    dhis2_catalina_log: /var/log/tomcat9/catalina.out
+    dhis2_migration_timeout: 10
+  tasks:
+    - name: Overwrite catalina.out with a plain startup message (no Flyway)
+      ansible.builtin.copy:
+        content: |
+          INFO Deploying web application archive [/opt/dhis2]
+          INFO Server startup in 12345 ms
+        dest: /var/log/tomcat9/catalina.out
+        mode: "0644"
+
+    - name: Run monitor-migrations task
+      ansible.builtin.include_tasks: /opt/dhis2-server-tools/deploy/roles/create-instance/tasks/monitor-migrations.yml
+
+    - name: Case 3 - state file must mark completion (flyway=noop or completed)
+      ansible.builtin.command: grep -c 'flyway=noop\|flyway=completed' "/var/lib/dhis2-server-tools/state/upgrade.{{ inventory_hostname }}.state"
+      register: s3
+      changed_when: false
+      failed_when: s3.stdout | int < 1

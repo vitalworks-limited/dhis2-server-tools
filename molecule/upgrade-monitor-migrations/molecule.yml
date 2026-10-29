@@ -1,0 +1,49 @@
+---
+# molecule/upgrade-monitor-migrations
+#
+# Exercises the monitor-migrations.yml task from the create-instance
+# role against three mock Tomcat log inputs:
+#   1) a log that shows a successful Flyway migration => task succeeds
+#   2) a log that shows "FlywayException" => task fails fast (scenario X)
+#   3) a log with no Flyway activity but a "Server startup in ... ms"
+#      line => task reports flyway=noop and succeeds
+#
+# The Tomcat service is NOT actually installed - the role task only
+# requires a journalctl/log file to tail. We stub systemd by starting
+# the "tomcat9" placeholder service via a trivial systemd unit so
+# the role's ansible.builtin.systemd task does not fail. Section 76
+# stages 9/10, scenarios P and X.
+dependency:
+  name: galaxy
+  options:
+    ignore-certs: true
+    ignore-errors: true
+driver:
+  name: docker
+platforms:
+  - name: dhis2-flyway
+    image: geerlingguy/docker-ubuntu2204-ansible:latest
+    pre_build_image: true
+    command: ""
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+    privileged: true
+    cgroupns_mode: host
+provisioner:
+  name: ansible
+  config_options:
+    defaults:
+      interpreter_python: auto_silent
+      stdout_callback: yaml
+verifier:
+  name: ansible
+scenario:
+  test_sequence:
+    - dependency
+    - destroy
+    - syntax
+    - create
+    - prepare
+    - converge
+    - verify
+    - destroy

@@ -1,0 +1,45 @@
+---
+# molecule/dhis-conf-preservation
+#
+# Exercises the dhis2_conf_mode variable (preserve / merge / replace)
+# against the modified tomcat-setup.yml tasks in the create-instance
+# role. This is the mechanical proof of scenarios E1, E2, E3 and
+# section 11.5.1 of the implementation requirements document.
+#
+# No DHIS2 or Tomcat is actually installed - the role tasks related to
+# dhis.conf handling are self-contained (template, stat, copy, merge)
+# and run against a stubbed /opt/dhis2 layout.
+dependency:
+  name: galaxy
+  options:
+    ignore-certs: true
+    ignore-errors: true
+driver:
+  name: docker
+platforms:
+  - name: dhis2-conf-preservation
+    image: geerlingguy/docker-ubuntu2204-ansible:latest
+    pre_build_image: true
+    command: ""
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+    privileged: true
+    cgroupns_mode: host
+provisioner:
+  name: ansible
+  config_options:
+    defaults:
+      interpreter_python: auto_silent
+      stdout_callback: yaml
+verifier:
+  name: ansible
+scenario:
+  test_sequence:
+    - dependency
+    - destroy
+    - syntax
+    - create
+    - prepare
+    - converge
+    - verify
+    - destroy

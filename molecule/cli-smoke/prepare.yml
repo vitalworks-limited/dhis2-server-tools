@@ -1,0 +1,57 @@
+---
+- name: Prepare dhis2 CLI smoke-test container
+  hosts: all
+  gather_facts: true
+  tasks:
+    - name: Install OS prerequisites
+      ansible.builtin.apt:
+        name:
+          - python3
+          - rsync
+          - jq
+          - ca-certificates
+        update_cache: true
+        state: present
+      when: ansible_os_family == "Debian"
+
+    - name: Copy the repository into the container
+      ansible.posix.synchronize:
+        src: "{{ lookup('env', 'MOLECULE_PROJECT_DIRECTORY') | default(playbook_dir ~ '/../..', true) }}/"
+        dest: /opt/dhis2-server-tools/
+        rsync_opts:
+          - "--exclude=.git"
+          - "--exclude=.github"
+          - "--exclude=.idea"
+          - "--exclude=molecule/*/junit.xml"
+
+    - name: Ensure bin scripts are executable
+      ansible.builtin.file:
+        path: "/opt/dhis2-server-tools/bin/{{ item }}"
+        mode: "0755"
+      with_items:
+        - dhis2-deploy
+        - dhis2-host
+        - dhis2-inventory
+        - dhis2-instance
+        - dhis2-db
+        - dhis2-backup
+        - dhis2-restore
+        - dhis2-upgrade
+        - dhis2-proxy
+        - dhis2-tls
+        - dhis2-monitor
+        - dhis2-logs
+        - dhis2-doctor
+        - dhis2-security
+        - dhis2-vpn
+        - dhis2-doris
+        - dhis2-integration
+        - dhis2-vault
+        - dhis2-status
+
+    - name: Seed inventory from template
+      ansible.builtin.copy:
+        remote_src: true
+        src: /opt/dhis2-server-tools/deploy/inventory/hosts.template
+        dest: /opt/dhis2-server-tools/deploy/inventory/hosts
+        mode: "0600"

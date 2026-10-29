@@ -1,0 +1,25 @@
+---
+- name: Converge - run the CLI smoke test suite inside the container
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: Install the CLI into /usr/local/bin
+      ansible.builtin.shell: bash /opt/dhis2-server-tools/install.sh
+      args:
+        creates: /usr/local/bin/dhis2-deploy
+
+    - name: Run CLI smoke tests
+      ansible.builtin.command: bash /opt/dhis2-server-tools/tests/cli/run_cli_tests.sh
+      register: cli_tests
+      changed_when: false
+      failed_when: cli_tests.rc != 0
+
+    - name: Run regression scenarios (mock mode)
+      ansible.builtin.command: bash /opt/dhis2-server-tools/tests/regression/run_scenarios.sh
+      register: regr
+      changed_when: false
+      failed_when: regr.rc != 0
+
+    - name: Show regression summary
+      ansible.builtin.debug:
+        var: regr.stdout_lines

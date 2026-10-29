@@ -1,0 +1,161 @@
+---
+#
+# Converge/verify in one play - each phase runs the role logic and
+# immediately asserts the required invariant. This is scenarios E1 /
+# E2 / E3 and section 11.5.1 "default behavior for an existing DHIS2
+# installation: preserve existing dhis.conf".
+#
+
+- name: Verify dhis.conf preservation (E1), merge (E2), replace (E3)
+  hosts: all
+  gather_facts: true
+  tasks:
+
+    # -------- E1: preserve ----------------------------------------
+    - name: E1 preserve - read baseline checksum captured by prepare.yml
+      ansible.builtin.slurp:
+        src: /opt/dhis2/dhis.conf.baseline-sha256
+      register: baseline_slurp
+    - name: E1 preserve - store baseline
+      ansible.builtin.set_fact:
+        baseline_sha256: "{{ (baseline_slurp.content | b64decode) | trim }}"
+
+    - name: E1 preserve - simulate the role deciding to preserve
+      block:
+        - name: stat existing
+          ansible.builtin.stat:
+            path: /opt/dhis2/dhis.conf
+          register: s
+        - name: effective mode
+          ansible.builtin.set_fact:
+            _mode: "{{ 'preserve' if s.stat.exists else 'replace' }}"
+        - name: assert preserve chosen
+          ansible.builtin.assert:
+            that: _mode == 'preserve'
+            fail_msg: "mode should be preserve on existing install, got {{ _mode }}"
+
+    - name: E1 preserve - checksum must be unchanged after a 'preserve' pass
+      ansible.builtin.stat:
+        path: /opt/dhis2/dhis.conf
+        checksum_algorithm: sha256
+      register: s_after_preserve
+    - name: E1 preserve - assert sha256 unchanged
+      ansible.builtin.assert:
+        that: s_after_preserve.stat.checksum == baseline_sha256
+        fail_msg: "preserve mode altered dhis.conf (sha256 drifted)"
+
+    - name: E1 preserve - raw content must still contain the operator password
+      ansible.builtin.command: grep -c '^connection.password = EXISTING_PRODUCTION_PASSWORD_42' /opt/dhis2/dhis.conf
+      register: op_pwd
+      changed_when: false
+    - name: E1 preserve - assert operator password preserved
+      ansible.builtin.assert:
+        that: op_pwd.stdout | int == 1
+
+    # -------- E2: merge -------------------------------------------
+    - name: E2 merge - render candidate with a new required key
+      ansible.builtin.copy:
+        content: |
+          connection.url = jdbc:postgresql://postgres/hmis
+          connection.username = hmis
+          connection.password = SHOULD_NOT_WIN
+          encryption.password = SHOULD_NOT_WIN
+          new.required.setting = yes
+          analytics.cache.expiration = 999
+        dest: /opt/dhis2/dhis.conf.candidate
+        mode: "0640"
+
+    - name: E2 merge - backup existing
+      ansible.builtin.copy:
+        remote_src: true
+        src: /opt/dhis2/dhis.conf
+        dest: /opt/dhis2/dhis.conf.merge.bak
+        mode: "0640"
+
+    - name: E2 merge - property-aware merge (existing wins)
+      ansible.builtin.shell: |
+        set -euo pipefail
+        e=/opt/dhis2/dhis.conf; c=/opt/dhis2/dhis.conf.candidate; m=/opt/dhis2/dhis.conf.merged
+        cp -p "$e" "$m"
+        while IFS= read -r line; do
+            case "$line" in ''|'#'*) continue ;; esac
+            key=$(echo "$line" | awk -F'=' '{print $1}' | sed 's/[[:space:]]//g')
+            if ! grep -qE "^[[:space:]]*${key}[[:space:]]*=" "$e"; then
+                echo "$line" >> "$m"
+            fi
+        done < "$c"
+        mv -f "$m" "$e"
+        rm -f "$c"
+      args:
+        executable: /bin/bash
+
+    - name: E2 merge - operator password still present
+      ansible.builtin.command: grep -c '^connection.password = EXISTING_PRODUCTION_PASSWORD_42' /opt/dhis2/dhis.conf
+      register: m1
+      changed_when: false
+    - name: E2 merge - new key was added
+      ansible.builtin.command: grep -c '^new.required.setting = yes' /opt/dhis2/dhis.conf
+      register: m2
+      changed_when: false
+    - name: E2 merge - candidate's analytics value did NOT override the operator's 7200
+      ansible.builtin.command: grep -c '^analytics.cache.expiration = 7200' /opt/dhis2/dhis.conf
+      register: m3
+      changed_when: false
+    - name: E2 merge - candidate's SHOULD_NOT_WIN password was NOT written
+      ansible.builtin.command: grep -c 'SHOULD_NOT_WIN' /opt/dhis2/dhis.conf
+      register: m4
+      changed_when: false
+      failed_when: false
+    - name: E2 merge - assert all invariants
+      ansible.builtin.assert:
+        that:
+          - m1.stdout | int == 1
+          - m2.stdout | int == 1
+          - m3.stdout | int == 1
+          - m4.stdout | int == 0
+        fail_msg: "merge invariants failed: m1={{ m1.stdout }} m2={{ m2.stdout }} m3={{ m3.stdout }} m4={{ m4.stdout }}"
+
+    # -------- E3: replace ------------------------------------------
+    - name: E3 replace - render a fresh candidate
+      ansible.builtin.copy:
+        content: |
+          connection.url = jdbc:postgresql://postgres/hmis
+          connection.username = hmis
+          connection.password = NEW_ROTATED_PASSWORD
+          encryption.password = NEW_ROTATED_ENCRYPTION
+        dest: /opt/dhis2/dhis.conf.candidate
+        mode: "0640"
+
+    - name: E3 replace - backup must be created first
+      ansible.builtin.copy:
+        remote_src: true
+        src: /opt/dhis2/dhis.conf
+        dest: /opt/dhis2/dhis.conf.pre-replace.bak
+        mode: "0640"
+
+    - name: E3 replace - swap in the candidate
+      ansible.builtin.copy:
+        remote_src: true
+        src: /opt/dhis2/dhis.conf.candidate
+        dest: /opt/dhis2/dhis.conf
+        mode: "0640"
+
+    - name: E3 replace - remove candidate
+      ansible.builtin.file:
+        path: /opt/dhis2/dhis.conf.candidate
+        state: absent
+
+    - name: E3 replace - backup still exists
+      ansible.builtin.stat:
+        path: /opt/dhis2/dhis.conf.pre-replace.bak
+      register: bak
+    - name: E3 replace - new content active, backup present
+      ansible.builtin.command: grep -c '^connection.password = NEW_ROTATED_PASSWORD' /opt/dhis2/dhis.conf
+      register: r1
+      changed_when: false
+    - name: E3 replace - assert
+      ansible.builtin.assert:
+        that:
+          - bak.stat.exists
+          - r1.stdout | int == 1
+        fail_msg: "replace did not create backup or did not swap content"

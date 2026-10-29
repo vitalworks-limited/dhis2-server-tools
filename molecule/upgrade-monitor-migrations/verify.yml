@@ -1,0 +1,24 @@
+---
+- name: Verify - state file lineage
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: State file exists and is restrictively permissioned
+      ansible.builtin.stat:
+        path: /var/lib/dhis2-server-tools/state/upgrade.{{ inventory_hostname }}.state
+      register: st
+
+    - name: Permissions check
+      ansible.builtin.assert:
+        that:
+          - st.stat.exists
+          - st.stat.mode == '0640'
+          - st.stat.pw_name == 'root'
+          - st.stat.gr_name == 'tomcat'
+        fail_msg: "state file ownership/permissions drifted: {{ st.stat }}"
+
+    - name: Final state records a result
+      ansible.builtin.command: grep -cE 'result:' /var/lib/dhis2-server-tools/state/upgrade.{{ inventory_hostname }}.state
+      register: r
+      changed_when: false
+      failed_when: r.stdout | int < 1

@@ -1,0 +1,47 @@
+---
+- name: Verify - CLI invariants
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: dhis2-deploy --version prints the project name
+      ansible.builtin.command: dhis2-deploy --version
+      register: v
+      changed_when: false
+
+    - name: Assert version banner
+      ansible.builtin.assert:
+        that:
+          - "'dhis2-server-tools' in v.stdout"
+        fail_msg: "unexpected version output: {{ v.stdout }}"
+
+    - name: dhis2-deploy architectures --json is parseable
+      ansible.builtin.shell: >
+        dhis2-deploy architectures --json | python3 -c
+        'import json,sys; d=json.load(sys.stdin); assert isinstance(d["architectures"], list) and len(d["architectures"])>=5'
+      changed_when: false
+
+    - name: dhis2-status --json returns schema=1
+      ansible.builtin.shell: >
+        dhis2-status --json
+      register: st
+      changed_when: false
+      environment:
+        DHIS2_INVENTORY: /opt/dhis2-server-tools/deploy/inventory/hosts
+
+    - name: dhis2-status --json contains expected keys
+      ansible.builtin.assert:
+        that:
+          - "'\"command\":\"dhis2-status\"' in st.stdout"
+          - "'\"schema\":1' in st.stdout"
+
+    - name: dhis2-inventory validate exits 0
+      ansible.builtin.command: dhis2-inventory validate
+      changed_when: false
+      environment:
+        DHIS2_INVENTORY: /opt/dhis2-server-tools/deploy/inventory/hosts
+
+    - name: Unknown subcommand returns exit 2
+      ansible.builtin.command: dhis2-deploy bogus-subcommand-xyz
+      register: bogus
+      failed_when: bogus.rc != 2
+      changed_when: false

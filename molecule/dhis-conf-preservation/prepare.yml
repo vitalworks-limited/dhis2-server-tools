@@ -1,0 +1,53 @@
+---
+- name: Prepare - stub /opt/dhis2 layout and seed an existing dhis.conf
+  hosts: all
+  gather_facts: true
+  vars:
+    existing_dhis_conf: |
+      # Production dhis.conf - operator-maintained
+      connection.url = jdbc:postgresql://postgres/hmis
+      connection.username = hmis
+      connection.password = EXISTING_PRODUCTION_PASSWORD_42
+      encryption.password = OPERATOR_ENCRYPTION_KEY_99
+      analytics.cache.expiration = 7200
+      # custom property
+      tracker.custom.flag = enabled
+  tasks:
+    - name: Create tomcat group and user (so the file permissions match the role)
+      ansible.builtin.group:
+        name: tomcat
+        state: present
+
+    - name: Create /opt/dhis2 directory
+      ansible.builtin.file:
+        path: /opt/dhis2
+        state: directory
+        mode: "0700"
+
+    - name: Seed an existing production-style dhis.conf
+      ansible.builtin.copy:
+        content: "{{ existing_dhis_conf }}"
+        dest: /opt/dhis2/dhis.conf
+        owner: root
+        group: tomcat
+        mode: "0640"
+
+    - name: Record its sha256 for later comparison
+      ansible.builtin.stat:
+        path: /opt/dhis2/dhis.conf
+        checksum_algorithm: sha256
+      register: baseline_stat
+
+    - name: Save baseline checksum to disk
+      ansible.builtin.copy:
+        content: "{{ baseline_stat.stat.checksum }}"
+        dest: /opt/dhis2/dhis.conf.baseline-sha256
+        mode: "0644"
+
+    - name: Copy repository into container
+      ansible.posix.synchronize:
+        src: "{{ lookup('env', 'MOLECULE_PROJECT_DIRECTORY') | default(playbook_dir ~ '/../..', true) }}/"
+        dest: /opt/dhis2-server-tools/
+        rsync_opts:
+          - "--exclude=.git"
+          - "--exclude=.github"

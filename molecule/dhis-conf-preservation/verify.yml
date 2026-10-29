@@ -1,0 +1,25 @@
+---
+# A separate verifier step that reruns a quick invariant pass: the final
+# file is the replaced one, the pre-replace backup contains the merged
+# intermediate state, and the earliest baseline hash is still readable.
+- name: Verify end-state after preserve->merge->replace sequence
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: Final dhis.conf must contain the rotated credentials
+      ansible.builtin.command: grep -c '^connection.password = NEW_ROTATED_PASSWORD' /opt/dhis2/dhis.conf
+      register: p
+      changed_when: false
+      failed_when: p.stdout | int != 1
+
+    - name: Pre-replace backup must contain the merged intermediate state
+      ansible.builtin.command: grep -c 'new.required.setting = yes' /opt/dhis2/dhis.conf.pre-replace.bak
+      register: m
+      changed_when: false
+      failed_when: m.stdout | int != 1
+
+    - name: Baseline hash file must still exist (operator forensics)
+      ansible.builtin.stat:
+        path: /opt/dhis2/dhis.conf.baseline-sha256
+      register: b
+      failed_when: not b.stat.exists
