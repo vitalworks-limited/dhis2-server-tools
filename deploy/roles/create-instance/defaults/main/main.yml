@@ -24,3 +24,43 @@ postgresql_extensions:
   - postgis
   - btree_gin
   - pg_trgm
+
+# dhis.conf handling mode - section 11.5.1 of the implementation
+# requirements. Supported values: preserve | merge | replace. When unset,
+# the role chooses 'preserve' for existing installations (safe default)
+# and 'replace' for first-time deployments. The dhis2-deploy CLI sets
+# this explicitly through --preserve-dhis-conf / --merge-dhis-conf /
+# --replace-dhis-conf.
+# dhis2_conf_mode: preserve
+
+# Database upgrade policy - sections 73-80. One of:
+#   refuse | detect | prompt | auto | force
+# detect is the recommended default: inspect first, do not migrate without
+# an explicit upgrade command or override.
+dhis2_database_upgrade_mode: detect
+
+# Preserve the existing database credentials unless an explicit rotation
+# operation is requested. Section 11.5.1 "Database password stability".
+dhis2_preserve_database_credentials: true
+
+# Whether to allow this run to execute DHIS2 database migrations through
+# application startup. The upgrade workflow sets this to true explicitly;
+# routine deployments should leave it false.
+dhis2_allow_db_migrations: false
+
+# Observe Flyway migration completion/failure after Tomcat start. The
+# dhis2-upgrade workflow sets this to true. Section 76 (stages 9/10).
+dhis2_monitor_migrations: false
+
+# Fail the migration-monitoring task if the application does not report
+# ready within this many seconds. Default is 30 minutes.
+dhis2_migration_timeout: 1800
+
+# Skip the WAR deployment step entirely - section 57.1 (configuration-only
+# deployment MUST NOT delete or re-extract the running webapp). The CLI
+# sets this when --skip-war-deploy is used.
+dhis2_skip_war_deploy: false
+
+# Skip tomcat restarts triggered by this run - section 57.1. Does not
+# affect handlers that are gated on actual config changes.
+dhis2_skip_restart: false

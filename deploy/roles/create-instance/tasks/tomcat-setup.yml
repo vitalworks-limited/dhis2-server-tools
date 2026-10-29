@@ -39,15 +39,124 @@
     modification_time: preserve
     access_time: preserve
 
-- name: Instance | Template dhis.conf
+#
+# dhis.conf handling - section 11.5.1 and scenarios E1/E2/E3 of the
+# dhis2-server-tools-implementation-requirements document. Three modes
+# are supported, selectable with the variable `dhis2_conf_mode`:
+#
+#   preserve  - leave an existing /opt/dhis2/dhis.conf untouched; template
+#               only when the file does not yet exist (first-time install).
+#   merge     - render the template to a temp file, then merge key=value
+#               properties: any key already present in the existing file is
+#               kept; any new required property from the template is added.
+#               A timestamped backup is created before writing.
+#   replace   - unconditionally re-render the template (legacy behaviour).
+#               Create a timestamped backup first.
+#
+# The default is 'preserve' when an existing dhis.conf is detected and
+# 'replace' for first-time deployments, which matches section 11.5.1
+# ("default behavior for an existing DHIS2 installation: preserve
+# existing dhis.conf"). The CLI (dhis2-deploy --preserve-dhis-conf, etc.)
+# sets this variable explicitly.
+#
+- name: Instance | Detect existing dhis.conf
+  ansible.builtin.stat:
+    path: /opt/dhis2/dhis.conf
+  register: dhis_conf_stat
+
+- name: Instance | Determine effective dhis.conf mode
+  ansible.builtin.set_fact:
+    _dhis2_conf_mode_effective: >-
+      {{ dhis2_conf_mode
+         | default('preserve' if dhis_conf_stat.stat.exists else 'replace') }}
+
+- name: Instance | Report dhis.conf mode
+  ansible.builtin.debug:
+    msg: "dhis.conf mode: {{ _dhis2_conf_mode_effective }} (existed: {{ dhis_conf_stat.stat.exists }})"
+
+- name: Instance | Preserve existing dhis.conf (no changes)
+  ansible.builtin.debug:
+    msg: "Preserving existing /opt/dhis2/dhis.conf; database password / connection values are kept."
+  when:
+    - dhis_conf_stat.stat.exists
+    - _dhis2_conf_mode_effective == 'preserve'
+
+- name: Instance | Backup existing dhis.conf before merge/replace
+  ansible.builtin.copy:
+    remote_src: true
+    src: /opt/dhis2/dhis.conf
+    dest: "/opt/dhis2/dhis.conf.{{ ansible_date_time.iso8601_basic_short }}.bak"
+    mode: "0640"
+    owner: root
+    group: tomcat
+  when:
+    - dhis_conf_stat.stat.exists
+    - _dhis2_conf_mode_effective in ['merge', 'replace']
+
+- name: Instance | Render candidate dhis.conf (merge/replace)
   ansible.builtin.template:
     src: dhis.conf.j2
+    dest: /opt/dhis2/dhis.conf.candidate
+    mode: "0640"
+    owner: root
+    group: tomcat
+  when:
+    - db_password is defined
+    - _dhis2_conf_mode_effective in ['merge', 'replace']
+      or not dhis_conf_stat.stat.exists
+
+- name: Instance | Merge dhis.conf (keep existing values, add new keys)
+  ansible.builtin.shell: |
+    set -euo pipefail
+    existing=/opt/dhis2/dhis.conf
+    candidate=/opt/dhis2/dhis.conf.candidate
+    merged=/opt/dhis2/dhis.conf.merged
+    # Collect existing keys
+    awk -F'=' '/^[^#]/ && NF>=2 { split($0,a,"="); gsub(/^[[:space:]]+|[[:space:]]+$/,"",a[1]); print a[1] }' "$existing" | sort -u > /tmp/.dhis2-existing-keys.$$
+    # Start merged file from the existing file
+    cp -p "$existing" "$merged"
+    # Append any key from candidate that is NOT already present
+    while IFS= read -r line; do
+        case "$line" in
+            ''|'#'*) continue ;;
+        esac
+        key=$(echo "$line" | awk -F'=' '{print $1}' | sed 's/[[:space:]]//g')
+        if ! grep -q "/tmp/.dhis2-existing-keys.$$" <<<"$key" && ! grep -qE "^[[:space:]]*${key}[[:space:]]*=" "$existing"; then
+            echo "$line" >> "$merged"
+        fi
+    done < "$candidate"
+    rm -f /tmp/.dhis2-existing-keys.$$
+    chmod 0640 "$merged"
+    chown root:tomcat "$merged"
+    mv -f "$merged" "$existing"
+    rm -f "$candidate"
+  args:
+    executable: /bin/bash
+  when:
+    - dhis_conf_stat.stat.exists
+    - _dhis2_conf_mode_effective == 'merge'
+    - db_password is defined
+  notify: Restart Tomcat
+
+- name: Instance | Replace dhis.conf (fresh render from template)
+  ansible.builtin.copy:
+    remote_src: true
+    src: /opt/dhis2/dhis.conf.candidate
     dest: /opt/dhis2/dhis.conf
     mode: "0640"
     owner: root
     group: tomcat
-  when: db_password is defined
+  when:
+    - db_password is defined
+    - _dhis2_conf_mode_effective == 'replace'
+      or not dhis_conf_stat.stat.exists
   notify: Restart Tomcat
+
+- name: Instance | Remove candidate file if replace path used it
+  ansible.builtin.file:
+    path: /opt/dhis2/dhis.conf.candidate
+    state: absent
+  when: _dhis2_conf_mode_effective in ['merge', 'replace']
 
 - name: Copy server.xml to the instances
   ansible.builtin.copy:

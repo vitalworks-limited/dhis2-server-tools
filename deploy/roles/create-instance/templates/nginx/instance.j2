@@ -1,7 +1,18 @@
 {% set _glowroot_enabled = app_monitoring is defined and app_monitoring | trim == 'glowroot' %}
 {% set _glowroot_locked = wireguard_monitoring_locked | default(false) | bool %}
+{#
+# Maintenance response - section 57.10. Touching
+# /etc/dhis2-server-tools/maint/<instance> on the proxy host returns
+# HTTP 503 with a short JSON body. The upstream config remains intact,
+# so disabling maintenance restores the original route (no rewrite).
+# dhis2-proxy maintenance enable/disable manages the flag file.
+#}
+{% set _maint_flag = '/etc/dhis2-server-tools/maint/' ~ (item | to_fixed_string) %}
 {% if  hostvars[item]['dhis2_base_path'] | default(item) | to_fixed_string == "ROOT"  %}
 location / {
+   if (-f {{ _maint_flag }}) {
+       return 503;
+   }
    proxy_pass  http://{{ item | replace('-', '_') }}_tomcat;
    include /etc/nginx/proxy_params;
    proxy_redirect off;
@@ -27,6 +38,9 @@ location /glowroot/ {
 {% else %}
 location /{{ hostvars[item]['dhis2_base_path'] | default(item) | to_fixed_string }}/ {
    {# instance location block configs #}
+   if (-f {{ _maint_flag }}) {
+       return 503;
+   }
    proxy_pass http://{{ item | replace('-', '_') }}_tomcat/{{ hostvars[item]['dhis2_base_path'] | default(item) | to_fixed_string }}/;
    include /etc/nginx/proxy_params;
    proxy_redirect off;

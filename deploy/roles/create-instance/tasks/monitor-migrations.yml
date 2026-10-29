@@ -1,0 +1,134 @@
+---
+#
+# Flyway migration monitoring - section 76 (stages 9/10) and 79.
+#
+# Runs ONLY when the CLI explicitly asks for migration monitoring:
+#
+#     dhis2_monitor_migrations: true
+#     dhis2_allow_db_migrations:  true
+#
+# Starts Tomcat (controlled start), polls catalina.out for Flyway
+# markers, records state to /var/lib/dhis2-server-tools/state, and
+# fails the play if a Flyway error is detected or if monitoring times
+# out without an application-ready signal. The CLI (dhis2-upgrade run)
+# then surfaces this as a non-zero exit without ever reporting
+# upgrade success - requirement from scenario X.
+#
+# This is intentionally conservative: no SQL repairs are attempted
+# (section 79). On failure, operator-ready next steps are logged.
+#
+
+- name: Monitor-migrations | Ensure state directory exists
+  ansible.builtin.file:
+    path: /var/lib/dhis2-server-tools/state
+    state: directory
+    owner: root
+    group: root
+    mode: "0750"
+
+- name: Monitor-migrations | Record migration-started marker
+  ansible.builtin.copy:
+    content: |
+      instance: {{ inventory_hostname }}
+      target_version: {{ dhis2_version | default('unknown') }}
+      source_version: {{ dhis2_source_version | default('unknown') }}
+      started_at: {{ ansible_date_time.iso8601 }}
+      backup_path: {{ dhis2_pre_upgrade_backup | default('n/a') }}
+      policy: {{ dhis2_database_upgrade_mode | default('detect') }}
+    dest: "/var/lib/dhis2-server-tools/state/upgrade.{{ inventory_hostname }}.state"
+    mode: "0640"
+    owner: root
+    group: tomcat
+
+- name: Monitor-migrations | Resolve tomcat log location
+  ansible.builtin.set_fact:
+    _dhis2_catalina_log: "{{ dhis2_catalina_log | default('/var/log/tomcat' + (tomcat_version | string) + '/catalina.out') }}"
+    _dhis2_migration_timeout: "{{ (dhis2_migration_timeout | default(1800)) | int }}"
+
+- name: Monitor-migrations | Record Tomcat startup
+  ansible.builtin.systemd:
+    name: "tomcat{{ tomcat_version }}"
+    state: started
+    enabled: true
+    daemon_reload: true
+
+- name: Monitor-migrations | Watch for Flyway completion or failure
+  ansible.builtin.shell: |
+    set -eo pipefail
+    log={{ _dhis2_catalina_log | quote }}
+    timeout={{ _dhis2_migration_timeout }}
+    deadline=$(( $(date +%s) + timeout ))
+    saw_start=false
+    saw_success=false
+    while (( $(date +%s) < deadline )); do
+        if [[ -r "$log" ]]; then
+            # Any Flyway error terminates immediately
+            if grep -qE 'ERROR .*Flyway|Migration .*failed|FlywayException' "$log"; then
+                echo "flyway=failed"
+                exit 10
+            fi
+            # Migration started
+            grep -qE 'Flyway .* Database:|Migrating schema' "$log" && saw_start=true
+            # Successful completion
+            if grep -qE 'Successfully applied .* migration|up to date|Schema version:' "$log"; then
+                saw_success=true
+                break
+            fi
+            # Application ready
+            if grep -qE 'Server startup in|Catalina.start Server startup|Started Server' "$log"; then
+                saw_success=true
+                break
+            fi
+        fi
+        sleep 5
+    done
+    if $saw_success; then
+        $saw_start && echo "flyway=completed" || echo "flyway=noop"
+        exit 0
+    fi
+    echo "flyway=timeout"
+    exit 11
+  args:
+    executable: /bin/bash
+  register: _flyway_watch
+  changed_when: false
+  failed_when:
+    - _flyway_watch.rc != 0
+  when:
+    - dhis2_monitor_migrations | default(false) | bool
+    - dhis2_allow_db_migrations | default(false) | bool
+
+- name: Monitor-migrations | Append result to state file
+  ansible.builtin.lineinfile:
+    path: "/var/lib/dhis2-server-tools/state/upgrade.{{ inventory_hostname }}.state"
+    line: "finished_at: {{ ansible_date_time.iso8601 }} result: {{ _flyway_watch.stdout | default('skipped') }}"
+    create: true
+    mode: "0640"
+    owner: root
+    group: tomcat
+
+- name: Monitor-migrations | Fail with actionable guidance on timeout/error
+  ansible.builtin.fail:
+    msg: |
+      DHIS2 Flyway migration did not complete successfully for {{ inventory_hostname }}.
+      Observed: {{ _flyway_watch.stdout | default('(no observation recorded)') }}
+
+      Recommended next steps (section 79):
+        1. Inspect application logs:
+             dhis2-logs migration {{ inventory_hostname }}
+             dhis2-instance logs {{ inventory_hostname }} --lines 500
+        2. Inspect Flyway history:
+             dhis2-db show {{ dhis2_db_name | default(inventory_hostname) }}
+        3. Restore the pre-upgrade database if required:
+             dhis2-restore database --backup {{ dhis2_pre_upgrade_backup | default('<PATH>') }} \
+               --instance {{ inventory_hostname }} --drop-existing --create-db --yes
+        4. Roll back the application artifact if required:
+             dhis2-instance war rollback {{ inventory_hostname }} --yes
+
+      The pre-upgrade backup path and state are recorded in
+      /var/lib/dhis2-server-tools/state/upgrade.{{ inventory_hostname }}.state
+  when:
+    - dhis2_monitor_migrations | default(false) | bool
+    - dhis2_allow_db_migrations | default(false) | bool
+    - _flyway_watch.rc is defined
+    - _flyway_watch.rc != 0

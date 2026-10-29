@@ -53,8 +53,23 @@
     - >
        (dhis2_version | default('') | string | trim | length > 0) or
        (dhis2_war_file | default('') | string | trim | length > 0)
+    - not (dhis2_skip_war_deploy | default(false) | bool)
     # - (dhis2_version is defined and dhis2_version) or (dhis2_war_file is defined and dhis2_war_file)
   tags: [deploy-war]
+
+# Flyway migration monitoring - section 76 (stages 9/10). Only invoked
+# by the upgrade workflow when the CLI passes dhis2_monitor_migrations=true.
+# Routine deployments are completely unaffected.
+- name: Monitor DHIS2 Flyway migrations after controlled start
+  ansible.builtin.include_tasks:
+    file: monitor-migrations.yml
+    apply:
+      tags: [monitor-migrations]
+  when:
+    - inventory_hostname in groups['instances']
+    - dhis2_monitor_migrations | default(false) | bool
+    - dhis2_allow_db_migrations  | default(false) | bool
+  tags: [monitor-migrations]
 
 - name: Configuring {{ proxy }}
   ansible.builtin.include_tasks:
