@@ -30,3 +30,32 @@ See `defaults/main.yml` for `doris_version`, `doris_user`, `doris_home`,
 Not run directly — included from `deploy/dhis2.yml` as `- role: doris`,
 gated on `groups['apache_doris'] | length > 0`, after `postgres` and before
 `create-instance`.
+
+## Tags
+
+- `doris-install`
+
+## CLI integration
+
+- `dhis2-doris status | health | version | resources` — reports the
+  configured host, FE / BE process state, **and** FE :8030 /
+  BE :8040 HTTP `/api/health` endpoints so the health signal
+  distinguishes "process running" from "answering requests".
+- `dhis2-doris frontend | backend` — service status plus
+  HTTP health probe, with secrets redacted from the response body.
+- `dhis2-doris databases | catalogs` — expose SQL state via the
+  MySQL protocol (9030) with redaction.
+- `dhis2-doris connect-postgres` — reminder that a JDBC catalog in
+  Doris is an **external federated bridge**, not a materialised copy
+  of the source PostgreSQL data (section 57.18).
+- `dhis2-doris connectivity | logs` — listener and log inspection.
+
+## No-regression notes
+
+- SSH-based Doris deployment is **not** production-ready; the role
+  fails fast when `ansible_connection=ssh` is used on an
+  `[apache_doris]` host, and the CLI reports the limitation rather
+  than attempting unsupported behaviour.
+- `dhis2-host lxd snapshot` prints an explicit warning that an LXD
+  container snapshot is **not** a validated database backup
+  (section 57.3 and scenario S).

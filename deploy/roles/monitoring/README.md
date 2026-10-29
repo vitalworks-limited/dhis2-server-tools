@@ -1,38 +1,54 @@
-Role Name
-=========
+# monitoring
 
-A brief description of the role goes here.
+Installs the configured server-monitoring stack on hosts in the
+`[monitoring]` group and plumbs the instance hosts into it.
 
-Requirements
-------------
+## Supported stacks
 
-Any pre-requisites that may not be covered by Ansible itself or the role should be mentioned here. For instance, if the role uses the EC2 module, it may be a good idea to mention in this section that the boto package is required.
+Set `server_monitoring` in the inventory:
 
-Role Variables
---------------
+| Value | Behaviour |
+| ----- | --------- |
+| `munin` | Munin master + per-node agent (default) |
+| `prometheus` | Prometheus server + node + postgres exporters |
+| `grafana` | Grafana server (typically paired with Prometheus) |
+| `grafana/prometheus` | Combined stack installed in one pass |
 
-A description of the settable variables for this role should go here, including any variables that are in defaults/main.yml, vars/main.yml, and any variables that can/should be set via parameters to the role. Any variables that are read from other roles and/or the global scope (ie. hostvars, group vars, etc.) should be mentioned here as well.
+Multi-stack selection is handled by splitting on `/`; see
+`tasks/main.yml`.
 
-Dependencies
-------------
+## Responsibilities
 
-A list of other roles hosted on Galaxy should go here, plus any details in regards to parameters that may need to be set for other roles, or variables that are used from other roles.
+- Install the chosen server stack on `[monitoring]`.
+- Install Munin node and / or exporters (`node_exporter`,
+  `postgres_exporter`) on every host that reports metrics.
+- Deploy pre-built Grafana dashboards under `files/*.json` when the
+  Grafana server play runs.
+- Honour the existing operator configuration — custom dashboards and
+  scrape configs are not overwritten on re-run.
 
-Example Playbook
-----------------
+## Tags
 
-Including an example of how to use your role (for instance, with variables passed in as parameters) is always nice for users too:
+- `monitoring`
+- `tomcat-munin-monitoring`
+- `prometheus-connect`
 
-    - hosts: servers
-      roles:
-         - { role: username.rolename, x: 42 }
+## CLI integration
 
-License
--------
+- `dhis2-monitor status | targets | exporters | dashboards |
+  endpoints` — read-only inspection.
+- `dhis2-monitor install | enable | disable` — delegate to the
+  monitoring tag.
+- `dhis2-monitor alerts | test-alert | silence | unsilence` —
+  Alertmanager HTTP API v2 is used as a fallback when `amtool`
+  is not installed; silences always include creator, reason, and
+  expiry (section 57.12).
+- `dhis2-monitor retention | storage` — report retention policy and
+  on-disk growth.
 
-BSD
+## No-regression notes
 
-Author Information
-------------------
-
-An optional section for the role authors to include contact information, or a website (HTML is not allowed).
+- The CLI reflects what is actually configured; it does not assume
+  Grafana / Prometheus (section 21).
+- Alert testing does not disclose credentials (section 57.12).
+- Monitoring updates preserve unrelated targets.

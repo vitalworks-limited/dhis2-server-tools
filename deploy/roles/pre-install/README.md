@@ -1,38 +1,38 @@
-Role Name
-=========
+# pre-install
 
-A brief description of the role goes here.
+Prepares the Ansible controller / deployment host before any role runs
+against managed nodes.
 
-Requirements
-------------
+## Responsibilities
 
-Any pre-requisites that may not be covered by Ansible itself or the role should be mentioned here. For instance, if the role uses the EC2 module, it may be a good idea to mention in this section that the boto package is required.
+- Create and secure `/opt/ansible/` and `/opt/ansible/secrets/` with
+  `0700` and the invoking operator as owner.
+- Generate per-instance database passwords when they do not already
+  exist (tag `db_password_generate`), writing them under
+  `/opt/ansible/secrets/`. Existing files are preserved — passwords
+  are never rotated by this role (section 11.5.1 of the implementation
+  requirements doc: "Database password stability").
+- Install Debian prerequisites (`Debian.yml`) or macOS prerequisites
+  (`Darwin.yml`) on the controller.
+- Optionally install a Grafana client on the controller when
+  `server_monitoring` is set.
+- Configure firewall rules on the controller.
 
-Role Variables
---------------
+## When it runs
 
-A description of the settable variables for this role should go here, including any variables that are in defaults/main.yml, vars/main.yml, and any variables that can/should be set via parameters to the role. Any variables that are read from other roles and/or the global scope (ie. hostvars, group vars, etc.) should be mentioned here as well.
+Automatically from `deploy/dhis2.yml` as the first play against
+`127.0.0.1`.
 
-Dependencies
-------------
+## Tags
 
-A list of other roles hosted on Galaxy should go here, plus any details in regards to parameters that may need to be set for other roles, or variables that are used from other roles.
+- `pre-install`
+- `db_password_generate`
 
-Example Playbook
-----------------
+## No-regression notes
 
-Including an example of how to use your role (for instance, with variables passed in as parameters) is always nice for users too:
-
-    - hosts: servers
-      roles:
-         - { role: username.rolename, x: 42 }
-
-License
--------
-
-BSD
-
-Author Information
-------------------
-
-An optional section for the role authors to include contact information, or a website (HTML is not allowed).
+- Password files under `/opt/ansible/secrets/` are **never overwritten**
+  if they already exist. The CLI's `--preserve-dhis-conf` depends on
+  this behaviour. See
+  [docs/CLI-Configuration-Preservation.md](../../../docs/CLI-Configuration-Preservation.md).
+- The `dhis2-vault` CLI exposes `init`, `scan`, `rotate`, and
+  `references` operations that interact with this directory.

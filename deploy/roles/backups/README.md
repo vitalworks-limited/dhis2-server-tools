@@ -1,38 +1,66 @@
-Role Name
-=========
+# backups
 
-A brief description of the role goes here.
+Installs the DHIS2 backup script and schedule on hosts in the
+`[databases]` group.
 
-Requirements
-------------
+## Responsibilities
 
-Any pre-requisites that may not be covered by Ansible itself or the role should be mentioned here. For instance, if the role uses the EC2 module, it may be a good idea to mention in this section that the boto package is required.
+- Install the backup wrapper script (uses `pg_dump --format=custom`
+  by default, writes under `/var/backups/dhis2/`).
+- Render `.pgpass` and (optionally) `s3cfg` so the script can push
+  dumps to an S3-compatible bucket.
+- Install a cron entry on the database host.
+- Preserve any operator-maintained backup configuration between runs.
 
-Role Variables
---------------
+## Dispatch
 
-A description of the settable variables for this role should go here, including any variables that are in defaults/main.yml, vars/main.yml, and any variables that can/should be set via parameters to the role. Any variables that are read from other roles and/or the global scope (ie. hostvars, group vars, etc.) should be mentioned here as well.
+`tasks/main.yml` chooses `tasks/lxd.yml` or `tasks/ssh.yml` from each
+database host's `ansible_connection`.
 
-Dependencies
-------------
+## Variables
 
-A list of other roles hosted on Galaxy should go here, plus any details in regards to parameters that may need to be set for other roles, or variables that are used from other roles.
+Common overrides (see `defaults/main.yml` and
+[docs/Variables.md](../../../docs/Variables.md)):
 
-Example Playbook
-----------------
+| Variable | Purpose |
+| -------- | ------- |
+| `backup_cron_schedule` | cron expression for the scheduled dump |
+| `s3_bucket`, `s3_access_key`, `s3_secret_key` | push to S3 if set |
 
-Including an example of how to use your role (for instance, with variables passed in as parameters) is always nice for users too:
+Secret-containing templates (`.pgpass.j2`, `s3cfg.j2`) are written
+with `0600`.
 
-    - hosts: servers
-      roles:
-         - { role: username.rolename, x: 42 }
+## Tags
 
-License
--------
+- `backup-script`
 
-BSD
+## CLI integration
 
-Author Information
-------------------
+- `dhis2-backup create INSTANCE [--format custom|plain|plain-gzip|tar|directory]`
+- `dhis2-backup verify PATH` — gzip integrity, `pg_restore -l`,
+  manifest presence.
+- `dhis2-backup test PATH` — restores into a disposable temp
+  database.
+- `dhis2-backup list | show | manifest | checksum`
+- `dhis2-backup prune --keep N` — never removes the newest valid
+  backup (section 16.3).
+- `dhis2-backup schedule INSTANCE --cron "..."` and
+  `dhis2-backup unschedule`.
+- `dhis2-backup export PATH --to s3://…`
+- `dhis2-backup config INSTANCE` — read-only, redacted.
 
-An optional section for the role authors to include contact information, or a website (HTML is not allowed).
+## Manifest format
+
+Every CLI-created backup writes a sibling `.manifest.json` containing
+non-secret metadata (instance, database, PG version, format, size,
+SHA-256, timestamp, tool version). This is the input to
+`dhis2-restore plan` (section 57.7).
+
+## No-regression notes
+
+- The existing scheduled dumps continue to run unchanged when a
+  deployment is re-applied.
+- Pruning refuses to delete the newest valid backup even with
+  `--yes`.
+- Checksum-only verification is **not** labelled as a full restore
+  test; `dhis2-backup test` is distinct.

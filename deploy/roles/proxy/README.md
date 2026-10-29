@@ -1,38 +1,58 @@
-Role Name
-=========
+# proxy
 
-A brief description of the role goes here.
+Installs the chosen reverse proxy on hosts in the `[web]` inventory
+group.
 
-Requirements
-------------
+## Supported engines
 
-Any pre-requisites that may not be covered by Ansible itself or the role should be mentioned here. For instance, if the role uses the EC2 module, it may be a good idea to mention in this section that the boto package is required.
+| Engine | Install task | Status |
+| ------ | ------------ | ------ |
+| `nginx` | `nginx-install.yml` | SUPPORTED (default) |
+| `apache2` | `apache2-install.yml` | SUPPORTED |
+| `openresty` | `openresty-install.yml` | SUPPORTED |
 
-Role Variables
---------------
+Set the inventory variable `proxy=nginx|apache2|openresty`.
 
-A description of the settable variables for this role should go here, including any variables that are in defaults/main.yml, vars/main.yml, and any variables that can/should be set via parameters to the role. Any variables that are read from other roles and/or the global scope (ie. hostvars, group vars, etc.) should be mentioned here as well.
+## Responsibilities
 
-Dependencies
-------------
+- Install the proxy and its dependencies.
+- Serve the DHIS2 instance route(s) rendered by the `create-instance`
+  role (`create-instance/templates/<engine>/`).
+- Serve Munin (`munin.j2`) and, when configured, Prometheus / Grafana
+  (`prometheus.j2`, `grafana.j2`).
+- Enforce basic-auth in front of Munin when `server_monitoring: munin`.
 
-A list of other roles hosted on Galaxy should go here, plus any details in regards to parameters that may need to be set for other roles, or variables that are used from other roles.
+## Dispatch
 
-Example Playbook
-----------------
+`tasks/main.yml` includes `{{ ansible_connection }}.yml` first (LXD
+container creation or SSH prerequisite checks), then
+`{{ proxy }}-install.yml`, then the engine-specific config generation
+is handled by the `create-instance` role's `proxy/<engine>.yml`.
 
-Including an example of how to use your role (for instance, with variables passed in as parameters) is always nice for users too:
+## Tags
 
-    - hosts: servers
-      roles:
-         - { role: username.rolename, x: 42 }
+- `proxy-install` — install the engine
+- `proxy-conf` — rebuild config from inventory
+- `nginx-perf-log` — enable the performance log
+- `securing-munin` — basic auth
 
-License
--------
+## CLI integration
 
-BSD
+- `dhis2-proxy status | show | config | test | reload | restart` —
+  **`test` must pass before any reload or restart**; the CLI aborts
+  the operation if the configuration is invalid, so a broken
+  rendering never replaces a working one (section 57.10).
+- `dhis2-proxy routes | upstream | listeners | certificates` —
+  read-only inspection.
+- `dhis2-proxy maintenance enable | disable` — writes
+  `/etc/dhis2-server-tools/maint/<instance>` and the Nginx template
+  returns HTTP 503 for that instance's location block while
+  preserving the original route. Disabling removes the flag file.
+- `dhis2-proxy backup | diff` — recovery artifacts and planning.
 
-Author Information
-------------------
+## No-regression notes
 
-An optional section for the role authors to include contact information, or a website (HTML is not allowed).
+- Last-known-good configuration is preserved across all CLI-driven
+  operations (sections 57.10 and scenario N).
+- Maintenance mode uses an advisory flag file; no proxy rules are
+  deleted or rewritten.
