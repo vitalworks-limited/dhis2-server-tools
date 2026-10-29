@@ -43,6 +43,17 @@
 #   dhis2-instance war verify NAME
 #   dhis2-instance war backup NAME
 #   dhis2-instance war rollback NAME [--yes]
+#   dhis2-instance set-version NAME VERSION [--pin] [--allow-latest-patch]
+#   dhis2-instance resolve-version NAME
+#
+# Version formats:
+#   2.43               channel - latest patch of 2.43 (requires --allow-latest-patch
+#                      for set-version; auto-advance semantics)
+#   "2.43.2"           pin to the exact patch 2.43.2
+#   "2.43.2.1"         pin to the exact patch 2.43.2.1
+# Use --pin to also set dhis2_pin_patch_version=true (role will FAIL
+# the deployment if the pinned patch cannot be resolved against
+# releases.json, rather than silently falling back to latest).
 # USAGE_END
 set -Eeuo pipefail
 . "$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")/.." && pwd)/lib/common.sh"
@@ -71,6 +82,8 @@ main() {
         maintenance) _maintenance "$@" ;;
         config) _config "$@" ;;
         war) _war "$@" ;;
+        set-version) _set_version "$@" ;;
+        resolve-version) _resolve_version "$@" ;;
         clone) dhis2_log_error "clone: use 'dhis2-restore clone SRC DST --backup BACKUP' (section 57.8)"; exit "$DHIS2_EXIT_USAGE" ;;
         --help|-h|help) dhis2_cli_show_help "$0"; exit 0 ;;
         *) dhis2_log_error "Unknown subcommand: $sub"; exit "$DHIS2_EXIT_USAGE" ;;
@@ -362,6 +375,108 @@ _war() {
             ;;
         *) dhis2_log_error "Unknown war sub: $sub"; exit "$DHIS2_EXIT_USAGE" ;;
     esac
+}
+
+#
+# dhis2-instance set-version NAME VERSION [--pin] [--allow-latest-patch]
+#
+# Validates the version string against releases.json before writing to
+# the inventory, and (unless --allow-latest-patch) requires a full
+# major.minor.patch so bare channels like "2.43" don't silently become
+# whatever is latest tomorrow.
+#
+_set_version() {
+    local name="${1:-}" version="${2:-}"; shift 2 || true
+    local pin=false allow_latest=false
+    while (( $# )); do case "$1" in --pin) pin=true ;; --allow-latest-patch) allow_latest=true ;; esac; shift || true; done
+    [[ -z "$name" || -z "$version" ]] && { dhis2_log_error 'Usage: dhis2-instance set-version NAME VERSION [--pin] [--allow-latest-patch]'; exit "$DHIS2_EXIT_USAGE"; }
+
+    if ! _validate_dhis2_version "$version" "$allow_latest"; then
+        exit "$DHIS2_EXIT_USAGE"
+    fi
+    "${DHIS2_CLI_ROOT}/bin/dhis2-inventory" set "$name" dhis2_version "\"$version\""
+    if $pin; then
+        "${DHIS2_CLI_ROOT}/bin/dhis2-inventory" set "$name" dhis2_pin_patch_version "true"
+        dhis2_log_info "Pinned $name to $version with dhis2_pin_patch_version=true (strict)."
+    else
+        dhis2_log_info "Set $name dhis2_version=\"$version\" (lenient; add --pin for strict pinning)."
+    fi
+}
+
+#
+# dhis2-instance resolve-version NAME
+#
+# Reads the current inventory dhis2_version for NAME, downloads
+# releases.json locally, and shows what the role will resolve: exact
+# patch URL (pinned) or latest-in-channel (fallback). Does not change
+# inventory.
+#
+_resolve_version() {
+    local name="${1:-}"
+    [[ -z "$name" ]] && { dhis2_log_error 'Usage: dhis2-instance resolve-version NAME'; exit "$DHIS2_EXIT_USAGE"; }
+    local vars; vars=$(dhis2_inventory_host_vars_redacted "$name")
+    local v; v=$(echo "$vars" | awk -F'[" ]+' '/"dhis2_version"/ {print $(NF-1); exit}')
+    [[ -z "$v" ]] && { dhis2_log_error "$name has no dhis2_version set"; exit "$DHIS2_EXIT_PREFLIGHT"; }
+    _resolve_version_impl "$v"
+}
+
+# Validate a DHIS2 version string against releases.json. Returns 0 on
+# OK, non-zero on failure.
+_validate_dhis2_version() {
+    local version="$1" allow_latest="${2:-false}"
+    # Format
+    if [[ ! "$version" =~ ^[0-9]+(\.[0-9]+)+$ ]]; then
+        dhis2_log_error "Version '$version' is not in a valid format. Expected: 2.major[.minor[.patch]]"
+        return 1
+    fi
+    local dot_count
+    dot_count=$(awk -F'.' '{print NF-1}' <<< "$version")
+    if (( dot_count < 2 )) && [[ "$allow_latest" != "true" ]]; then
+        dhis2_log_error "Version '$version' is a bare channel. Supply major.minor.patch or pass --allow-latest-patch."
+        dhis2_log_error "  Example: --to 2.43.2  (pins); --allow-latest-patch 2.43 (track latest 2.43.x)"
+        return 1
+    fi
+    # Resolve against releases.json
+    _resolve_version_impl "$version"
+}
+
+_resolve_version_impl() {
+    local version="$1"
+    local td; td=$(dhis2_cli_register_tempdir)
+    local json="$td/releases.json"
+    if ! curl -fsSL --max-time 10 "https://releases.dhis2.org/v1/versions/stable.json" -o "$json" 2>/dev/null \
+       && ! wget -q -O "$json" "https://releases.dhis2.org/v1/versions/stable.json" 2>/dev/null; then
+        dhis2_log_warn "Could not fetch releases.json - skipping remote validation."
+        return 0
+    fi
+    python3 - "$json" "$version" <<'PY'
+import json, sys, re
+path, version = sys.argv[1:3]
+with open(path) as f:
+    data = json.load(f)
+versions = {v['name']: v for v in data.get('versions', [])}
+parts = version.split('.')
+major = '.'.join(parts[:2])
+if major not in versions:
+    sys.stderr.write(f"ERROR: channel {major} not in releases.json (available: {', '.join(sorted(versions))})\n")
+    sys.exit(2)
+chan = versions[major]
+patches = chan.get('patchVersions', [])
+if len(parts) >= 3:
+    hit = next((p for p in patches if p.get('name') == version), None)
+    if not hit:
+        avail = ', '.join(p.get('name','?') for p in patches[-10:])
+        sys.stderr.write(f"ERROR: patch {version} is not in releases.json (latest 10: {avail})\n")
+        sys.exit(3)
+    print(f"MATCHED pinned patch: {hit['name']}")
+    print(f"URL:    {hit.get('url')}")
+    print(f"SHA256: {hit.get('sha256','?')}")
+else:
+    latest = patches[-1] if patches else chan
+    print(f"CHANNEL {major} - latest patch: {latest.get('name','?')}")
+    print(f"URL:    {latest.get('url', chan.get('latestStableUrl','?'))}")
+    print(f"SHA256: {latest.get('sha256','?')}")
+PY
 }
 
 main "$@"

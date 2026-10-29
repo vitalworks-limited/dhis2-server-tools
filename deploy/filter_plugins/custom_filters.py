@@ -12,6 +12,19 @@ from ansible.errors import (
 
 
 # ensures dhis2_version is correct e.g 2.42 and not 2.43.b
+#
+# Accepts (as supplied in inventory, where Ansible's INI parser may
+# auto-coerce a plain `2.42` to a float):
+#
+#   float  2.42        -> {major: '2.42', minor: None,       pinned_exact: False}
+#   string "2.42"      -> {major: '2.42', minor: None,       pinned_exact: False}
+#   string "2.42.7"    -> {major: '2.42', minor: '2.42.7',   pinned_exact: True}
+#   string "2.42.7.1"  -> {major: '2.42', minor: '2.42.7.1', pinned_exact: True}
+#
+# minor=None means "latest patch of this major channel" (the pre-existing
+# auto-upgrade semantics). pinned_exact=True means the operator supplied
+# a specific patch and set-dhis2-url.yml MUST either resolve that patch
+# or fail loudly instead of silently falling back to latest.
 def normalize_dhis2_version(dhis2_version, dhis2_releases):
     version_list = [item['name'] for item in dhis2_releases]
     pattern = r'^\d+(\.\d+)*$'
@@ -19,19 +32,27 @@ def normalize_dhis2_version(dhis2_version, dhis2_releases):
         dhis2_version_major = str(format(dhis2_version, '.2f'))
         if dhis2_version_major in version_list:
             return {'dhis2_version_major': dhis2_version_major,
-                    'dhis2_version_minor': None
+                    'dhis2_version_minor': None,
+                    'pinned_exact': False,
                     }
         else:
             raise AnsibleFilterError(f"The version {dhis2_version} is not in "
                                      f"released versions, '{version_list}'"
                                      )
     elif isinstance(dhis2_version, str):
-        if re.match(pattern, dhis2_version):
-            dhis2_version_major = ('.'.join(dhis2_version.split('.')[:2]))
-            dhis2_version_minor = dhis2_version
+        s = dhis2_version.strip()
+        if re.match(pattern, s):
+            parts = s.split('.')
+            dhis2_version_major = '.'.join(parts[:2])
+            # Only treat strings with a patch component (>=3 dotted parts)
+            # as pinned. A bare "2.42" string behaves identically to the
+            # float case - latest patch of the channel.
+            dhis2_version_minor = s if len(parts) >= 3 else None
+            pinned_exact = len(parts) >= 3
             if dhis2_version_major in version_list:
                 return {'dhis2_version_major': dhis2_version_major,
-                        'dhis2_version_minor': dhis2_version_minor
+                        'dhis2_version_minor': dhis2_version_minor,
+                        'pinned_exact': pinned_exact,
                         }
             else:
                 raise AnsibleFilterError(f"The version {dhis2_version} is not "

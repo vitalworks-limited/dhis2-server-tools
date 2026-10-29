@@ -1,30 +1,100 @@
 ---
-# Ensures dhis2_version is valid
+# Resolves dhis2_version (which may be a bare major channel like 2.42 or
+# an exact patch like 2.42.7.1) to a concrete download URL for the WAR.
+#
+# Precedence (highest wins):
+#
+#   1. dhis2_war_file           - explicit URL or local file; set-dhis2-url
+#                                 is NOT consulted. Handled by deploy-war.yml.
+#   2. dhis2_version=2.X.Y[.Z]  - pin to the exact patch. If the patch
+#                                 cannot be found in releases.json,
+#                                 dhis2_pin_patch_version=true fails loudly;
+#                                 otherwise the role falls back to the
+#                                 latest patch and prints a WARNING.
+#   3. dhis2_version=2.X        - latest patch of the 2.X channel.
+#   4. (unset)                  - the role default (defaults/main/main.yml).
+
+# Normalise - returns {major, minor, pinned_exact}.
 - name: Sanitize dhis2_version_major
   ansible.builtin.set_fact:
     normalized_dhis2_version: "{{ (dhis2_version | normalize_dhis2_version(dhis2_releases_list)) }}"
 
-# Sets dhis_version_major and dhis2_version_minor
+# Resolve the top-level release entry for the major channel.
 - name: Set DHIS2 release version
   ansible.builtin.set_fact:
     dhis2_release_version: "{{ (dhis2_releases_list | selectattr('name', 'eq', normalized_dhis2_version['dhis2_version_major']) | list) | first }}"
     dhis2_version_major: "{{ normalized_dhis2_version['dhis2_version_major'] }}"
 
-- name: Set patchversion_name
+- name: Set patchversion_name (latest patch within channel)
   ansible.builtin.set_fact:
     latest_patchversion_name: "{{ (dhis2_release_version['patchVersions'] | last)['name'] | default(dhis2_release_version['name']) }}"
+
+#
+# Try to resolve the EXACT patch the operator asked for. If the operator
+# supplied a bare major (minor=None), we skip the exact-match attempt and
+# use the latest within the channel.
+#
+- name: Attempt to resolve exact pinned patch
+  ansible.builtin.set_fact:
+    _exact_patch: >-
+      {{ (dhis2_release_version['patchVersions']
+           | selectattr('name', 'eq', normalized_dhis2_version['dhis2_version_minor'])
+           | list) }}
+  when: normalized_dhis2_version['dhis2_version_minor'] is not none
+
+- name: Fail when a pinned exact patch cannot be resolved and strict pinning is on
+  ansible.builtin.fail:
+    msg: |
+      dhis2_version={{ dhis2_version }} resolves channel {{ dhis2_version_major }} but
+      patch '{{ normalized_dhis2_version['dhis2_version_minor'] }}' is NOT in releases.json.
+      Available patch versions for {{ dhis2_version_major }}:
+      {{ dhis2_release_version['patchVersions'] | map(attribute='name') | list | join(', ') }}
+      Either correct dhis2_version or unset dhis2_pin_patch_version to allow the
+      role to fall back to the latest patch (currently {{ latest_patchversion_name }}).
+  when:
+    - normalized_dhis2_version['pinned_exact'] | default(false) | bool
+    - dhis2_pin_patch_version | default(false) | bool
+    - (_exact_patch | default([])) | length == 0
+
+- name: Warn when exact patch requested but not resolvable (lenient mode)
+  ansible.builtin.debug:
+    msg: |
+      WARNING: dhis2_version={{ dhis2_version }} - exact patch
+      '{{ normalized_dhis2_version['dhis2_version_minor'] }}' was NOT found in
+      releases.json. Falling back to latest patch {{ latest_patchversion_name }}.
+      Set dhis2_pin_patch_version=true in inventory to fail hard instead.
+  when:
+    - normalized_dhis2_version['pinned_exact'] | default(false) | bool
+    - not (dhis2_pin_patch_version | default(false) | bool)
+    - (_exact_patch | default([])) | length == 0
 
 - name: Set dhis2_latest_patchversion and sha256
   ansible.builtin.set_fact:
     sha256: "{{ dhis2_release_version['sha256'] | default(omit) }}"
     latest_patchversion_url: "{{ (dhis2_release_version['patchVersions'] | last)['url'] | default(dhis2_release_version['latestStableUrl']) }}"
     latest_stable_url: "{{ dhis2_release_version['latestStableUrl'] }}"
-    patchversion_name: "{{ (dhis2_release_version['patchVersions'] | selectattr('name', 'eq', normalized_dhis2_version['dhis2_version_minor']) | first)['name'] | default(latest_patchversion_name) }}"
+    patchversion_name: >-
+      {{ (_exact_patch | default([]) | first)['name']
+         if (_exact_patch | default([])) | length > 0
+         else latest_patchversion_name }}
 
-# Use latest_stable_url instead of latest_patchversion_url, since latest_patchversion_url is not set in all dhis2_versions  defined in releases.json file
-- name: Set dhis2__url, defaults to latestPatchVersion
+- name: Resolve dhis2_url
   ansible.builtin.set_fact:
-    dhis2_url: "{{ (dhis2_release_version['patchVersions'] | selectattr('name', 'eq', normalized_dhis2_version['dhis2_version_minor']) | first)['url'] | default(latest_stable_url) }}"
+    dhis2_url: >-
+      {{ (_exact_patch | default([]) | first)['url']
+         if (_exact_patch | default([])) | length > 0
+         else latest_stable_url }}
+    dhis2_url_sha256: >-
+      {{ (_exact_patch | default([]) | first)['sha256'] | default(sha256 | default('')) }}
+
+- name: Record the resolved artifact for operator inspection
+  ansible.builtin.debug:
+    msg:
+      - "dhis2_version requested: {{ dhis2_version }}"
+      - "resolved patch:          {{ patchversion_name }}"
+      - "pinned_exact:            {{ normalized_dhis2_version['pinned_exact'] | default(false) }}"
+      - "strict pinning:          {{ dhis2_pin_patch_version | default(false) }}"
+      - "resolved URL:            {{ dhis2_url }}"
 
 - name: Set java_version
   ansible.builtin.set_fact:

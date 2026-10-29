@@ -21,11 +21,26 @@ postgres  ansible_host=172.19.2.20  wireguard_ip=10.0.0.3
 
 # dhis2 hosts
 # EXAMPLE:  dhis  ansible_host=172.19.2.11  database_host=postgres  dhis2_version=2.42  fqdn=dhis.example.org  dhis2_auto_upgrade=true  proxy_rewrite=True  apache_doris_db=doris
-# NOTE:  dhis2_auto_upgrade=true automates upgrading to the versision set in  dhis2_version=2.42
+#
+# dhis2_version precedence (per host):
+#   dhis2_version=2.42          - latest patch of the 2.42 channel (auto-upgrade behaviour)
+#   dhis2_version="2.42.7"      - PIN to patch 2.42.7 exactly
+#   dhis2_version="2.42.7.1"    - PIN to patch 2.42.7.1 exactly
+# When pinned to a specific patch:
+#   dhis2_pin_patch_version=true  - FAIL the run if the exact patch is not in releases.json
+#                                   (recommended for production - no silent drift)
+#   dhis2_pin_patch_version=false - fall back to the latest patch of the channel with a warning (default)
+#
+# NOTE:  dhis2_auto_upgrade=true automates upgrading to the version set in dhis2_version.
+#        When combined with a pinned patch (e.g. 2.42.7), auto-upgrade stays within the pin.
 # Memory tuning (all optional, unset = no limit / JVM's own 25%-of-visible-memory default):
 #   lxd_memory_limit=8GB   - LXD container hard memory cap
 #   heap_memory_size=5G    - Tomcat/DHIS2 JVM -Xmx/-Xms (also accepts e.g. 5120m)
 [instances]
+# Example - latest patch of 2.42, auto-upgrades within channel
+# dhis       ansible_host=172.19.2.11  database_host=postgres  dhis2_version=2.42         proxy_rewrite=True  wireguard_ip=10.0.0.4
+# Example - production host pinned to 2.42.7.1, no drift
+# hmis       ansible_host=172.19.2.12  database_host=postgres  dhis2_version="2.42.7.1"   dhis2_pin_patch_version=true  dhis2_auto_upgrade=false
 dhis  ansible_host=172.19.2.11  database_host=postgres  dhis2_version=2.42 proxy_rewrite=True  wireguard_ip=10.0.0.4
 
 

@@ -5,6 +5,9 @@ implementation requirements. It is additive — `dhis2_version` /
 `dhis2_auto_upgrade` behavior in the existing `create-instance` role is
 preserved.
 
+Per-host version pinning (patch-level, strict/lenient) is documented
+in [docs/CLI-Version-Pinning.md](./CLI-Version-Pinning.md).
+
 ## Database upgrade policy
 
 `deploy/roles/create-instance/defaults/main/main.yml` sets:

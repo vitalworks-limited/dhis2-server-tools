@@ -10,8 +10,21 @@ app_monitoring: glowroot
 # default database_host
 database_host: postgres
 
-# default dhis2_version
+# default dhis2_version. Accepts:
+#   2.42          - latest patch of the 2.42 channel (auto-upgrade semantics)
+#   "2.42"        - same as above
+#   "2.42.7"      - pin to patch 2.42.7
+#   "2.42.7.1"    - pin to patch 2.42.7.1
+# When a pinned patch cannot be resolved against releases.json the role
+# falls back to the latest patch and warns. Set dhis2_pin_patch_version
+# to fail hard instead.
 dhis2_version: 2.42
+
+# When true, resolving a pinned patch to the latest-in-channel fallback
+# is a FATAL error - the deployment aborts rather than silently
+# advancing. Recommended for production hosts where version drift must
+# be deliberate.
+dhis2_pin_patch_version: false
 
 # Public URL written to dhis.conf as server.base.url. Leave empty to derive
 # https://<fqdn>[/<instance>] when fqdn is set. HTTPS only, no trailing slash.
