@@ -17,20 +17,71 @@
     - "'skipped' not in  version_results.stdout"
     - version_results.stdout | trim is version(patchversion_name, '<')  # Comparison logic
 
-- name: Download dhis2 war file
-  ansible.builtin.command:
-    cmd: wget -q -O /opt/dhis2/dhis2.war "{{ dhis2_url }}"
+#
+# WAR download + SHA-256 verification.
+#
+# Section 57.9 ("Artifact verification") and 11.5 require WAR
+# downloads to be verified where authoritative checksums are
+# available. The CLI's set-dhis2-url.yml resolves `dhis2_url_sha256`
+# from releases.json; operators supplying a `dhis2_war_file` may also
+# supply `dhis2_war_file_sha256`.
+#
+# Behaviour:
+#   - If a checksum is known for the artifact we're about to install,
+#     ansible.builtin.get_url runs `wget` under the hood but ALSO
+#     performs the sha256 check atomically. A mismatch fails the task.
+#   - If the operator supplies no checksum for a `dhis2_war_file`, the
+#     task warns and proceeds (preserves legacy behaviour for people
+#     who already script around this).
+#
+- name: Download dhis2 war file (releases.json, with sha256 verification)
+  ansible.builtin.get_url:
+    url: "{{ dhis2_url }}"
+    dest: /opt/dhis2/dhis2.war
+    checksum: "{{ ('sha256:' ~ dhis2_url_sha256) if (dhis2_url_sha256 | default('')) else omit }}"
+    mode: "0640"
+    force: true
+    timeout: 120
   when:
     - patchversion_name is defined
     - dhis2_url is defined
     - "'skipped' in version_results.stdout or (version_results.stdout | trim is version(patchversion_name, '<') and dhis2_auto_upgrade | default(false) | bool)"
 
-- name: Download dhis2.war with hard coded url
-  ansible.builtin.command:
-    cmd: wget -q --timeout=120 -O /opt/dhis2/dhis2.war "{{ dhis2_war_file }}"
+- name: Warn when the resolved WAR has no known sha256 (releases.json path)
+  ansible.builtin.debug:
+    msg: >
+      WARNING: no sha256 available for {{ dhis2_url }} in releases.json
+      - the WAR was downloaded WITHOUT integrity verification. If this is
+      unexpected, update dhis2-server-tools so set-dhis2-url.yml resolves
+      the correct patch metadata.
+  when:
+    - patchversion_name is defined
+    - dhis2_url is defined
+    - (dhis2_url_sha256 | default('')) == ''
+    - "'skipped' in version_results.stdout or (version_results.stdout | trim is version(patchversion_name, '<') and dhis2_auto_upgrade | default(false) | bool)"
+
+- name: Download dhis2.war with hard coded url (sha256 optional)
+  ansible.builtin.get_url:
+    url: "{{ dhis2_war_file }}"
+    dest: /opt/dhis2/dhis2.war
+    checksum: "{{ ('sha256:' ~ dhis2_war_file_sha256) if (dhis2_war_file_sha256 | default('')) else omit }}"
+    mode: "0640"
+    force: true
+    timeout: 120
   when:
     - dhis2_war_file is defined
     - (dhis2_war_file | regex_search('^(https?|ftp|file):\/\/')) is not none
+
+- name: Warn when operator-supplied WAR has no sha256
+  ansible.builtin.debug:
+    msg: >
+      WARNING: dhis2_war_file is set but dhis2_war_file_sha256 is not.
+      The WAR was downloaded WITHOUT integrity verification. Pass
+      dhis2_war_file_sha256=<hex> in inventory or via -e to enable it.
+  when:
+    - dhis2_war_file is defined
+    - (dhis2_war_file | regex_search('^(https?|ftp|file):\/\/')) is not none
+    - (dhis2_war_file_sha256 | default('')) == ''
 
 - name: Set war file permissions
   ansible.builtin.file:

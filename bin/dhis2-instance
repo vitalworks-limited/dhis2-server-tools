@@ -203,10 +203,60 @@ _status() {
     dhis2_ansible_adhoc "$name" shell -a "systemctl is-active $unit; systemctl show $unit -p ActiveState,SubState,MainPID,MemoryCurrent" -o -b
 }
 
+#
+# dhis2-instance health NAME [--retry N] [--interval SECONDS] [--expect-version X]
+#
+# Hits /api/system/info on the local Tomcat. Returns 0 only when the
+# endpoint answers 200 (and, when --expect-version is supplied, when
+# the running version string contains it). Retries control how long
+# we wait for a freshly-started DHIS2 to come up - section 11.6 and
+# 17.3 require health verification after deploy/restore/upgrade.
+#
 _health() {
-    local name="${1:-}"
-    [[ -z "$name" ]] && { dhis2_log_error "Usage: dhis2-instance health NAME"; exit "$DHIS2_EXIT_USAGE"; }
-    dhis2_ansible_adhoc "$name" shell -a "curl -sSf -o /dev/null -w 'http=%{http_code} ttfb=%{time_starttransfer}s total=%{time_total}s\n' http://127.0.0.1:8080/$name/api/system/info 2>/dev/null || echo 'local-check-failed'" -o
+    local name="${1:-}"; shift || true
+    local retry=1 interval=5 expect=""
+    while (( $# )); do
+        case "$1" in
+            --retry) retry="$2"; shift ;; --retry=*) retry="${1#*=}" ;;
+            --interval) interval="$2"; shift ;; --interval=*) interval="${1#*=}" ;;
+            --expect-version) expect="$2"; shift ;; --expect-version=*) expect="${1#*=}" ;;
+        esac
+        shift || true
+    done
+    [[ -z "$name" ]] && { dhis2_log_error "Usage: dhis2-instance health NAME [--retry N] [--interval S] [--expect-version X]"; exit "$DHIS2_EXIT_USAGE"; }
+    # Build and run the probe loop on the instance host so network
+    # localhost semantics work for both LXD and SSH deployments.
+    local probe
+    probe="
+        set -u
+        n=0; max=$retry; interval=$interval; expect='$expect'
+        while (( n < max )); do
+            n=\$((n+1))
+            resp=\$(curl -sS -m 10 -o /tmp/.dhis2health.\$\$ -w '%{http_code}' http://127.0.0.1:8080/$name/api/system/info 2>/dev/null || echo 000)
+            if [[ \"\$resp\" == \"200\" ]]; then
+                body=\$(cat /tmp/.dhis2health.\$\$ 2>/dev/null)
+                rm -f /tmp/.dhis2health.\$\$
+                if [[ -n \"\$expect\" ]] && ! echo \"\$body\" | grep -qF \"\$expect\"; then
+                    echo \"attempt \$n/\$max: 200 OK but version did not include '\$expect'\"
+                    sleep \$interval
+                    continue
+                fi
+                echo \"OK after \$n attempt(s)\"
+                echo \"\$body\" | tr ',' '\\n' | head -8
+                exit 0
+            fi
+            echo \"attempt \$n/\$max: http=\$resp\"
+            sleep \$interval
+        done
+        rm -f /tmp/.dhis2health.\$\$
+        exit 1
+    "
+    local rc=0
+    dhis2_ansible_adhoc "$name" shell -a "$probe" -o || rc=$?
+    if (( rc != 0 )); then
+        dhis2_log_error "Health check for $name did not succeed after $retry attempt(s)."
+        exit "$DHIS2_EXIT_HEALTH"
+    fi
 }
 
 _logs() {

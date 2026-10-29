@@ -16,6 +16,8 @@
 #                 [--backup-before-migration] [--verify-backup]
 #                 [--monitor-migrations] [--migration-timeout SECONDS]
 #                 [--restore-on-failure] [--yes]
+#   dhis2-upgrade run --all        --to VERSION [--serial N] [...]
+#   dhis2-upgrade run --instances a,b,c --to VERSION [--serial N] [...]
 #   dhis2-upgrade database INSTANCE --to VERSION  [...same migration options]
 #   dhis2-upgrade logs INSTANCE
 #   dhis2-upgrade verify INSTANCE
@@ -276,7 +278,91 @@ _stage() {
     dhis2_log_info "Artifact staged on $inst (section 57.9). Running application is unchanged."
 }
 
+#
+# Multi-instance orchestrator: dhis2-upgrade run accepts --all or
+# --instances a,b,c and runs the per-instance upgrade with controlled
+# concurrency (--serial N, default 1). Section 57.9 "Multi-instance
+# environments".
+#
+# All other options (--to, --backup-before-migration, etc.) apply to
+# EVERY targeted instance. Each instance is locked individually (see
+# the per-instance dhis2_lock_acquire call below) so unrelated hosts
+# are unaffected.
+#
+_run_multi() {
+    local to="" instances_csv="" serial=1 all=false
+    local -a passthrough=()
+    while (( $# )); do
+        case "$1" in
+            --to) to="$2"; shift ;; --to=*) to="${1#*=}" ;;
+            --all) all=true ;;
+            --instances) instances_csv="$2"; shift ;; --instances=*) instances_csv="${1#*=}" ;;
+            --serial) serial="$2"; shift ;; --serial=*) serial="${1#*=}" ;;
+            *) passthrough+=("$1") ;;
+        esac
+        shift || true
+    done
+    [[ -z "$to" ]] && { dhis2_log_error "--to VERSION required"; exit "$DHIS2_EXIT_USAGE"; }
+    local -a targets=()
+    if $all; then
+        mapfile -t targets < <(dhis2_inventory_group_hosts instances)
+    else
+        IFS=',' read -r -a targets <<< "$instances_csv"
+    fi
+    [[ ${#targets[@]} -eq 0 ]] && { dhis2_log_error "no instances resolved"; exit "$DHIS2_EXIT_USAGE"; }
+
+    dhis2_log_info "Multi-instance upgrade: ${#targets[@]} instance(s) to DHIS2 $to, concurrency=$serial"
+    local -a running_pids=() running_names=()
+    local -a results=()
+    local idx
+    for idx in "${!targets[@]}"; do
+        local t="${targets[$idx]}"
+        [[ -z "$t" ]] && continue
+        # Wait if we are at concurrency limit
+        while (( ${#running_pids[@]} >= serial )); do
+            local wpid="${running_pids[0]}"
+            local wname="${running_names[0]}"
+            wait "$wpid"; local wrc=$?
+            results+=("$wname:$wrc")
+            running_pids=("${running_pids[@]:1}")
+            running_names=("${running_names[@]:1}")
+        done
+        # Fork a per-instance upgrade. We use nohup+background so the
+        # child survives in a tty-less context, and we tag each log
+        # with the instance name.
+        (
+            exec 1> >(sed -u "s/^/[$t] /")
+            exec 2> >(sed -u "s/^/[$t] /" >&2)
+            _run "$t" --to "$to" "${passthrough[@]}"
+        ) &
+        running_pids+=("$!")
+        running_names+=("$t")
+    done
+    # Drain
+    while (( ${#running_pids[@]} > 0 )); do
+        wait "${running_pids[0]}"; local wrc=$?
+        results+=("${running_names[0]}:$wrc")
+        running_pids=("${running_pids[@]:1}")
+        running_names=("${running_names[@]:1}")
+    done
+    local fail=0 r
+    for r in "${results[@]}"; do
+        local n="${r%%:*}" rc="${r#*:}"
+        if [[ "$rc" == "0" ]]; then printf '  ok   %s\n' "$n"; else printf '  FAIL %s (rc=%s)\n' "$n" "$rc"; fail=$((fail+1)); fi
+    done
+    (( fail > 0 )) && exit "$DHIS2_EXIT_PARTIAL"
+}
+
 _run() {
+    # Dispatch to multi-instance mode when --all or --instances is present,
+    # or when the first positional arg looks like an option (--to given
+    # without an instance).
+    local a
+    for a in "$@"; do
+        case "$a" in
+            --all|--instances|--instances=*) _run_multi "$@"; return $? ;;
+        esac
+    done
     local inst="${1:-}"; shift || true
     local to="" backup=true verify=true monitor=true timeout="" restore=false allow_unknown=false source_ver="" allow_latest=false pin=true
     while (( $# )); do
@@ -373,8 +459,12 @@ _run() {
         exit "$DHIS2_EXIT_ANSIBLE"
     fi
 
-    # Stage 11: verify
+    # Stage 11: verify - must hit the DHIS2 API, not just the port.
+    # Retry while Tomcat is still starting the webapp. Expect the
+    # running version to contain the target (e.g. '2.43.2' -> body
+    # must contain '2.43.2').
     "${DHIS2_CLI_ROOT}/bin/dhis2-instance" endpoint check "$inst" || { dhis2_log_error "Post-upgrade endpoint check failed"; exit "$DHIS2_EXIT_HEALTH"; }
+    "${DHIS2_CLI_ROOT}/bin/dhis2-instance" health "$inst" --retry 30 --interval 10 --expect-version "$to" || { dhis2_log_error "Post-upgrade /api/system/info did not report version $to within 5 minutes"; exit "$DHIS2_EXIT_HEALTH"; }
 
     dhis2_log_audit dhis2-upgrade "{\"instance\":\"$inst\",\"to\":\"$to\",\"backup\":\"$backup_path\"}" "ok"
     dhis2_log_info "Upgrade complete."
