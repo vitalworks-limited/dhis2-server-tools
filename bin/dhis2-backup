@@ -4,7 +4,7 @@
 #
 # Usage:
 #   dhis2-backup create INSTANCE [--format custom|plain|plain-gzip|tar|directory]
-#                                [--out DIR] [--yes]
+#                                [--out DIR] [--encrypt gpg --recipient KEY_ID] [--yes]
 #   dhis2-backup files INSTANCE   [--out DIR]
 #   dhis2-backup full  INSTANCE   [--out DIR]
 #   dhis2-backup list                                    [--json]
@@ -62,14 +62,21 @@ _default_out() { echo "/var/backups/dhis2"; }
 
 _create() {
     local inst="${1:-}"; shift || true
-    [[ -z "$inst" ]] && { dhis2_log_error "Usage: dhis2-backup create INSTANCE"; exit "$DHIS2_EXIT_USAGE"; }
-    local fmt=custom out
+    [[ -z "$inst" ]] && { dhis2_log_error "Usage: dhis2-backup create INSTANCE [--encrypt gpg --recipient KEY_ID]"; exit "$DHIS2_EXIT_USAGE"; }
+    local fmt=custom out encrypt="" recipient=""
     out=$(_default_out)
     while (( $# )); do
         case "$1" in --format) fmt="$2"; shift ;; --format=*) fmt="${1#*=}" ;;
-                     --out) out="$2"; shift ;; --out=*) out="${1#*=}" ;; esac
+                     --out) out="$2"; shift ;; --out=*) out="${1#*=}" ;;
+                     --encrypt) encrypt="$2"; shift ;; --encrypt=*) encrypt="${1#*=}" ;;
+                     --recipient) recipient="$2"; shift ;; --recipient=*) recipient="${1#*=}" ;; esac
         shift || true
     done
+    # Validate encryption options early.
+    if [[ -n "$encrypt" ]]; then
+        [[ "$encrypt" != "gpg" ]] && { dhis2_log_error "--encrypt gpg is the only supported mechanism"; exit "$DHIS2_EXIT_USAGE"; }
+        [[ -z "$recipient" ]] && { dhis2_log_error "--encrypt gpg requires --recipient KEY_ID (long key fingerprint or email)"; exit "$DHIS2_EXIT_USAGE"; }
+    fi
     local ts; ts=$(date -u +%Y%m%d-%H%M%S)
     local base="$out/$inst-$ts"
     local pg_fmt_opt
@@ -82,7 +89,7 @@ _create() {
         *) dhis2_log_error "Unknown --format: $fmt"; exit "$DHIS2_EXIT_USAGE" ;;
     esac
     local path="$base$ext"
-    dhis2_log_info "Creating $fmt backup for $inst -> $path"
+    dhis2_log_info "Creating $fmt backup for $inst -> $path${encrypt:+ (encrypted with $encrypt:$recipient)}"
     local pg_cmd
     if [[ "$fmt" == "plain-gzip" ]]; then
         pg_cmd="mkdir -p '$out' && sudo -u postgres pg_dump '$inst' | gzip -9 > '$path'"
@@ -93,29 +100,57 @@ _create() {
     fi
     dhis2_ansible_adhoc "$DB_HOST" shell -a "$pg_cmd && echo DONE $path" -b -o || { dhis2_log_error "pg_dump failed"; exit "$DHIS2_EXIT_FAILURE"; }
 
-    # Manifest - section 57.7
-    local mf="$path.manifest.json"
+    local encrypted=false encrypted_path="$path"
+    if [[ -n "$encrypt" ]]; then
+        # Encrypt in-place on the DB host. Directory-format dumps are
+        # tarred first because gpg does not operate on directories.
+        dhis2_log_info "Encrypting with gpg (recipient: $recipient)"
+        local gpg_src="$path" gpg_dst="$path.gpg"
+        if [[ "$fmt" == "directory" ]]; then
+            dhis2_ansible_adhoc "$DB_HOST" shell -a "tar cf '$path.tar' -C '$(dirname "$path")' '$(basename "$path")' && rm -rf '$path'" -b -o
+            gpg_src="$path.tar"; gpg_dst="$path.tar.gpg"
+        fi
+        if ! dhis2_ansible_adhoc "$DB_HOST" shell -a "
+            command -v gpg >/dev/null || { echo 'gpg-not-installed'; exit 2; }
+            gpg --batch --yes --trust-model always \
+                --recipient '$recipient' --encrypt --output '$gpg_dst' '$gpg_src'
+            shred -u '$gpg_src' 2>/dev/null || rm -f '$gpg_src'
+            chmod 600 '$gpg_dst'
+            echo ENCRYPTED $gpg_dst
+        " -b -o; then
+            dhis2_log_error "gpg encryption failed - plaintext dump at $gpg_src has been removed."
+            exit "$DHIS2_EXIT_FAILURE"
+        fi
+        encrypted=true
+        encrypted_path="$gpg_dst"
+    fi
+
+    # Manifest - section 57.7 (now carries encryption status + recipient id).
+    local mf="$encrypted_path.manifest.json"
     dhis2_ansible_adhoc "$DB_HOST" shell -a "
-        size=\$(stat -c %s '$path' 2>/dev/null || du -sb '$path' | awk '{print \$1}')
-        sum=\$(sha256sum '$path' 2>/dev/null | awk '{print \$1}' || echo n/a)
+        p='$encrypted_path'
+        size=\$(stat -c %s \"\$p\" 2>/dev/null || du -sb \"\$p\" | awk '{print \$1}')
+        sum=\$(sha256sum \"\$p\" 2>/dev/null | awk '{print \$1}' || echo n/a)
         pgv=\$(sudo -u postgres psql -X -tAc 'SHOW server_version')
         cat > '$mf' <<EOF
 {
   \"instance\": \"$inst\",
   \"database\": \"$inst\",
-  \"backup_path\": \"$path\",
+  \"backup_path\": \"\$p\",
   \"format\": \"$fmt\",
   \"timestamp\": \"$ts\",
   \"size_bytes\": \$size,
   \"sha256\": \"\$sum\",
   \"postgresql_version\": \"\$pgv\",
-  \"tool_version\": \"$DHIS2_CLI_VERSION\"
+  \"tool_version\": \"$DHIS2_CLI_VERSION\",
+  \"encryption\": \"$([[ "$encrypted" == true ]] && echo "gpg" || echo "none")\",
+  \"recipient\": \"$recipient\"
 }
 EOF
-        chmod 600 '$mf' '$path'
+        chmod 600 '$mf' \"\$p\"
         echo MANIFEST $mf
     " -b -o
-    _verify "$path"
+    _verify "$encrypted_path"
 }
 
 _files() {
@@ -162,6 +197,11 @@ _verify() {
     out=$(dhis2_ansible_adhoc "$DB_HOST" shell -a "
         test -s '$p' || { echo 'empty-or-missing'; exit 1; }
         case '$p' in
+            *.gpg)
+                # Encrypted - gpg can verify header/integrity without a
+                # private key via --list-packets.
+                command -v gpg >/dev/null || { echo gpg-not-installed; exit 2; }
+                gpg --batch --quiet --list-packets '$p' >/dev/null 2>&1 && echo gpg-ok || { echo gpg-bad; exit 2; } ;;
             *.gz) gzip -t '$p' && echo gzip-ok || { echo gzip-bad; exit 2; } ;;
             *.sql) grep -q 'PostgreSQL database dump' '$p' && echo sql-ok || echo sql-unknown ;;
             *.dump|*.tar) sudo -u postgres pg_restore -l '$p' >/dev/null && echo pg-list-ok || { echo pg-list-bad; exit 3; } ;;

@@ -636,6 +636,7 @@ the generated `tests/regression/last-run.md`.
 - [docs/CLI-Upgrades.md](./docs/CLI-Upgrades.md) — controlled upgrade workflow and database upgrade policy
 - [docs/CLI-Version-Pinning.md](./docs/CLI-Version-Pinning.md) — per-host DHIS2 patch pinning (strict vs lenient)
 - [docs/CLI-Flyway-Operations.md](./docs/CLI-Flyway-Operations.md) — Flyway inspection, failure recovery, baseline, upgrade preflight
+- [docs/CLI-Backup-Restore.md](./docs/CLI-Backup-Restore.md) — backup formats, GPG encryption, verify / test / restore, WAR integrity
 - [docs/CLI-Testing.md](./docs/CLI-Testing.md) — the three-tier test strategy
 - [docs/Migration-to-CLI.md](./docs/Migration-to-CLI.md) — equivalences between legacy commands and the CLI
 - [docs/Compatibility.md](./docs/Compatibility.md) — no-regression guarantees

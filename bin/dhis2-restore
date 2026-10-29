@@ -143,19 +143,36 @@ _database() {
         dhis2_ansible_adhoc "$DB_HOST" shell -a "sudo -u postgres psql -X -c \"CREATE DATABASE \\\"$tgt_db\\\" OWNER \\\"$target_owner\\\" ENCODING 'UTF8' TEMPLATE template0\"" -b -o
     fi
 
-    # Step 8: restore
+    # Step 8: restore. Encrypted backups (.gpg) are decrypted to a
+    # temporary file inside a 0700 operator-only directory and the
+    # plaintext is shredded immediately after use.
     local pg_opts=""
     $CLEAN && pg_opts+=" --clean"
     [[ -n "$JOBS" ]] && pg_opts+=" -j $JOBS"
     dhis2_log_info "Running restore"
     dhis2_ansible_adhoc "$DB_HOST" shell -a "
         set -e
-        case '$BACKUP' in
-            *.gz)   gunzip -c '$BACKUP' | sudo -u postgres psql -q -d '$tgt_db' ;;
-            *.sql)  sudo -u postgres psql -q -d '$tgt_db' -f '$BACKUP' ;;
-            *.dump|*.tar|*.dir) sudo -u postgres pg_restore -q -d '$tgt_db' $pg_opts '$BACKUP' ;;
-            *) echo 'unknown-format'; exit 2 ;;
+        src='$BACKUP'
+        decrypted=''
+        if [[ \"\$src\" == *.gpg ]]; then
+            command -v gpg >/dev/null || { echo 'gpg-not-installed'; exit 4; }
+            td=\$(mktemp -d /var/tmp/dhis2-restore.XXXXXX)
+            chmod 700 \"\$td\"
+            decrypted=\"\$td/plain\${src##*/}\"
+            decrypted=\"\${decrypted%.gpg}\"
+            gpg --batch --quiet --output \"\$decrypted\" --decrypt \"\$src\" || { rm -rf \"\$td\"; exit 5; }
+            src=\"\$decrypted\"
+        fi
+        case \"\$src\" in
+            *.gz)   gunzip -c \"\$src\" | sudo -u postgres psql -q -d '$tgt_db' ;;
+            *.sql)  sudo -u postgres psql -q -d '$tgt_db' -f \"\$src\" ;;
+            *.dump|*.tar|*.dir) sudo -u postgres pg_restore -q -d '$tgt_db' $pg_opts \"\$src\" ;;
+            *) echo 'unknown-format'; [[ -n \"\$decrypted\" ]] && { shred -u \"\$decrypted\" 2>/dev/null || rm -f \"\$decrypted\"; }; exit 2 ;;
         esac
+        if [[ -n \"\$decrypted\" ]]; then
+            shred -u \"\$decrypted\" 2>/dev/null || rm -f \"\$decrypted\"
+            rmdir \"\$(dirname \"\$decrypted\")\" 2>/dev/null || true
+        fi
         echo restore-ok
     " -b -o || { dhis2_log_error "Restore failed"; exit "$DHIS2_EXIT_FAILURE"; }
 
