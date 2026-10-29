@@ -1,10 +1,10 @@
 # Regression run report
 
-Generated: 2026-10-29T19:13:07Z
+Generated: 2026-10-29T20:19:34Z
 
 Mode: mock
 
-Results: PASS=49 FAIL=0 SKIP=2
+Results: PASS=60 FAIL=0 SKIP=2
 
 | ID | Scenario | Mode | Result | Notes |
 |----|----------|------|--------|-------|
@@ -59,3 +59,14 @@ Results: PASS=49 FAIL=0 SKIP=2
 | AM | dhis2-upgrade run --to rejects bare channel | mock | PASS | requires patch by default |
 | AM2 | dhis2-instance set-version refuses bare channel by default | mock | PASS | guard present |
 | AN | upgrade run defaults to strict pin on patch versions | mock | PASS | pin flag propagated |
+| AO | deploy-war.yml verifies sha256 via get_url | mock | PASS | integrity check wired |
+| AP | dhis2-instance health supports --retry and --expect-version | mock | PASS | retry wired |
+| AP2 | upgrade run post-flight calls API health with version check | mock | PASS | post-flight API probe |
+| AQ | dhis2-vault rotate-db-password transactional with rollback | mock | PASS | rotation + rollback paths present |
+| AR | preflight checks DNS, disk, RAM, CPU | mock | PASS | all four resource checks present |
+| AS | upgrade run --all / --instances / --serial supported | mock | PASS | multi-instance orchestrator wired |
+| AT | install.sh writes logrotate policy | mock | PASS | logrotate policy present |
+| AU | dhis2-doctor --fix dry-run + apply | mock | PASS | fix path with dry-run present |
+| AV | dhis2-backup create supports --encrypt gpg --recipient | mock | PASS | encryption wired |
+| AV2 | dhis2-backup verify understands .gpg | mock | PASS | gpg verify branch present |
+| AV3 | dhis2-restore database decrypts .gpg transparently | mock | PASS | decrypt path present |

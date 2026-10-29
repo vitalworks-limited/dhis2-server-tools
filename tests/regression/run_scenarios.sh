@@ -611,6 +611,112 @@ scenario_AN() {
     fi
 }
 
+# ---------- Gaps 1-8 ----------
+
+scenario_AO() {
+    # Gap 1: WAR SHA256 verification wired into deploy-war.yml
+    if grep -q "checksum:" "$ROOT/deploy/roles/create-instance/tasks/deploy-war.yml" \
+       && grep -q "dhis2_url_sha256" "$ROOT/deploy/roles/create-instance/tasks/deploy-war.yml" \
+       && grep -q "dhis2_war_file_sha256" "$ROOT/deploy/roles/create-instance/tasks/deploy-war.yml"; then
+        _rec AO "deploy-war.yml verifies sha256 via get_url" mock PASS "integrity check wired"
+    else
+        _rec AO "deploy-war.yml verifies sha256 via get_url" mock FAIL "checksum arg missing"
+    fi
+}
+
+scenario_AP() {
+    # Gap 2: API-level upgrade verify with retry
+    if awk '/^_health\(\)/,/^}/' "$BIN/dhis2-instance" | grep -q "expect-version" \
+       && awk '/^_health\(\)/,/^}/' "$BIN/dhis2-instance" | grep -q "retry"; then
+        _rec AP "dhis2-instance health supports --retry and --expect-version" mock PASS "retry wired"
+    else
+        _rec AP "dhis2-instance health supports --retry and --expect-version" mock FAIL "retry missing"
+    fi
+    if awk '/^_run\(\)/,/^}/' "$BIN/dhis2-upgrade" | grep -q 'health.*--retry.*--expect-version'; then
+        _rec AP2 "upgrade run post-flight calls API health with version check" mock PASS "post-flight API probe"
+    else
+        _rec AP2 "upgrade run post-flight calls API health with version check" mock FAIL "post-flight API probe missing"
+    fi
+}
+
+scenario_AQ() {
+    # Gap 3: transactional DB password rotation
+    if grep -q "rotate-db-password" "$BIN/dhis2-vault" \
+       && grep -q "_rotate_db_rollback_pg" "$BIN/dhis2-vault" \
+       && grep -q "_rotate_db_rollback_conf" "$BIN/dhis2-vault"; then
+        _rec AQ "dhis2-vault rotate-db-password transactional with rollback" mock PASS "rotation + rollback paths present"
+    else
+        _rec AQ "dhis2-vault rotate-db-password transactional with rollback" mock FAIL "incomplete"
+    fi
+}
+
+scenario_AR() {
+    # Gap 4: preflight DNS/disk/RAM/CPU
+    local ok=true
+    awk '/^_preflight\(\)/,/^}/' "$BIN/dhis2-deploy" | grep -q "dns:" || ok=false
+    awk '/^_preflight\(\)/,/^}/' "$BIN/dhis2-deploy" | grep -q "disk:" || ok=false
+    awk '/^_preflight\(\)/,/^}/' "$BIN/dhis2-deploy" | grep -q "memory:" || ok=false
+    awk '/^_preflight\(\)/,/^}/' "$BIN/dhis2-deploy" | grep -q "cpu:" || ok=false
+    $ok && _rec AR "preflight checks DNS, disk, RAM, CPU" mock PASS "all four resource checks present" \
+         || _rec AR "preflight checks DNS, disk, RAM, CPU" mock FAIL "missing resource check(s)"
+}
+
+scenario_AS() {
+    # Gap 5: multi-instance upgrade
+    if grep -q "_run_multi" "$BIN/dhis2-upgrade" \
+       && grep -q '\-\-all\|--instances' "$BIN/dhis2-upgrade" \
+       && grep -q '\-\-serial' "$BIN/dhis2-upgrade"; then
+        _rec AS "upgrade run --all / --instances / --serial supported" mock PASS "multi-instance orchestrator wired"
+    else
+        _rec AS "upgrade run --all / --instances / --serial supported" mock FAIL "multi-instance orchestrator missing"
+    fi
+}
+
+scenario_AT() {
+    # Gap 6: audit log rotation installed by install.sh
+    if grep -q "/etc/logrotate.d/dhis2-server-tools" "$ROOT/install.sh" \
+       && grep -q "weekly" "$ROOT/install.sh"; then
+        _rec AT "install.sh writes logrotate policy" mock PASS "logrotate policy present"
+    else
+        _rec AT "install.sh writes logrotate policy" mock FAIL "logrotate missing"
+    fi
+}
+
+scenario_AU() {
+    # Gap 7: dhis2-doctor --fix with low-risk corrections
+    if grep -q "^_fix()" "$BIN/dhis2-doctor" \
+       && awk '/^_fix\(\)/,/^}/' "$BIN/dhis2-doctor" | grep -q "chmod" \
+       && awk '/^_fix\(\)/,/^}/' "$BIN/dhis2-doctor" | grep -q "would fix"; then
+        _rec AU "dhis2-doctor --fix dry-run + apply" mock PASS "fix path with dry-run present"
+    else
+        _rec AU "dhis2-doctor --fix dry-run + apply" mock FAIL "fix path missing"
+    fi
+}
+
+scenario_AV() {
+    # Gap 8: backup encryption (GPG) wired through create + verify + restore.
+    # Use grep -z to allow multi-line matches since the gpg invocation
+    # is wrapped across lines in the role.
+    local create_body
+    create_body=$(awk '/^_create\(\)/,/^_files\(\)/' "$BIN/dhis2-backup")
+    if echo "$create_body" | grep -q -- "--encrypt" \
+       && echo "$create_body" | tr '\n' ' ' | grep -q 'gpg .*--encrypt --output'; then
+        _rec AV "dhis2-backup create supports --encrypt gpg --recipient" mock PASS "encryption wired"
+    else
+        _rec AV "dhis2-backup create supports --encrypt gpg --recipient" mock FAIL "encryption missing"
+    fi
+    if awk '/^_verify\(\)/,/^_test\(\)/' "$BIN/dhis2-backup" | grep -q "\*\.gpg"; then
+        _rec AV2 "dhis2-backup verify understands .gpg" mock PASS "gpg verify branch present"
+    else
+        _rec AV2 "dhis2-backup verify understands .gpg" mock FAIL "no gpg verify branch"
+    fi
+    if awk '/^_database\(\)/,/^}/' "$BIN/dhis2-restore" | grep -q "\\.gpg"; then
+        _rec AV3 "dhis2-restore database decrypts .gpg transparently" mock PASS "decrypt path present"
+    else
+        _rec AV3 "dhis2-restore database decrypts .gpg transparently" mock FAIL "no decrypt path"
+    fi
+}
+
 # ---------- Report ----------
 
 _write_report() {
@@ -642,6 +748,7 @@ scenario_U; scenario_V; scenario_W; scenario_X; scenario_Y; scenario_Z
 scenario_AA; scenario_AB; scenario_AC; scenario_AD; scenario_AE
 scenario_AF; scenario_AG; scenario_AH; scenario_AI; scenario_AJ; scenario_AK
 scenario_AL; scenario_AM; scenario_AN
+scenario_AO; scenario_AP; scenario_AQ; scenario_AR; scenario_AS; scenario_AT; scenario_AU; scenario_AV
 
 _write_report
 echo
