@@ -49,6 +49,22 @@ via `dhis2_ha: true` and new inventory groups.
 
 ## 2. Target architecture
 
+HA supports the three deployment architectures the project already
+targets:
+
+- **Distributed SSH HA** (every role on its own physical / virtual host)
+- **Multi-host LXD HA** (containers striped across 2+ physical hosts)
+- **Hybrid LXD + SSH HA** (any mix declared per-host via the inventory's
+  existing `ansible_connection` semantics)
+
+Section **15b** below is the topology matrix, inventory examples per
+topology, and the cross-host rules the role enforces at preflight. A
+**single-host LXD** deployment (nine containers on one physical host)
+is explicitly refused as "not real HA" because a single hardware
+failure takes down everything.
+
+
+
 ```mermaid
 graph TB
     subgraph Clients
@@ -817,6 +833,232 @@ Before this HA work can land upstream:
 - [ ] Updated README diagrams.
 
 ---
+
+## 15b. Topology matrix: LXD, distributed SSH, hybrid
+
+HA supports all three deployment architectures the project already
+targets. The determining factor is **failure-domain isolation**, not
+the container runtime: HA is meaningful only when a single hardware
+failure cannot take down a quorum of any cluster member.
+
+### Supported HA topologies
+
+| # | Name | Topology | HA against | Status |
+|---|------|----------|------------|--------|
+| **A** | **Distributed SSH HA** | Every HA role on its own physical or virtual host, managed over SSH. Minimum 9 hosts in the recommended layout. | Host failure, network partition, kernel panic, OS reboot | **Fully supported — recommended for production.** |
+| **B** | **Multi-host LXD HA** | 2+ physical hosts, each running LXD. HA members live as containers distributed across the physical hosts (e.g. a PG container, an etcd container, an app container, and an LB container on each physical host). | Physical host failure, LXD runtime failure | **Fully supported.** Many MOH / NGO deployments own 2-3 servers and benefit from LXD's lower per-tenant overhead. |
+| **C** | **Hybrid LXD + SSH HA** | Any mix of LXD containers (on one or more physical hosts) and SSH-managed VMs, declared per-host via the inventory's existing `ansible_connection` semantics. | Both of the above, selectively | **Fully supported.** Typical: PG tier on dedicated SSH VMs for I/O performance; app tier on LXD containers across 2 physical hosts; etcd on 3 small dedicated VMs. |
+| **D** | **Single-host LXD "HA" (lab only)** | 9 LXD containers on ONE physical host. | Process / service failure only. **NOT host failure.** | **Refused by `dhis2-deploy preflight`.** Operators who want it for a laptop demo must set `ha_single_host_dev=true` and the role prints a HIGH-SEVERITY warning on every run. Section 23 safety: we must not let an operator mistake this for real HA. |
+
+Topology selection is **automatic from the inventory** — the role
+walks the inventory, groups cluster members by `ansible_host` /
+host-level facts, and errors out if any failure group has no
+redundancy. There is no `ha_topology` variable to pick.
+
+### Minimum physical / VM counts
+
+| Topology | Hosts for lean HA | What runs where |
+|----------|-------------------|-----------------|
+| A (distributed SSH) | 9 | Each role on its own host |
+| B (multi-host LXD, 3 physical) | 3 physical | Each physical host runs: 1 pg + 1 etcd + 1 app + 1 lb container, with MinIO and Redis containers striped across the 3 physical hosts |
+| B (multi-host LXD, 2 physical) | 2 physical | 2 physical hosts cannot host 3-member etcd quorum with HA; this layout requires at least a third tiny witness host for etcd — the plan errors out otherwise |
+| C (hybrid, example) | 5 (2 LXD + 3 SSH) | PG + etcd on 3 SSH VMs; app + LB on LXD containers across 2 physical hosts |
+| D (single-host LXD lab) | 1 | 9 containers on one host — zero hardware HA |
+
+### Rules the role enforces at preflight
+
+1. **3 etcd members on 3 distinct physical hosts.** If `ha_role` on
+   etcd containers would place more than one quorum member on the
+   same physical host, preflight fails.
+2. **Patroni leader + sync replica on distinct physical hosts.** A
+   `fsync=on; synchronous_commit=on` pair with both members on the
+   same physical host offers no HA against host failure.
+3. **Both LB nodes (keepalived) on the same L2 segment.** VRRP
+   requires it. In cloud VPCs without L2 adjacency the role refuses
+   `ha_lb_mode=keepalived` and the operator must choose `dns-rr`.
+4. **At least two app nodes on distinct physical hosts** when
+   `dhis2_ha=true`.
+5. **MinIO distributed-4 mode** requires 4 members on 4 distinct
+   physical hosts; `single-node` mode accepts any placement but
+   prints a warning that it is not HA.
+
+Each of these rules is a line in `dhis2-deploy preflight` with a
+clear error message pointing at the inventory host(s) that violated
+it.
+
+### LXD-specific constraints
+
+Issues the role tests for or configures when LXD is in play:
+
+1. **Container privilege.** Patroni's `pg_rewind`, systemd unit
+   management, and `wal-g` with some S3 providers need capabilities
+   that unprivileged containers restrict. The `patroni` role sets
+   `security.privileged=true` and `security.nesting=true` on PG
+   containers, with a documented justification. App containers
+   remain unprivileged.
+2. **Storage pool.** PostgreSQL's write performance degrades sharply
+   on an LXD `dir` pool because of fsync behaviour. The `patroni`
+   role refuses to install on a PG container whose root device uses
+   `dir`; `zfs`, `btrfs`, or `lvm` are required. Documented in
+   `docs/HA-LXD.md`.
+3. **Clock synchronisation.** LXD containers inherit the host clock
+   by default. Patroni DCS lease timers assume monotonic time within
+   seconds across cluster members. The `pre-install` role already
+   validates `timedatectl` on the host; HA preflight extends the
+   check to every LXD container member.
+4. **Network bridging.** keepalived VRRP across LXD containers on
+   different physical hosts requires L2 reachability between the
+   containers. The default `lxdbr0` bridge is NAT'd and will not
+   work. Operators either use a bridged `br0` with each PG / app /
+   LB container's interface attached directly, or they use
+   `ha_lb_mode=dns-rr`. The role prints a clear choice at init.
+5. **Snapshot semantics.** `dhis2-host lxd snapshot` already warns
+   that an LXD container snapshot is NOT a validated database
+   backup (section 57.3). In HA this is reinforced: the plan
+   explicitly refuses to use LXD snapshots as a PITR substitute.
+
+### Inventory examples
+
+#### Topology A — distributed SSH HA (9 VMs)
+
+```ini
+[instances]
+app01   ansible_host=10.0.2.11  ansible_connection=ssh  ansible_user=deploy
+app02   ansible_host=10.0.2.12  ansible_connection=ssh  ansible_user=deploy
+
+[databases]
+pg01    ansible_host=10.0.1.21  ha_role=primary                       ansible_connection=ssh
+pg02    ansible_host=10.0.1.22  ha_role=replica  ha_pg_sync_standby=true ansible_connection=ssh
+pg03    ansible_host=10.0.1.23  ha_role=replica                       ansible_connection=ssh
+
+[etcd]
+etcd01  ansible_host=10.0.1.31  ansible_connection=ssh
+etcd02  ansible_host=10.0.1.32  ansible_connection=ssh
+etcd03  ansible_host=10.0.1.33  ansible_connection=ssh
+
+[lb]
+lb01    ansible_host=10.0.0.11  keepalived_priority=100  ansible_connection=ssh
+lb02    ansible_host=10.0.0.12  keepalived_priority=90   ansible_connection=ssh
+
+[redis]
+redis01 ansible_host=10.0.1.41  ansible_connection=ssh
+
+[minio]
+minio01 ansible_host=10.0.1.51  ansible_connection=ssh
+minio02 ansible_host=10.0.1.52  ansible_connection=ssh
+minio03 ansible_host=10.0.1.53  ansible_connection=ssh
+minio04 ansible_host=10.0.1.54  ansible_connection=ssh
+```
+
+#### Topology B — multi-host LXD HA (3 physical servers)
+
+Three physical servers (`srv1`, `srv2`, `srv3`), each running LXD.
+Containers striped across them for failure isolation. The `physical_host`
+host var is only used by `dhis2-deploy preflight` to enforce the
+cross-host rules; it is purely metadata.
+
+```ini
+[instances]
+app01   ansible_host=172.19.2.11  physical_host=srv1  ansible_connection=lxd
+app02   ansible_host=172.19.2.12  physical_host=srv2  ansible_connection=lxd
+
+[databases]
+pg01    ansible_host=172.19.2.21  physical_host=srv1  ha_role=primary                       ansible_connection=lxd
+pg02    ansible_host=172.19.2.22  physical_host=srv2  ha_role=replica  ha_pg_sync_standby=true ansible_connection=lxd
+pg03    ansible_host=172.19.2.23  physical_host=srv3  ha_role=replica                       ansible_connection=lxd
+
+[etcd]
+etcd01  ansible_host=172.19.2.31  physical_host=srv1  ansible_connection=lxd
+etcd02  ansible_host=172.19.2.32  physical_host=srv2  ansible_connection=lxd
+etcd03  ansible_host=172.19.2.33  physical_host=srv3  ansible_connection=lxd
+
+[lb]
+lb01    ansible_host=172.19.2.2   physical_host=srv1  keepalived_priority=100  ansible_connection=lxd
+lb02    ansible_host=172.19.2.3   physical_host=srv2  keepalived_priority=90   ansible_connection=lxd
+
+[redis]
+redis01 ansible_host=172.19.2.41  physical_host=srv3  ansible_connection=lxd
+
+[minio]
+minio01 ansible_host=172.19.2.51  physical_host=srv1  ansible_connection=lxd
+minio02 ansible_host=172.19.2.52  physical_host=srv2  ansible_connection=lxd
+minio03 ansible_host=172.19.2.53  physical_host=srv3  ansible_connection=lxd
+minio04 ansible_host=172.19.2.54  physical_host=srv1  ansible_connection=lxd  # second container on srv1
+
+[all:vars]
+dhis2_ha=true
+ha_lb_mode=keepalived              # requires bridged container networking across srv1-3
+ha_vip=10.0.0.10
+ha_vip_interface=br0
+```
+
+Preflight validates:
+- `pg01.physical_host != pg02.physical_host` (leader vs sync standby on different physical hosts)
+- `etcd01.physical_host`, `etcd02.physical_host`, `etcd03.physical_host` all distinct
+- `app01.physical_host != app02.physical_host`
+- `lb01.physical_host != lb02.physical_host`
+- MinIO distributed-4 members span the 3 physical hosts (the 4th container returns to `srv1`, which is acceptable — the goal is 2-host-failure survivability, which 3 physical hosts cannot provide anyway; the limit is called out as a warning)
+
+#### Topology C — hybrid (PG on SSH, app + LB on LXD, etcd dedicated)
+
+```ini
+[instances]
+app01   ansible_host=172.19.2.11  physical_host=srv1  ansible_connection=lxd
+app02   ansible_host=172.19.2.12  physical_host=srv2  ansible_connection=lxd
+
+[databases]
+pg01    ansible_host=10.0.1.21  ha_role=primary                       ansible_connection=ssh ansible_user=postgres
+pg02    ansible_host=10.0.1.22  ha_role=replica  ha_pg_sync_standby=true ansible_connection=ssh ansible_user=postgres
+pg03    ansible_host=10.0.1.23  ha_role=replica                       ansible_connection=ssh ansible_user=postgres
+
+[etcd]
+etcd01  ansible_host=10.0.1.31  ansible_connection=ssh
+etcd02  ansible_host=10.0.1.32  ansible_connection=ssh
+etcd03  ansible_host=10.0.1.33  ansible_connection=ssh
+
+[lb]
+lb01    ansible_host=172.19.2.2  physical_host=srv1  keepalived_priority=100  ansible_connection=lxd
+lb02    ansible_host=172.19.2.3  physical_host=srv2  keepalived_priority=90   ansible_connection=lxd
+
+[redis]
+redis01 ansible_host=10.0.1.41  ansible_connection=ssh
+
+[minio]
+minio01 ansible_host=10.0.1.51  ansible_connection=ssh
+minio02 ansible_host=10.0.1.52  ansible_connection=ssh
+minio03 ansible_host=10.0.1.53  ansible_connection=ssh
+minio04 ansible_host=10.0.1.54  ansible_connection=ssh
+```
+
+### CLI additions reflecting topology awareness
+
+```
+dhis2-cluster topology                # prints the detected topology (A, B, C, D) + physical_host groupings
+dhis2-cluster topology --check        # runs the cross-host rules; exits non-zero on violations
+dhis2-cluster lxd                     # LXD-specific view: which containers run on which physical hosts
+dhis2-cluster failover --to HOST      # refuses if destination is on the same physical_host as the source
+```
+
+### Updated phase scoping
+
+The topology work does not add a new phase. Each existing phase gains
+a thin layer:
+
+- **Phase 1 (Patroni + etcd + HAProxy)** adds the `physical_host`
+  cross-host validation rules.
+- **Phase 2 (App HA + LB)** adds the keepalived L2-adjacency check
+  for LXD and the DNS-RR fallback.
+- **Phase 5 (Migration tooling)** documents all four topologies
+  side-by-side with explicit "when to pick which" guidance.
+
+### Risk register addition
+
+| Risk | Likelihood | Impact | Mitigation |
+|------|------------|--------|------------|
+| Operator deploys 9 containers on 1 physical host and believes they have HA | Medium | High | Preflight refuses topology D unless `ha_single_host_dev=true` + prints HIGH warning |
+| LXD bridged networking misconfigured, keepalived fails to failover | Medium | High | Phase 2 includes a dedicated keepalived L2-reachability smoke test; falls back to `dns-rr` with a warning |
+| PG container on `dir` storage pool, write performance tanks | High (default pool choice) | High | Patroni role refuses `dir`; documented in `docs/HA-LXD.md` |
+| Clock drift between LXD containers breaks Patroni DCS leases | Low | High | Preflight asserts `timedatectl` sync on every container member |
 
 ## 16. What we are explicitly NOT doing
 
