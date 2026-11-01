@@ -3,3 +3,10 @@
   ansible.builtin.include_tasks: "{{ ansible_connection }}.yml"
   when: inventory_hostname in groups['databases']
   tags: [postgresql-install, postgresql-conf]
+
+- name: WAL archive preflight (only when pg_archive_mode=on)
+  ansible.builtin.include_tasks: wal-archive-preflight.yml
+  when:
+    - inventory_hostname in groups['databases']
+    - pg_archive_mode | default('off') == 'on'
+  tags: [postgresql-conf, wal-archive-preflight]

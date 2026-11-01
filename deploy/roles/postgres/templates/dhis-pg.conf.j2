@@ -50,6 +50,49 @@ wal_writer_delay = 10000ms
 random_page_cost = 1.1
 log_min_duration_statement = 300s
 
+#
+# WAL retention bounds. See docs/CLI-WAL-Operations.md and
+# docs/vital-enhancements/wal-disk-safety-plan.md. These exist so a
+# surprise ETL job or a stalled archiver cannot grow pg_wal unbounded.
+# Operators tuning for heavy write workloads should raise max_wal_size
+# and the alert threshold together.
+#
+# max_wal_size is a SOFT target - PG may exceed it under sustained
+# write pressure, but at that point checkpoints are triggered more
+# aggressively. min_wal_size prevents too-aggressive recycling.
+#
+{% if pg_max_wal_size is defined and pg_max_wal_size | regex_search('^\d+(GB|MB|KB)$') %}
+max_wal_size = {{ pg_max_wal_size }}
+{% else %}
+max_wal_size = 4GB
+{% endif %}
+{% if pg_min_wal_size is defined and pg_min_wal_size | regex_search('^\d+(GB|MB|KB)$') %}
+min_wal_size = {{ pg_min_wal_size }}
+{% else %}
+min_wal_size = 80MB
+{% endif %}
+{% if pg_checkpoint_timeout is defined and pg_checkpoint_timeout | regex_search('^\d+(min|s|h)$') %}
+checkpoint_timeout = {{ pg_checkpoint_timeout }}
+{% endif %}
+{% if pg_wal_keep_size is defined and pg_wal_keep_size | regex_search('^\d+(GB|MB|KB)$') %}
+# wal_keep_size pins WAL on disk for N bytes - overriding this is
+# usually a mistake unless you understand why.
+wal_keep_size = {{ pg_wal_keep_size }}
+{% endif %}
+
+#
+# WAL archive. Default off (same as the current single-node
+# deployment). When enabled, the role's wal-archive-preflight.yml runs
+# the archive_command against a test file and refuses to proceed if
+# it fails - preventing a stuck archive from filling pg_wal.
+#
+{% if pg_archive_mode | default('off') == 'on' %}
+archive_mode = on
+archive_command = '{{ pg_archive_command }}'
+# wal_level >= replica is required when archive_mode=on
+wal_level = {{ pg_wal_level | default('replica') }}
+{% endif %}
+
 # This is required for DHIS2.32+
 max_locks_per_transaction = 128
 

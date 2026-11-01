@@ -6,3 +6,29 @@ postgresql_extensions:
   - postgis
   - btree_gin
   - pg_trgm
+
+#
+# WAL retention bounds and archive controls. See
+# docs/CLI-WAL-Operations.md and
+# docs/vital-enhancements/wal-disk-safety-plan.md.
+#
+# Defaults match single-node PostgreSQL safe values; override per-host
+# or in [all:vars] for heavier write workloads or when continuous
+# archiving is in use.
+#
+pg_max_wal_size: 4GB            # soft target before aggressive checkpointing
+pg_min_wal_size: 80MB           # recycle floor
+# pg_checkpoint_timeout: 5min   # default; raise only with care
+# pg_wal_keep_size: 1GB         # usually leave unset; replication slots are safer
+
+#
+# Continuous WAL archiving. Default OFF to match the existing single-
+# node deployment. When set to 'on', pg_archive_command MUST also be
+# set to a valid shell command and the role will run
+# wal-archive-preflight.yml to prove the command works BEFORE
+# enabling archive_mode. A stuck archive_command fills pg_wal; the
+# preflight prevents that class of outage.
+#
+pg_archive_mode: off
+# pg_archive_command: 'wal-g wal-push %p'   # example
+# pg_wal_level: replica                     # required when archive_mode=on

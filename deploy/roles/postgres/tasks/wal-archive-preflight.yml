@@ -1,0 +1,62 @@
+---
+#
+# WAL archive-command preflight.
+#
+# Only invoked when pg_archive_mode=on is explicitly requested (default
+# is off, which matches the existing single-node deployment).
+#
+# PostgreSQL will keep every WAL segment on the data filesystem until
+# archive_command returns 0. If the configured archive command fails
+# silently (bad credentials, unreachable S3, missing wal-g binary),
+# the filesystem fills and writes stop. We MUST catch this before we
+# flip archive_mode=on.
+#
+# This task tries the configured archive_command against a 16-byte
+# test file. On any failure the deployment aborts before archive_mode
+# is enabled.
+#
+# See docs/vital-enhancements/wal-disk-safety-plan.md section 2.1.
+#
+
+- name: WAL preflight | Verify pg_archive_command is defined
+  ansible.builtin.fail:
+    msg: >
+      pg_archive_mode=on requires pg_archive_command to be set to a
+      valid shell command that archives %p to a durable destination
+      and exits 0 on success.
+  when:
+    - pg_archive_mode | default('off') == 'on'
+    - not (pg_archive_command | default('') | length > 0)
+
+- name: WAL preflight | Dry-run the archive command against a test segment
+  ansible.builtin.shell: |
+    set -e
+    tmp=$(mktemp /tmp/dhis2-wal-test.XXXXXX)
+    chmod 600 "$tmp"
+    echo "dhis2-server-tools wal archive preflight $(date -u +%FT%TZ)" > "$tmp"
+    # Mimic PG's %p and %f substitution for the test. Many archive
+    # commands handle both; wal-g wal-push only needs %p.
+    out=$({{ pg_archive_command | replace("%p", "\"$tmp\"") | replace("%f", "\"dhis2-wal-preflight-$$\"") }} 2>&1) || {
+        echo "archive_command failed:"
+        echo "$out"
+        rm -f "$tmp"
+        exit 1
+    }
+    rm -f "$tmp"
+    echo archive_command_preflight_ok
+  args:
+    executable: /bin/bash
+  register: _wal_archive_test
+  changed_when: false
+  failed_when: _wal_archive_test.rc != 0
+  when:
+    - pg_archive_mode | default('off') == 'on'
+    - pg_archive_command | default('') | length > 0
+  become: true
+  become_user: postgres
+
+- name: WAL preflight | Record the result
+  ansible.builtin.debug:
+    msg: >
+      archive_command preflight: {{ _wal_archive_test.stdout | default('skipped') }}
+  when: _wal_archive_test is defined
