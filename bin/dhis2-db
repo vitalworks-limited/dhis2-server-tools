@@ -52,11 +52,21 @@
 #   dhis2-db flyway baseline DB --version X [--description TEXT] [--yes]
 #   dhis2-db flyway validate DB
 #   dhis2-db flyway source-version DB         [--json]
+#   dhis2-db wal status                       [--host HOST] [--json]
+#   dhis2-db wal archive-status               [--host HOST]
+#   dhis2-db wal retention                    [--host HOST]
+#   dhis2-db wal flush                        [--host HOST]
+#   dhis2-db wal checkpoint                   [--host HOST]
+#   dhis2-db wal emergency-drain --yes        [--host HOST]
+#   dhis2-db replication-slot list            [--host HOST] [--json]
+#   dhis2-db replication-slot drop NAME [--force] [--yes]
+#   dhis2-db replication-slot advance NAME --to LSN [--yes]
 #
 # All destructive queries (drop, vacuum full, terminate-session,
-# flyway repair/unlock/baseline) require explicit confirmation unless
-# --yes is supplied (section 33). Flyway repair never attempts
-# arbitrary SQL repairs - section 79.
+# flyway repair/unlock/baseline, wal emergency-drain, replication-slot
+# drop/advance) require explicit confirmation unless --yes is supplied
+# (section 33). Flyway repair never attempts arbitrary SQL repairs -
+# section 79. See docs/CLI-WAL-Operations.md for the WAL runbook.
 # USAGE_END
 set -Eeuo pipefail
 . "$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")/.." && pwd)/lib/common.sh"
@@ -122,6 +132,8 @@ main() {
         kill-grace) _kill_grace "$@" ;;
         analytics) _analytics_cmd "$@" ;;
         pg-version) _pg_version_json ;;
+        wal) _wal "$@" ;;
+        replication-slot|replication-slots|slot|slots) _replication_slot "$@" ;;
         --help|-h|help) dhis2_cli_show_help "$0"; exit 0 ;;
         *) dhis2_log_error "Unknown subcommand: $sub"; exit "$DHIS2_EXIT_USAGE" ;;
     esac
@@ -733,6 +745,209 @@ _pg_version_json() {
     else
         printf 'host:                %s\nserver_version_num:  %s\nmajor:               %s\n' "$DB_HOST" "${vn:-0}" "$major"
     fi
+}
+
+#
+# -------- WAL disk safety --------
+#
+# All subcommands read from pg_stat_wal / pg_stat_archiver /
+# pg_replication_slots. Destructive paths (emergency-drain, drop,
+# advance) require confirmation and write audit records.
+#
+# Usage:
+#   dhis2-db wal status                 [--json]
+#   dhis2-db wal archive-status         [--json]
+#   dhis2-db wal retention              (why is WAL being kept?)
+#   dhis2-db wal flush                  (CHECKPOINT + archive flush)
+#   dhis2-db wal checkpoint             (plain CHECKPOINT)
+#   dhis2-db wal emergency-drain --yes  (BREAK GLASS - loses recent archive history)
+#
+_wal() {
+    local sub="${1:-}"; shift || true
+    case "$sub" in
+        status) _wal_status ;;
+        archive-status) _wal_archive_status ;;
+        retention) _wal_retention ;;
+        flush) _wal_flush ;;
+        checkpoint) _wal_checkpoint ;;
+        emergency-drain) _wal_emergency_drain "$@" ;;
+        --help|-h|help)
+            awk '/^# -------- WAL disk safety/,/^#$/' "$0" | sed 's/^# \{0,1\}//'
+            exit 0
+            ;;
+        *) dhis2_log_error "Unknown wal subcommand: $sub"; exit "$DHIS2_EXIT_USAGE" ;;
+    esac
+}
+
+_wal_pg_q() {
+    local sql="$1"
+    dhis2_ansible_adhoc "$DB_HOST" shell -a "sudo -u postgres psql -X -tAc \"$sql\"" -b -o 2>&1 | tail -1 | awk '{print $NF}'
+}
+
+_wal_status() {
+    local size wal_count free_pct archive_lag oldest_segment data_dir
+    data_dir=$(_wal_pg_q "SHOW data_directory")
+    size=$(dhis2_ansible_adhoc "$DB_HOST" shell -a "du -sb '${data_dir:-/var/lib/postgresql}'/pg_wal 2>/dev/null | awk '{print \$1}'" -b -o 2>&1 | tail -1 | awk '{print $NF}')
+    wal_count=$(dhis2_ansible_adhoc "$DB_HOST" shell -a "ls '${data_dir:-/var/lib/postgresql}'/pg_wal 2>/dev/null | grep -cE '^[0-9A-F]{24}$'" -b -o 2>&1 | tail -1 | awk '{print $NF}')
+    free_pct=$(dhis2_ansible_adhoc "$DB_HOST" shell -a "df --output=pcent '${data_dir:-/var/lib/postgresql}'/pg_wal 2>/dev/null | tail -1 | tr -dc '0-9'" -b -o 2>&1 | tail -1 | awk '{print $NF}')
+    archive_lag=$(_wal_pg_q "SELECT coalesce(extract(epoch from (now() - last_archived_time))::int, -1) FROM pg_stat_archiver")
+    oldest_segment=$(dhis2_ansible_adhoc "$DB_HOST" shell -a "ls -t '${data_dir:-/var/lib/postgresql}'/pg_wal 2>/dev/null | grep -E '^[0-9A-F]{24}$' | tail -1" -b -o 2>&1 | tail -1 | awk '{print $NF}')
+    local size_h; size_h=$(numfmt --to=iec --suffix=B "${size:-0}" 2>/dev/null || echo "${size:-?}")
+    if [[ "$DHIS2_OPT_JSON" == true ]]; then
+        dhis2_json_emit command=dhis2-db-wal action=status host="$DB_HOST" bytes="${size:-0}" wal_segments="${wal_count:-0}" filesystem_used_pct="${free_pct:-0}" archive_lag_seconds="${archive_lag:-null}" oldest_segment="${oldest_segment:-null}"
+    else
+        printf 'host:                    %s\n' "$DB_HOST"
+        printf 'pg_wal size:             %s (%s bytes)\n' "$size_h" "${size:-?}"
+        printf 'pg_wal segment count:    %s\n' "${wal_count:-?}"
+        printf 'filesystem used:         %s%%\n' "${free_pct:-?}"
+        printf 'archive lag (seconds):   %s\n' "${archive_lag:--1 (archive_mode=off)}"
+        printf 'oldest segment on disk:  %s\n' "${oldest_segment:-<none>}"
+    fi
+    # Non-zero exit when the filesystem is >=90% full
+    [[ -n "$free_pct" && "$free_pct" -ge 90 ]] && exit "$DHIS2_EXIT_HEALTH"
+    return 0
+}
+
+_wal_archive_status() {
+    dhis2_ansible_adhoc "$DB_HOST" shell -a "sudo -u postgres psql -X -c \"
+        SELECT archived_count,
+               last_archived_wal,
+               last_archived_time,
+               failed_count,
+               last_failed_wal,
+               last_failed_time,
+               extract(epoch from (now() - last_archived_time))::int AS seconds_since_last_archive
+        FROM pg_stat_archiver;
+    \"" -b -o | dhis2_log_redact
+    dhis2_log_info "If failed_count > 0, inspect postgresql logs for the exact archive_command error:"
+    dhis2_log_info "  dhis2-logs postgres --grep archive_command --lines 200"
+}
+
+_wal_retention() {
+    dhis2_c_bold "WAL retention reasons on $DB_HOST"; echo
+
+    # Replication slots pinning WAL
+    dhis2_c_bold "replication slots:"; echo
+    dhis2_ansible_adhoc "$DB_HOST" shell -a "sudo -u postgres psql -X -c \"
+        SELECT slot_name, slot_type, active,
+               pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) AS retained_wal,
+               database
+        FROM pg_replication_slots ORDER BY pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn) DESC NULLS LAST
+    \"" -b -o | dhis2_log_redact
+
+    # wal_keep_size
+    dhis2_c_bold "wal_keep_size:"; echo
+    dhis2_ansible_adhoc "$DB_HOST" shell -a "sudo -u postgres psql -X -c \"
+        SELECT name, setting, unit FROM pg_settings WHERE name IN ('wal_keep_size','max_wal_size','min_wal_size','checkpoint_timeout','archive_mode','archive_command')
+    \"" -b -o | dhis2_log_redact
+
+    # Long transactions
+    dhis2_c_bold "long transactions that pin WAL:"; echo
+    dhis2_ansible_adhoc "$DB_HOST" shell -a "sudo -u postgres psql -X -c \"
+        SELECT pid, usename, state, now()-xact_start AS xact_age, left(query, 80) AS query
+        FROM pg_stat_activity
+        WHERE xact_start IS NOT NULL AND now()-xact_start > interval '15 minutes'
+        ORDER BY xact_start
+    \"" -b -o | dhis2_log_redact
+
+    dhis2_log_info "Next actions:"
+    dhis2_log_info "  Orphan slot:      dhis2-db replication-slot drop NAME"
+    dhis2_log_info "  Archive failing:  dhis2-db wal archive-status"
+    dhis2_log_info "  Long transaction: dhis2-db kill-grace PID --grace-seconds 30 --yes"
+}
+
+_wal_flush() {
+    dhis2_log_info "Running CHECKPOINT and requesting archive flush"
+    dhis2_ansible_adhoc "$DB_HOST" shell -a "sudo -u postgres psql -X -c 'CHECKPOINT; SELECT pg_switch_wal();'" -b -o
+    dhis2_log_info "A WAL switch forces the current segment to be archived on the next poll."
+}
+
+_wal_checkpoint() {
+    dhis2_ansible_adhoc "$DB_HOST" shell -a "sudo -u postgres psql -X -c 'CHECKPOINT'" -b -o
+}
+
+_wal_emergency_drain() {
+    dhis2_cli_confirm "EMERGENCY DRAIN on $DB_HOST. This temporarily sets archive_command=/bin/true for 30 seconds so WAL can be reclaimed when the archive is unreachable. WAL generated during the drain window will NOT be archived - PITR history is lost from this point until a fresh base backup is taken. Proceed only when the data filesystem is near-full AND the archive is confirmed unreachable." "$DB_HOST"
+    dhis2_log_audit dhis2-db-wal "{\"action\":\"emergency-drain\",\"host\":\"$DB_HOST\",\"user\":\"${USER:-cli}\"}" "started"
+    dhis2_ansible_adhoc "$DB_HOST" shell -a "
+        set -e
+        prev=\$(sudo -u postgres psql -X -tAc \"SHOW archive_command\")
+        echo prev_archive_command=\"\$prev\"
+        sudo -u postgres psql -X -c \"ALTER SYSTEM SET archive_command = '/bin/true'; SELECT pg_reload_conf()\"
+        sleep 30
+        sudo -u postgres psql -X -c \"ALTER SYSTEM RESET archive_command; SELECT pg_reload_conf()\"
+        echo restored
+    " -b -o | dhis2_log_redact
+    dhis2_log_warn "ACTION REQUIRED after this drain:"
+    dhis2_log_warn "  1. Fix the archive destination (dhis2-db wal archive-status)."
+    dhis2_log_warn "  2. Take a fresh base backup to re-seed PITR:"
+    dhis2_log_warn "       dhis2-backup create INSTANCE --format custom --encrypt gpg --recipient ..."
+    dhis2_log_warn "  3. Confirm archive is healthy again:"
+    dhis2_log_warn "       dhis2-doctor wal"
+    dhis2_log_audit dhis2-db-wal "{\"action\":\"emergency-drain\",\"host\":\"$DB_HOST\"}" "done"
+}
+
+#
+# -------- Replication slot lifecycle --------
+#
+# Usage:
+#   dhis2-db replication-slot list                   [--json]
+#   dhis2-db replication-slot drop NAME [--force] [--yes]
+#   dhis2-db replication-slot advance NAME --to LSN [--yes]
+#
+_replication_slot() {
+    local sub="${1:-list}"; shift || true
+    case "$sub" in
+        list) _slot_list ;;
+        drop) _slot_drop "$@" ;;
+        advance) _slot_advance "$@" ;;
+        --help|-h|help)
+            awk '/^# -------- Replication slot lifecycle/,/^#$/' "$0" | sed 's/^# \{0,1\}//'
+            exit 0
+            ;;
+        *) dhis2_log_error "Unknown replication-slot subcommand: $sub"; exit "$DHIS2_EXIT_USAGE" ;;
+    esac
+}
+
+_slot_list() {
+    dhis2_ansible_adhoc "$DB_HOST" shell -a "sudo -u postgres psql -X -c \"
+        SELECT slot_name,
+               slot_type,
+               database,
+               active,
+               active_pid,
+               pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) AS retained_wal,
+               confirmed_flush_lsn
+          FROM pg_replication_slots
+         ORDER BY pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn) DESC NULLS LAST
+    \"" -b -o | dhis2_log_redact
+}
+
+_slot_drop() {
+    local name="${1:-}"; shift || true
+    local force=false
+    while (( $# )); do case "$1" in --force) force=true ;; esac; shift || true; done
+    [[ -z "$name" ]] && { dhis2_log_error 'Usage: dhis2-db replication-slot drop NAME [--force]'; exit "$DHIS2_EXIT_USAGE"; }
+    # Refuse to drop an active slot unless --force is passed.
+    local active
+    active=$(_wal_pg_q "SELECT active FROM pg_replication_slots WHERE slot_name='$name'")
+    if [[ "$active" == "t" && "$force" != "true" ]]; then
+        dhis2_log_error "Slot '$name' is ACTIVE (live consumer). Pass --force if you are certain the consumer is gone."
+        exit "$DHIS2_EXIT_SAFETY"
+    fi
+    dhis2_cli_confirm "Drop replication slot '$name' on $DB_HOST? Retained WAL will be released." "$name"
+    dhis2_ansible_adhoc "$DB_HOST" shell -a "sudo -u postgres psql -X -c \"SELECT pg_drop_replication_slot('$name')\"" -b -o
+    dhis2_log_audit dhis2-db "{\"action\":\"replication-slot-drop\",\"host\":\"$DB_HOST\",\"slot\":\"$name\",\"forced\":$force}" "ok"
+}
+
+_slot_advance() {
+    local name="${1:-}"; shift || true
+    local lsn=""
+    while (( $# )); do case "$1" in --to) lsn="$2"; shift ;; --to=*) lsn="${1#*=}" ;; esac; shift || true; done
+    [[ -z "$name" || -z "$lsn" ]] && { dhis2_log_error 'Usage: dhis2-db replication-slot advance NAME --to LSN'; exit "$DHIS2_EXIT_USAGE"; }
+    dhis2_cli_confirm "Advance slot '$name' to LSN $lsn WITHOUT the consumer's acknowledgement? WAL between the old and new positions becomes irretrievable to the consumer." "$name"
+    dhis2_ansible_adhoc "$DB_HOST" shell -a "sudo -u postgres psql -X -c \"SELECT pg_replication_slot_advance('$name', '$lsn')\"" -b -o
+    dhis2_log_audit dhis2-db "{\"action\":\"replication-slot-advance\",\"host\":\"$DB_HOST\",\"slot\":\"$name\",\"to_lsn\":\"$lsn\"}" "ok"
 }
 
 main "$@"

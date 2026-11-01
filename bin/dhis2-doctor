@@ -22,6 +22,9 @@
 #   dhis2-doctor bundle --out PATH            (shortcut for dhis2-logs bundle)
 #   dhis2-doctor fix [--yes]                  (low-risk auto-corrections)
 #   dhis2-doctor --fix                        (same)
+#   dhis2-doctor wal                          (pg_wal size, archive lag,
+#                                              replication slot retention,
+#                                              long transactions)
 #
 # All checks are read-only unless --fix is passed; only well-understood
 # low-risk fixes are applied with --fix (section 23.2):
@@ -48,14 +51,15 @@ main() {
             --quick) scope=quick ;;
             --full) scope=full ;;
             --fix|fix) scope="fix" ;;
-            network|database|proxy|memory|config|storage|services|tls|backup|upgrade-readiness|snapshot|compare|bundle|instance) scope="$1"; shift || true; extra_arg="${1:-}" ;;
+            network|database|proxy|memory|config|storage|services|tls|backup|upgrade-readiness|snapshot|compare|bundle|instance|wal) scope="$1"; shift || true; extra_arg="${1:-}" ;;
             --help|-h|help) dhis2_cli_show_help "$0"; exit 0 ;;
         esac
     fi
     case "$scope" in
         fix) _fix; return ;;
         quick) _controller; _inventory_check ;;
-        full|all) _controller; _inventory_check; _network; _services; _database; _proxy; _memory; _tls; _backup; _config ;;
+        full|all) _controller; _inventory_check; _network; _services; _database; _wal; _proxy; _memory; _tls; _backup; _config ;;
+        wal) _wal ;;
         network) _network ;;
         database) _database ;;
         proxy) _proxy ;;
@@ -293,6 +297,83 @@ _compare() {
     local a="$1" b="$2"
     [[ -z "$a" || -z "$b" ]] && { dhis2_log_error "Usage: dhis2-doctor compare SNAP_A SNAP_B"; exit "$DHIS2_EXIT_USAGE"; }
     diff -ruN "$a" "$b" | dhis2_log_redact
+}
+
+#
+# dhis2-doctor wal - WAL disk-safety cross-check.
+#
+# Checks and thresholds (section wal-disk-safety-plan 2.2):
+#   pg_wal filesystem used %        >= 90%  FAIL   >= 75%  warn
+#   archive lag (seconds)           >= 900  FAIL   >= 300  warn
+#   pg_stat_archiver.failed_count   > 0     warn
+#   per-slot retained_wal_bytes     >= 1 GiB warn   >= 10 GiB FAIL
+#   idle_in_transaction age         >= 1 h  warn
+#
+_wal() {
+    dhis2_c_bold "WAL disk-safety"; echo
+    local h; h=$(dhis2_inventory_group_hosts databases | head -1)
+    if [[ -z "$h" ]]; then
+        _record_warn "no [databases] host - WAL checks skipped"
+        return
+    fi
+    local psql="sudo -u postgres psql -X -tAc"
+
+    # Filesystem use
+    local used_pct
+    used_pct=$(dhis2_ansible_adhoc "$h" shell -a "df --output=pcent \$(sudo -u postgres psql -X -tAc 'SHOW data_directory')/pg_wal 2>/dev/null | tail -1 | tr -dc '0-9'" -b -o 2>&1 | tail -1 | awk '{print $NF}')
+    if [[ -n "$used_pct" ]]; then
+        if (( used_pct >= 90 )); then _record_fail "pg_wal filesystem ${used_pct}% full"
+        elif (( used_pct >= 75 )); then _record_warn "pg_wal filesystem ${used_pct}% full"
+        else _record_ok "pg_wal filesystem ${used_pct}% full"
+        fi
+    fi
+
+    # Archive status
+    local arch_lag arch_failed
+    arch_lag=$(dhis2_ansible_adhoc "$h" shell -a "$psql \"SELECT coalesce(extract(epoch from (now() - last_archived_time))::int, -1) FROM pg_stat_archiver\"" -b -o 2>&1 | tail -1 | awk '{print $NF}')
+    arch_failed=$(dhis2_ansible_adhoc "$h" shell -a "$psql \"SELECT failed_count FROM pg_stat_archiver\"" -b -o 2>&1 | tail -1 | awk '{print $NF}')
+    if [[ "$arch_lag" == "-1" ]]; then
+        _record_ok "archive_mode is off (nothing to archive)"
+    else
+        if (( arch_lag >= 900 )); then _record_fail "archive lag ${arch_lag}s (threshold 900s)"
+        elif (( arch_lag >= 300 )); then _record_warn "archive lag ${arch_lag}s (threshold 300s)"
+        else _record_ok "archive lag ${arch_lag}s"
+        fi
+    fi
+    if [[ -n "$arch_failed" && "$arch_failed" != "0" ]]; then
+        _record_warn "pg_stat_archiver.failed_count=$arch_failed - inspect postgres logs"
+    fi
+
+    # Replication slots pinning WAL
+    local slot_offenders
+    slot_offenders=$(dhis2_ansible_adhoc "$h" shell -a "$psql \"
+        SELECT slot_name || ':' || pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)::bigint
+          FROM pg_replication_slots
+         WHERE pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn) > 1073741824
+         ORDER BY pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn) DESC
+    \"" -b -o 2>&1 | tail -n +2 | sed '/^$/d')
+    if [[ -z "$slot_offenders" ]]; then
+        _record_ok "no replication slot retains more than 1 GiB of WAL"
+    else
+        local s
+        while IFS= read -r s; do
+            [[ -z "$s" ]] && continue
+            local slot="${s%%:*}" bytes="${s##*:}"
+            if (( bytes >= 10737418240 )); then _record_fail "slot $slot retains $(( bytes / 1073741824 )) GiB of WAL - run 'dhis2-db replication-slot drop $slot' if the consumer is gone"
+            else _record_warn "slot $slot retains $(( bytes / 1073741824 )) GiB of WAL"
+            fi
+        done <<< "$slot_offenders"
+    fi
+
+    # Long transactions pinning WAL
+    local long_tx
+    long_tx=$(dhis2_ansible_adhoc "$h" shell -a "$psql \"
+        SELECT count(*) FROM pg_stat_activity
+         WHERE xact_start IS NOT NULL AND now()-xact_start > interval '1 hour'
+    \"" -b -o 2>&1 | tail -1 | awk '{print $NF}')
+    if [[ -n "$long_tx" && "$long_tx" != "0" ]]; then
+        _record_warn "$long_tx transaction(s) open > 1h may pin WAL - 'dhis2-db long-running'"
+    fi
 }
 
 #
