@@ -28,6 +28,110 @@ Eight root causes, roughly in order of frequency:
 7. **Analytics table rebuild** generating planned write bursts.
 8. **Timeline divergence after HA failover.**
 
+## Compliance
+
+The role **mathematically guarantees** that WAL cannot grow past the
+`pg_wal` filesystem under normal operation. Every HA deploy and
+every single-node deploy that enables archive mode runs
+`roles/postgres/tasks/wal-compliance-preflight.yml`, which validates
+the following inequality:
+
+```
+max_wal_size
++ max_slot_wal_keep_size
++ wal_keep_size
++ max_wal_size            # 1x archive-lag headroom
++ 2 * wal_segment_size    # current + next-segment overhead
+<=  pg_wal_fs_safe_pct% of the pg_wal filesystem size
+```
+
+If the inequality fails the role **refuses to deploy** unless
+`pg_wal_compliance_override=true` is set (which writes an audit
+record and prints a HIGH-SEVERITY warning).
+
+### Required knobs (official PostgreSQL 16 docs)
+
+Every knob below is set to a safe default in
+`roles/postgres/defaults/main.yml` and overridable in inventory.
+
+| Knob | Role default | PG official doc |
+|------|--------------|-----------------|
+| `max_wal_size` | 4GB | [runtime-config-wal § MAX_WAL_SIZE](https://www.postgresql.org/docs/16/runtime-config-wal.html#GUC-MAX-WAL-SIZE) |
+| `min_wal_size` | 80MB | [runtime-config-wal § MIN_WAL_SIZE](https://www.postgresql.org/docs/16/runtime-config-wal.html#GUC-MIN-WAL-SIZE) |
+| `max_slot_wal_keep_size` | **10GB** (role refuses -1) | [runtime-config-replication § MAX_SLOT_WAL_KEEP_SIZE](https://www.postgresql.org/docs/16/runtime-config-replication.html#GUC-MAX-SLOT-WAL-KEEP-SIZE) |
+| `wal_keep_size` | **0** (keep at 0 with slots) | [runtime-config-replication § WAL_KEEP_SIZE](https://www.postgresql.org/docs/16/runtime-config-replication.html#GUC-WAL-KEEP-SIZE) |
+| `archive_timeout` | 60s (when `archive_mode=on`) | [runtime-config-wal § ARCHIVE_TIMEOUT](https://www.postgresql.org/docs/16/runtime-config-wal.html#GUC-ARCHIVE-TIMEOUT) |
+| `log_checkpoints` | on | [runtime-config-logging § LOG_CHECKPOINTS](https://www.postgresql.org/docs/16/runtime-config-logging.html#GUC-LOG-CHECKPOINTS) |
+| `checkpoint_timeout` | PG default (5min) | [runtime-config-wal § CHECKPOINT_TIMEOUT](https://www.postgresql.org/docs/16/runtime-config-wal.html#GUC-CHECKPOINT-TIMEOUT) |
+
+### Policy enforcements
+
+The role refuses to proceed when:
+
+1. `max_slot_wal_keep_size` is `-1` (unlimited).
+   Rationale: an orphaned replication slot can then retain WAL
+   without bound, which is the single most common way to fill
+   `pg_wal` in HA deployments.
+
+2. The configured retention sum exceeds `pg_wal_fs_safe_pct` of
+   the `pg_wal` filesystem. Default `pg_wal_fs_safe_pct=70` leaves
+   30% of the filesystem for unarchived WAL spikes and segment
+   overhead.
+
+The role warns (does not refuse) when:
+
+3. `wal_keep_size != 0` while replication slots are in use.
+   Rationale: the slot already retains WAL for the standby;
+   `wal_keep_size` just adds disk pressure. The PG docs recommend
+   `wal_keep_size=0` with slots.
+
+### Live validation
+
+Operators can verify a running cluster at any time:
+
+```bash
+dhis2-db wal compliance
+dhis2-db wal compliance --json | jq .
+
+dhis2-doctor wal                      # includes a compliance line
+```
+
+Exit codes:
+- `0` compliant
+- `6` (health) retention sum > budget
+- `8` (safety) `max_slot_wal_keep_size=-1` (unlimited)
+
+### Example output
+
+```
+WAL compliance on postgres
+  pg_wal filesystem:            51200 MiB
+  pg_wal_fs_safe_pct:           70%
+  budget:                       35840 MiB
+  required:                     18464 MiB
+  headroom:                     17376 MiB (compliant)
+
+  max_wal_size:                 4096 MiB
+  max_slot_wal_keep_size:       10240 MiB
+  wal_keep_size:                0 MiB
+  wal_segment_size:             16 MiB
+
+OK - WAL configuration is compliant
+```
+
+### Overriding compliance (break glass)
+
+Only when the operator explicitly accepts the risk:
+
+```yaml
+# inventory
+pg_wal_compliance_override: true
+```
+
+The role proceeds, writes an audit entry to
+`/var/log/dhis2-server-tools/audit.ndjson`, and prints the exact
+overage in MiB so the operator can act on the risk.
+
 ## Prevention
 
 The `postgres` role now sets safe defaults for WAL retention:

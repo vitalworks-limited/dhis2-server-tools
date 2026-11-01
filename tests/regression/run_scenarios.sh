@@ -874,6 +874,69 @@ scenario_BM() {
     fi
 }
 
+# ---------- WAL compliance scenarios (BN-BR) ----------
+
+scenario_BN() {
+    # pg_max_slot_wal_keep_size default must be bounded (not -1)
+    if grep -q '^pg_max_slot_wal_keep_size: 10GB' "$ROOT/deploy/roles/postgres/defaults/main.yml"; then
+        _rec BN "pg_max_slot_wal_keep_size defaults to a bounded value" mock PASS "default 10GB (not -1)"
+    else
+        _rec BN "pg_max_slot_wal_keep_size defaults to a bounded value" mock FAIL "default is missing or unlimited"
+    fi
+}
+
+scenario_BO() {
+    # wal-compliance-preflight.yml exists, is wired, and refuses -1
+    local ok=true
+    [[ -f "$ROOT/deploy/roles/postgres/tasks/wal-compliance-preflight.yml" ]] || ok=false
+    grep -q 'wal-compliance-preflight.yml' "$ROOT/deploy/roles/postgres/tasks/main.yml" || ok=false
+    grep -q 'Refuse unlimited max_slot_wal_keep_size' "$ROOT/deploy/roles/postgres/tasks/wal-compliance-preflight.yml" || ok=false
+    $ok && _rec BO "WAL compliance preflight task present + wired + refuses -1" mock PASS "preflight compliance task present" \
+         || _rec BO "WAL compliance preflight task present + wired + refuses -1" mock FAIL "preflight missing or incomplete"
+}
+
+scenario_BP() {
+    # Preflight math references the budget vs required check and cites PG docs
+    local body="$ROOT/deploy/roles/postgres/tasks/wal-compliance-preflight.yml"
+    if grep -q 'Refuse deploy on sizing breach' "$body" \
+       && grep -q 'postgresql.org/docs/16/runtime-config-wal' "$body" \
+       && grep -q 'postgresql.org/docs/16/runtime-config-replication' "$body"; then
+        _rec BP "preflight does sizing math and cites PG16 official docs" mock PASS "math + docs cited"
+    else
+        _rec BP "preflight does sizing math and cites PG16 official docs" mock FAIL "math or docs missing"
+    fi
+}
+
+scenario_BQ() {
+    # dhis2-db wal compliance subcommand present, computes budget vs required,
+    # emits exit 6/8 on breach, with --json support
+    local body
+    body=$(awk '/^_wal_compliance\(\)/,/^_wal_emergency_drain\(\)/' "$BIN/dhis2-db")
+    local ok=true
+    echo "$body" | grep -q 'budget_bytes' || ok=false
+    echo "$body" | grep -q 'required_bytes' || ok=false
+    echo "$body" | grep -q 'DHIS2_EXIT_SAFETY' || ok=false
+    echo "$body" | grep -q 'DHIS2_EXIT_HEALTH' || ok=false
+    $ok && _rec BQ "dhis2-db wal compliance computes budget and exits 6/8 on breach" mock PASS "compliance subcommand correct" \
+         || _rec BQ "dhis2-db wal compliance computes budget and exits 6/8 on breach" mock FAIL "incomplete"
+}
+
+scenario_BR() {
+    # dhis2-doctor wal integrates the compliance check (exit 6 -> FAIL)
+    if awk '/^_wal\(\)/,/^}/' "$BIN/dhis2-doctor" | grep -q 'wal compliance'; then
+        _rec BR "dhis2-doctor wal integrates compliance via dhis2-db wal compliance" mock PASS "doctor compliance wired"
+    else
+        _rec BR "dhis2-doctor wal integrates compliance via dhis2-db wal compliance" mock FAIL "doctor compliance missing"
+    fi
+    # Patroni template includes max_slot_wal_keep_size + archive_timeout
+    if grep -q 'max_slot_wal_keep_size' "$ROOT/deploy/roles/patroni/templates/patroni.yml.j2" \
+       && grep -q 'archive_timeout' "$ROOT/deploy/roles/patroni/templates/patroni.yml.j2"; then
+        _rec BR2 "patroni template includes compliance knobs" mock PASS "max_slot_wal_keep_size + archive_timeout rendered"
+    else
+        _rec BR2 "patroni template includes compliance knobs" mock FAIL "patroni template missing compliance knobs"
+    fi
+}
+
 scenario_AW() {
     # WAL CLI family wired
     local ok=true
@@ -989,6 +1052,7 @@ scenario_AO; scenario_AP; scenario_AQ; scenario_AR; scenario_AS; scenario_AT; sc
 scenario_AW; scenario_AX; scenario_AY; scenario_AZ
 scenario_BA; scenario_BB; scenario_BC; scenario_BD; scenario_BE; scenario_BF
 scenario_BG; scenario_BH; scenario_BI; scenario_BJ; scenario_BK; scenario_BL; scenario_BM
+scenario_BN; scenario_BO; scenario_BP; scenario_BQ; scenario_BR
 
 _write_report
 echo

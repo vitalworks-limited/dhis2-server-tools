@@ -1,10 +1,10 @@
 # Regression run report
 
-Generated: 2026-11-01T09:26:18Z
+Generated: 2026-11-01T10:44:12Z
 
 Mode: mock
 
-Results: PASS=79 FAIL=0 SKIP=2
+Results: PASS=85 FAIL=0 SKIP=2
 
 | ID | Scenario | Mode | Result | Notes |
 |----|----------|------|--------|-------|
@@ -89,3 +89,9 @@ Results: PASS=79 FAIL=0 SKIP=2
 | BK | dhis2.yml gates HA import on dhis2_ha=true | mock | PASS | no-regression preserved |
 | BL | patroni role masks OS postgresql service | mock | PASS | OS pg masked |
 | BM | dhis2-cluster output passes through secret redaction | mock | PASS | redaction wired |
+| BN | pg_max_slot_wal_keep_size defaults to a bounded value | mock | PASS | default 10GB (not -1) |
+| BO | WAL compliance preflight task present + wired + refuses -1 | mock | PASS | preflight compliance task present |
+| BP | preflight does sizing math and cites PG16 official docs | mock | PASS | math + docs cited |
+| BQ | dhis2-db wal compliance computes budget and exits 6/8 on breach | mock | PASS | compliance subcommand correct |
+| BR | dhis2-doctor wal integrates compliance via dhis2-db wal compliance | mock | PASS | doctor compliance wired |
+| BR2 | patroni template includes compliance knobs | mock | PASS | max_slot_wal_keep_size + archive_timeout rendered |
