@@ -9,17 +9,89 @@ postgresql_extensions:
 
 #
 # WAL retention bounds and archive controls. See
-# docs/CLI-WAL-Operations.md and
-# docs/vital-enhancements/wal-disk-safety-plan.md.
+# docs/CLI-WAL-Operations.md section 'Compliance' for the sizing
+# formula and the official PostgreSQL doc URLs cited for every knob.
 #
-# Defaults match single-node PostgreSQL safe values; override per-host
-# or in [all:vars] for heavier write workloads or when continuous
-# archiving is in use.
+# Defaults are chosen to GUARANTEE that WAL cannot consume the
+# pg_wal filesystem under normal operation. The wal-compliance-
+# preflight.yml task runs on every HA deploy (and on single-node
+# deploys when continuous archiving is enabled) and refuses to
+# proceed if the configured retention sum could exceed
+# pg_wal_fs_safe_pct of the filesystem size.
 #
-pg_max_wal_size: 4GB            # soft target before aggressive checkpointing
-pg_min_wal_size: 80MB           # recycle floor
-# pg_checkpoint_timeout: 5min   # default; raise only with care
-# pg_wal_keep_size: 1GB         # usually leave unset; replication slots are safer
+
+# 1. max_wal_size - "The maximum size to let the WAL grow during
+#    automatic checkpoints" (PostgreSQL 16, runtime-config-wal).
+#    Soft limit; PG can exceed under sustained write pressure.
+pg_max_wal_size: 4GB
+
+# 2. min_wal_size - "As long as WAL disk usage stays below this
+#    setting, old WAL files are always recycled" (same source).
+pg_min_wal_size: 80MB
+
+# 3. max_slot_wal_keep_size (PG 13+) - "The maximum size of WAL
+#    files that replication slots are allowed to retain in the
+#    pg_wal directory at checkpoint time. If exceeded, slots become
+#    invalidated" (runtime-config-replication).
+#
+#    The project's compliance policy REFUSES the default -1
+#    (unlimited) and requires a bounded value. 10 GiB default is
+#    appropriate for small-to-medium deployments; raise for
+#    high-write workloads that also need long replica downtime
+#    tolerance. The preflight validates that this value fits in the
+#    pg_wal filesystem budget.
+pg_max_slot_wal_keep_size: 10GB
+
+# 4. wal_keep_size (PG 13+) - "The minimum size of past log file
+#    segments kept in the pg_wal directory, in case a standby
+#    server needs to fetch them for streaming replication"
+#    (runtime-config-replication). With physical replication slots
+#    (Patroni's default) this should stay at 0; the slot does the
+#    retention. Setting a non-zero value in a slot-based cluster
+#    only adds disk pressure.
+pg_wal_keep_size: 0
+
+# 5. checkpoint_timeout - "Maximum time between automatic WAL
+#    checkpoints" (runtime-config-wal). 5min is the PG default and
+#    recommended; raising it increases WAL retained between
+#    checkpoints.
+# pg_checkpoint_timeout: 5min
+
+# 6. log_checkpoints - "Causes checkpoints and restartpoints to be
+#    logged in the server log" (runtime-config-logging). Essential
+#    for diagnosing checkpoint-driven WAL pressure. Default on.
+pg_log_checkpoints: 'on'
+
+# 7. archive_timeout - "The server is forced to switch to a new
+#    WAL file every archive_timeout seconds" (runtime-config-wal).
+#    Default 0 (disabled). The project enables 60s when
+#    archive_mode=on so archive lag has a predictable upper bound.
+pg_archive_timeout: 60s
+
+# 8. wal_segment_size - usually left at the compile-time default
+#    of 16 MB. Only override after a careful initdb-time decision.
+# pg_wal_segment_size: 16MB
+
+#
+# Compliance thresholds. The preflight computes the maximum WAL
+# retention mathematically possible and checks it against the
+# pg_wal filesystem budget.
+#
+
+# Headroom factor applied to the filesystem size. 70% leaves 30%
+# for unarchived WAL spikes, segment overhead, and operator
+# comfort. Raise only after measuring.
+pg_wal_fs_safe_pct: 70
+
+# Explicit filesystem size override (bytes). When unset, the role
+# runs `stat -f` on the data_directory to determine the size.
+# Operators with pre-known dedicated pg_wal volumes may set this.
+# pg_wal_fs_bytes: 107374182400     # 100 GiB
+
+# Break-glass override: deploy even if the compliance math fails.
+# Default false. When true, the role prints a HIGH-SEVERITY warning
+# and writes an audit record documenting the override.
+pg_wal_compliance_override: false
 
 #
 # Continuous WAL archiving. Default OFF to match the existing single-

@@ -74,11 +74,17 @@ min_wal_size = 80MB
 {% if pg_checkpoint_timeout is defined and pg_checkpoint_timeout | regex_search('^\d+(min|s|h)$') %}
 checkpoint_timeout = {{ pg_checkpoint_timeout }}
 {% endif %}
-{% if pg_wal_keep_size is defined and pg_wal_keep_size | regex_search('^\d+(GB|MB|KB)$') %}
-# wal_keep_size pins WAL on disk for N bytes - overriding this is
-# usually a mistake unless you understand why.
-wal_keep_size = {{ pg_wal_keep_size }}
-{% endif %}
+# wal_keep_size - with replication slots this stays 0; the slot does
+# the retention. See PG16 runtime-config-replication.
+wal_keep_size = {{ pg_wal_keep_size | default(0) }}
+
+# max_slot_wal_keep_size - HARD cap on WAL that replication slots can
+# retain. Compliance: unlimited (-1) is refused by the preflight.
+# See PG16 runtime-config-replication.
+max_slot_wal_keep_size = {{ pg_max_slot_wal_keep_size | default('10GB') }}
+
+# log_checkpoints - essential for diagnosing WAL pressure.
+log_checkpoints = {{ pg_log_checkpoints | default('on') }}
 
 #
 # WAL archive. Default off (same as the current single-node
@@ -89,6 +95,10 @@ wal_keep_size = {{ pg_wal_keep_size }}
 {% if pg_archive_mode | default('off') == 'on' %}
 archive_mode = on
 archive_command = '{{ pg_archive_command }}'
+# archive_timeout bounds the archive lag - WAL is force-switched
+# every N seconds even if the segment is not full. See PG16
+# runtime-config-wal.
+archive_timeout = {{ pg_archive_timeout | default('60s') }}
 # wal_level >= replica is required when archive_mode=on
 wal_level = {{ pg_wal_level | default('replica') }}
 {% endif %}

@@ -53,10 +53,16 @@ bootstrap:
         hot_standby: 'on'
         max_wal_senders: 10
         max_replication_slots: 10
+        # Compliance (docs/CLI-WAL-Operations.md section 'Compliance'):
+        # max_slot_wal_keep_size must be bounded; wal_keep_size=0 with slots.
+        max_slot_wal_keep_size: {{ pg_max_slot_wal_keep_size | default('10GB') }}
+        wal_keep_size: {{ pg_wal_keep_size | default(0) }}
+        log_checkpoints: '{{ pg_log_checkpoints | default("on") }}'
         synchronous_commit: {{ 'on' if patroni_synchronous_mode | bool else 'off' }}
 {% if pg_archive_mode | default('off') == 'on' %}
         archive_mode: 'on'
         archive_command: "{{ pg_archive_command }}"
+        archive_timeout: {{ pg_archive_timeout | default('60s') }}
 {% endif %}
   initdb:
     - encoding: UTF8
