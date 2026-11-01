@@ -1,0 +1,47 @@
+#
+# etcd.conf.yml - managed by dhis2-server-tools / roles/etcd.
+# Do not edit by hand.
+#
+# This cluster backs Patroni's DCS. Changing initial-* fields on a
+# running cluster has no effect; etcd uses the on-disk raft state
+# instead. To add/remove members use `etcdctl member add|remove`.
+#
+
+name: {{ inventory_hostname }}
+data-dir: {{ etcd_data_dir }}
+wal-dir: {{ etcd_data_dir }}/wal
+snapshot-count: 10000
+log-level: {{ etcd_log_level }}
+
+# Listeners
+listen-peer-urls:   {{ 'https' if ha_etcd_tls else 'http' }}://0.0.0.0:{{ etcd_peer_port }}
+listen-client-urls: {{ 'https' if ha_etcd_tls else 'http' }}://0.0.0.0:{{ etcd_client_port }}
+
+# Advertise addresses (what peers / clients should use to reach us)
+initial-advertise-peer-urls: {{ 'https' if ha_etcd_tls else 'http' }}://{{ ansible_default_ipv4.address }}:{{ etcd_peer_port }}
+advertise-client-urls:       {{ 'https' if ha_etcd_tls else 'http' }}://{{ ansible_default_ipv4.address }}:{{ etcd_client_port }}
+
+# Cluster bootstrap. The initial-cluster string is identical on every
+# member and consulted only when a member has NO existing raft state.
+initial-cluster: {{ groups['etcd'] | map('extract', hostvars, 'inventory_hostname') | zip(groups['etcd'] | map('extract', hostvars) | map(attribute='ansible_default_ipv4') | map(attribute='address')) | map('join', '=' ~ ('https' if ha_etcd_tls else 'http') ~ '://') | map('regex_replace', '$', ':' ~ etcd_peer_port) | join(',') }}
+initial-cluster-token: {{ etcd_cluster_token }}
+initial-cluster-state: new
+
+# Quota + compaction so an unbounded DCS cannot wedge the cluster.
+quota-backend-bytes: {{ etcd_quota_backend_bytes }}
+auto-compaction-mode: {{ etcd_auto_compaction_mode }}
+auto-compaction-retention: "{{ etcd_auto_compaction_retention }}"
+
+{% if ha_etcd_tls %}
+# TLS - every peer/client connection is mutually authenticated.
+client-transport-security:
+  cert-file:        {{ etcd_conf_dir }}/pki/server.crt
+  key-file:         {{ etcd_conf_dir }}/pki/server.key
+  trusted-ca-file:  {{ etcd_conf_dir }}/pki/ca.crt
+  client-cert-auth: true
+peer-transport-security:
+  cert-file:        {{ etcd_conf_dir }}/pki/peer.crt
+  key-file:         {{ etcd_conf_dir }}/pki/peer.key
+  trusted-ca-file:  {{ etcd_conf_dir }}/pki/ca.crt
+  peer-client-cert-auth: true
+{% endif %}

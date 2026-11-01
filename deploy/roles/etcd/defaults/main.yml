@@ -1,0 +1,42 @@
+---
+# etcd role defaults.
+#
+# etcd is the DCS used by Patroni. Deploy 3 nodes minimum, one per
+# distinct physical_host. The role is invoked only when
+# dhis2_ha=true AND inventory has an [etcd] group.
+#
+# Section 15b of the HA plan requires a dedicated [etcd] group.
+
+etcd_version: "3.5.21"           # pinned; bumped deliberately per ADR
+etcd_user: etcd
+etcd_group: etcd
+etcd_data_dir: /var/lib/etcd
+etcd_conf_dir: /etc/etcd
+etcd_bin_dir: /usr/local/bin
+etcd_download_url: "https://github.com/etcd-io/etcd/releases/download/v{{ etcd_version }}/etcd-v{{ etcd_version }}-linux-amd64.tar.gz"
+
+# Cluster identity. Must be unique per environment to prevent
+# cross-cluster join accidents.
+etcd_cluster_token: "{{ ha_cluster_name | default('dhis2') }}-etcd"
+
+# Ports. 2379 = client; 2380 = peer. Firewall rules scope these to
+# the cluster members only.
+etcd_client_port: 2379
+etcd_peer_port: 2380
+
+# Disk quota - prevents an unbounded etcd DB from locking the DCS.
+# 8 GiB is comfortable for a Patroni-only workload.
+etcd_quota_backend_bytes: 8589934592
+etcd_auto_compaction_mode: periodic
+etcd_auto_compaction_retention: "24h"
+
+# TLS. Default OFF for Phase 1; Phase 4 (hardening) flips this to
+# required and the role refuses an insecure deploy.
+ha_etcd_tls: false
+# When ha_etcd_tls=true, these paths must exist on each etcd host:
+#   /etc/etcd/pki/ca.crt
+#   /etc/etcd/pki/server.crt /etc/etcd/pki/server.key
+#   /etc/etcd/pki/peer.crt /etc/etcd/pki/peer.key
+
+# Logger
+etcd_log_level: info

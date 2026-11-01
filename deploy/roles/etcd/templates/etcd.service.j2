@@ -1,0 +1,23 @@
+[Unit]
+Description=etcd key-value store (dhis2-server-tools HA DCS)
+Documentation=https://github.com/etcd-io/etcd
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+User={{ etcd_user }}
+Group={{ etcd_group }}
+ExecStart={{ etcd_bin_dir }}/etcd --config-file={{ etcd_conf_dir }}/etcd.conf.yml
+Restart=on-failure
+RestartSec=5s
+LimitNOFILE=65536
+# Harden
+NoNewPrivileges=yes
+ProtectHome=yes
+ProtectSystem=full
+PrivateTmp=yes
+ReadWritePaths={{ etcd_data_dir }} {{ etcd_conf_dir }}
+
+[Install]
+WantedBy=multi-user.target

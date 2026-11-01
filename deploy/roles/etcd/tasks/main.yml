@@ -1,0 +1,137 @@
+---
+#
+# etcd role - 3-node DCS for Patroni.
+#
+# Preconditions (checked by dhis2-deploy preflight when dhis2_ha=true):
+#   - 3 etcd members on 3 distinct physical_host values
+#   - time synced on every etcd host (Patroni DCS leases need it)
+#
+# This role is idempotent: on re-run it leaves an existing cluster
+# untouched, only reloads config and ensures service state.
+#
+
+- name: etcd | Create group
+  ansible.builtin.group:
+    name: "{{ etcd_group }}"
+    state: present
+    system: true
+
+- name: etcd | Create user
+  ansible.builtin.user:
+    name: "{{ etcd_user }}"
+    group: "{{ etcd_group }}"
+    system: true
+    shell: /usr/sbin/nologin
+    home: "{{ etcd_data_dir }}"
+    createhome: false
+
+- name: etcd | Create directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ etcd_user }}"
+    group: "{{ etcd_group }}"
+    mode: "0750"
+  loop:
+    - "{{ etcd_data_dir }}"
+    - "{{ etcd_conf_dir }}"
+    - "{{ etcd_conf_dir }}/pki"
+
+# Pick the official static binary. Using the OS package is tempting
+# but Ubuntu's etcd is often several minor versions behind what
+# Patroni requires. We pin a known-good version.
+- name: etcd | Check installed etcd version
+  ansible.builtin.command: "{{ etcd_bin_dir }}/etcd --version"
+  register: _etcd_installed_version
+  changed_when: false
+  failed_when: false
+
+- name: etcd | Download etcd release tarball
+  ansible.builtin.get_url:
+    url: "{{ etcd_download_url }}"
+    dest: "/tmp/etcd-v{{ etcd_version }}-linux-amd64.tar.gz"
+    mode: "0644"
+    timeout: 120
+  when: >
+    _etcd_installed_version.rc != 0
+    or (etcd_version not in (_etcd_installed_version.stdout | default('')))
+
+- name: etcd | Extract etcd binaries
+  ansible.builtin.unarchive:
+    src: "/tmp/etcd-v{{ etcd_version }}-linux-amd64.tar.gz"
+    dest: "/tmp"
+    remote_src: true
+    creates: "/tmp/etcd-v{{ etcd_version }}-linux-amd64/etcd"
+
+- name: etcd | Install etcd + etcdctl binaries
+  ansible.builtin.copy:
+    remote_src: true
+    src: "/tmp/etcd-v{{ etcd_version }}-linux-amd64/{{ item }}"
+    dest: "{{ etcd_bin_dir }}/{{ item }}"
+    mode: "0755"
+    owner: root
+    group: root
+  loop:
+    - etcd
+    - etcdctl
+    - etcdutl
+  notify: Restart etcd
+
+- name: etcd | Render etcd.conf.yml
+  ansible.builtin.template:
+    src: etcd.conf.yml.j2
+    dest: "{{ etcd_conf_dir }}/etcd.conf.yml"
+    owner: "{{ etcd_user }}"
+    group: "{{ etcd_group }}"
+    mode: "0640"
+  notify: Restart etcd
+
+- name: etcd | Install systemd unit
+  ansible.builtin.template:
+    src: etcd.service.j2
+    dest: /etc/systemd/system/etcd.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Reload systemd and restart etcd
+
+- name: etcd | Open firewall for cluster peers only
+  ansible.builtin.ufw:
+    rule: allow
+    port: "{{ item.0 }}"
+    proto: tcp
+    from_ip: "{{ hostvars[item.1]['ansible_host'] | default(item.1) }}"
+    comment: "etcd peer/{{ item.0 }} from {{ item.1 }}"
+  when: ansible_facts['os_family'] | default('') == 'Debian'
+  loop: "{{ [etcd_client_port, etcd_peer_port] | product(groups['etcd']) | list }}"
+  loop_control:
+    label: "{{ item.0 }} from {{ item.1 }}"
+
+- name: etcd | Ensure service is enabled and started
+  ansible.builtin.systemd:
+    name: etcd
+    state: started
+    enabled: true
+    daemon_reload: true
+
+- name: etcd | Wait for client port to be reachable
+  ansible.builtin.wait_for:
+    host: "127.0.0.1"
+    port: "{{ etcd_client_port }}"
+    timeout: 60
+
+- name: etcd | Query cluster health
+  ansible.builtin.command: >
+    {{ etcd_bin_dir }}/etcdctl
+    --endpoints=http://127.0.0.1:{{ etcd_client_port }}
+    endpoint health
+  register: _etcd_health
+  changed_when: false
+  failed_when: false
+  retries: 5
+  delay: 3
+  until: _etcd_health.rc == 0
+
+- name: etcd | Report cluster health
+  ansible.builtin.debug:
+    msg: "{{ _etcd_health.stdout }}"
