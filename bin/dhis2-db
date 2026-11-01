@@ -58,6 +58,7 @@
 #   dhis2-db wal flush                        [--host HOST]
 #   dhis2-db wal checkpoint                   [--host HOST]
 #   dhis2-db wal emergency-drain --yes        [--host HOST]
+#   dhis2-db wal compliance                   [--host HOST] [--json]
 #   dhis2-db replication-slot list            [--host HOST] [--json]
 #   dhis2-db replication-slot drop NAME [--force] [--yes]
 #   dhis2-db replication-slot advance NAME --to LSN [--yes]
@@ -771,6 +772,7 @@ _wal() {
         flush) _wal_flush ;;
         checkpoint) _wal_checkpoint ;;
         emergency-drain) _wal_emergency_drain "$@" ;;
+        compliance) _wal_compliance ;;
         --help|-h|help)
             awk '/^# -------- WAL disk safety/,/^#$/' "$0" | sed 's/^# \{0,1\}//'
             exit 0
@@ -864,6 +866,114 @@ _wal_flush() {
 
 _wal_checkpoint() {
     dhis2_ansible_adhoc "$DB_HOST" shell -a "sudo -u postgres psql -X -c 'CHECKPOINT'" -b -o
+}
+
+#
+# dhis2-db wal compliance - compute live WAL sizing budget vs the
+# pg_wal filesystem on $DB_HOST. Exits 6 (health) on breach, 8
+# (safety) on unlimited max_slot_wal_keep_size.
+#
+# This is the live-system counterpart to the role's
+# wal-compliance-preflight.yml. The role prevents a non-compliant
+# deployment from being applied in the first place; this command
+# lets operators verify compliance of a running cluster (useful
+# after a configuration drift or manual psql ALTER SYSTEM).
+#
+# References:
+#   https://www.postgresql.org/docs/16/runtime-config-wal.html
+#   https://www.postgresql.org/docs/16/runtime-config-replication.html
+#
+_wal_compliance() {
+    local out
+    out=$(dhis2_ansible_adhoc "$DB_HOST" shell -a "
+        set -eo pipefail
+        q(){ sudo -u postgres psql -X -tAc \"\$1\"; }
+        dd=\$(q 'SHOW data_directory')
+        mws=\$(q \"SELECT setting::bigint * (SELECT setting::bigint FROM pg_settings WHERE name='block_size') FROM pg_settings WHERE name='max_wal_size'\")
+        mins=\$(q \"SELECT setting::bigint * (SELECT setting::bigint FROM pg_settings WHERE name='block_size') FROM pg_settings WHERE name='min_wal_size'\")
+        mskeep=\$(q \"SELECT setting FROM pg_settings WHERE name='max_slot_wal_keep_size'\")
+        wkeep=\$(q \"SELECT setting::bigint * 1024 FROM pg_settings WHERE name='wal_keep_size'\")
+        seg=\$(q \"SELECT setting::bigint FROM pg_settings WHERE name='wal_segment_size'\")
+        fs=\$(stat -f -c '%s %b' \"\$dd/pg_wal\" 2>/dev/null)
+        bs=\$(echo \"\$fs\" | awk '{print \$1}')
+        bc=\$(echo \"\$fs\" | awk '{print \$2}')
+        fs_b=\$(( bs * bc ))
+        # max_slot_wal_keep_size is stored in units of 1 MB; -1 means
+        # unlimited (bytes value of -1 * 1MB = -1048576). We detect
+        # that in the Python below.
+        mskeep_b=\$(( mskeep * 1024 * 1024 ))
+        echo \"data_directory=\$dd\"
+        echo \"pg_wal_fs_bytes=\$fs_b\"
+        echo \"max_wal_size=\$mws\"
+        echo \"min_wal_size=\$mins\"
+        echo \"max_slot_wal_keep_size=\$mskeep_b\"
+        echo \"max_slot_wal_keep_size_mb=\$mskeep\"
+        echo \"wal_keep_size=\$wkeep\"
+        echo \"wal_segment_size=\$seg\"
+    " -b -o 2>&1 | tail -n +2)
+
+    # Parse the key=value lines into locals
+    local pg_wal_fs mws mskeep mskeep_mb wkeep seg
+    pg_wal_fs=$(echo "$out"  | awk -F= '/^pg_wal_fs_bytes=/      {print $2; exit}')
+    mws=$(echo "$out"        | awk -F= '/^max_wal_size=/         {print $2; exit}')
+    mskeep=$(echo "$out"     | awk -F= '/^max_slot_wal_keep_size=/ {print $2; exit}')
+    mskeep_mb=$(echo "$out"  | awk -F= '/^max_slot_wal_keep_size_mb=/ {print $2; exit}')
+    wkeep=$(echo "$out"      | awk -F= '/^wal_keep_size=/        {print $2; exit}')
+    seg=$(echo "$out"        | awk -F= '/^wal_segment_size=/     {print $2; exit}')
+
+    local pct="${DHIS2_PG_WAL_SAFE_PCT:-70}"
+    local budget required headroom
+    budget=$(( pg_wal_fs * pct / 100 ))
+    # Required = max_wal_size + max_slot_wal_keep + wal_keep + archive-lag(1x mws) + 2 segments
+    required=$(( mws + mskeep + wkeep + mws + 2 * seg ))
+    headroom=$(( budget - required ))
+
+    local unlimited=false
+    [[ "${mskeep_mb:-0}" == "-1" ]] && unlimited=true
+
+    local compliant=true
+    (( required > budget )) && compliant=false
+    $unlimited && compliant=false
+
+    if [[ "$DHIS2_OPT_JSON" == true ]]; then
+        local succ=true; $compliant || succ=false
+        dhis2_json_emit \
+            command=dhis2-db-wal action=compliance host="$DB_HOST" \
+            success="$succ" \
+            pg_wal_fs_bytes="$pg_wal_fs" \
+            budget_bytes="$budget" \
+            required_bytes="$required" \
+            headroom_bytes="$headroom" \
+            max_wal_size="$mws" \
+            max_slot_wal_keep_size="$mskeep" \
+            max_slot_wal_keep_size_unlimited="$unlimited" \
+            wal_keep_size="$wkeep" \
+            wal_segment_size="$seg"
+    else
+        dhis2_c_bold "WAL compliance on $DB_HOST"; echo
+        printf '  pg_wal filesystem:            %s MiB\n' "$(( pg_wal_fs / 1024 / 1024 ))"
+        printf '  pg_wal_fs_safe_pct:           %s%%\n' "$pct"
+        printf '  budget:                       %s MiB\n' "$(( budget / 1024 / 1024 ))"
+        printf '  required:                     %s MiB\n' "$(( required / 1024 / 1024 ))"
+        printf '  headroom:                     %s MiB (%s)\n' "$(( headroom / 1024 / 1024 ))" "$($compliant && echo compliant || echo BREACHED)"
+        echo
+        printf '  max_wal_size:                 %s MiB\n' "$(( mws / 1024 / 1024 ))"
+        printf '  max_slot_wal_keep_size:       %s%s\n' "$(( mskeep / 1024 / 1024 ))" " MiB$($unlimited && echo ' (-1 UNLIMITED - compliance refuses)' || true)"
+        printf '  wal_keep_size:                %s MiB\n' "$(( wkeep / 1024 / 1024 ))"
+        printf '  wal_segment_size:             %s MiB\n' "$(( seg / 1024 / 1024 ))"
+        echo
+        if $unlimited; then
+            dhis2_c_red "FAIL"; echo " - max_slot_wal_keep_size is -1 (unlimited)"
+            dhis2_log_info "  https://www.postgresql.org/docs/16/runtime-config-replication.html#GUC-MAX-SLOT-WAL-KEEP-SIZE"
+            exit "$DHIS2_EXIT_SAFETY"
+        fi
+        if ! $compliant; then
+            dhis2_c_red "FAIL"; echo " - WAL retention sum exceeds budget"
+            dhis2_log_info "  See docs/CLI-WAL-Operations.md section 'Compliance' for remediation."
+            exit "$DHIS2_EXIT_HEALTH"
+        fi
+        dhis2_status_ok "OK"; echo " - WAL configuration is compliant"
+    fi
 }
 
 _wal_emergency_drain() {

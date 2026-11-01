@@ -374,6 +374,16 @@ _wal() {
     if [[ -n "$long_tx" && "$long_tx" != "0" ]]; then
         _record_warn "$long_tx transaction(s) open > 1h may pin WAL - 'dhis2-db long-running'"
     fi
+
+    # Compliance: run `dhis2-db wal compliance` and surface its outcome
+    local comp_rc=0
+    "${DHIS2_CLI_ROOT}/bin/dhis2-db" wal compliance >/dev/null 2>&1 || comp_rc=$?
+    case "$comp_rc" in
+        0) _record_ok "WAL compliance: max_wal_size + slot + keep + headroom fits budget" ;;
+        6) _record_fail "WAL compliance: retention sum exceeds pg_wal filesystem budget - run 'dhis2-db wal compliance' for details" ;;
+        8) _record_fail "WAL compliance: max_slot_wal_keep_size is UNLIMITED (-1) - orphaned slot can fill pg_wal; set a bounded value" ;;
+        *) _record_warn "WAL compliance: 'dhis2-db wal compliance' exited $comp_rc" ;;
+    esac
 }
 
 #
