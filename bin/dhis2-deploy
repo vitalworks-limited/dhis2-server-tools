@@ -144,6 +144,64 @@ _preflight() {
         dhis2_validate_lxd_present || findings+=("lxd: not installed")
     fi
 
+    # HA cross-host rules (section 15b of the HA plan). Only fire when
+    # the inventory opts into HA. These are HARD failures, not warnings
+    # - 3 etcd on the same physical host is not real HA. The parsing
+    # reads the INI directly so it works on controllers without
+    # ansible-inventory available (installer-prepare path).
+    if grep -qE '^[[:space:]]*dhis2_ha[[:space:]]*=[[:space:]]*(true|yes|1|True)' "$inv"; then
+        local etcd_count etcd_distinct
+        # Rule 1: >=3 etcd members on 3 distinct physical_host
+        etcd_count=$(awk '
+            /^\[.*\]/ { section=substr($0,2,length($0)-2); next }
+            section=="etcd" && !/^#/ && NF>0 { c++ }
+            END { print c+0 }
+        ' "$inv")
+        etcd_distinct=$(awk '
+            /^\[.*\]/ { section=substr($0,2,length($0)-2); next }
+            section=="etcd" && !/^#/ && NF>0 {
+                for (i=1;i<=NF;i++) {
+                    if ($i ~ /^physical_host=/) {
+                        split($i,a,"="); print a[2]
+                    }
+                }
+            }
+        ' "$inv" | sort -u | grep -c '[^[:space:]]' || true)
+        if (( etcd_count < 3 )); then
+            findings+=("ha: [etcd] has $etcd_count member(s); 3 required (section 15b)")
+        elif (( etcd_distinct < 3 )); then
+            findings+=("ha: 3 etcd members must span 3 distinct physical_host (found $etcd_distinct; set the physical_host host var)")
+        fi
+
+        # Rule 2: primary + sync_standby on distinct physical_host
+        local primary_phys sync_phys
+        primary_phys=$(awk '
+            /^\[.*\]/ { section=substr($0,2,length($0)-2); next }
+            section=="databases" && !/^#/ && NF>0 {
+                is_primary=0; phys=""
+                for (i=1;i<=NF;i++) {
+                    if ($i == "ha_role=primary") is_primary=1
+                    if ($i ~ /^physical_host=/) { split($i,a,"="); phys=a[2] }
+                }
+                if (is_primary) print phys
+            }
+        ' "$inv" | head -1)
+        sync_phys=$(awk '
+            /^\[.*\]/ { section=substr($0,2,length($0)-2); next }
+            section=="databases" && !/^#/ && NF>0 {
+                is_sync=0; phys=""
+                for (i=1;i<=NF;i++) {
+                    if ($i == "ha_pg_sync_standby=true") is_sync=1
+                    if ($i ~ /^physical_host=/) { split($i,a,"="); phys=a[2] }
+                }
+                if (is_sync) print phys
+            }
+        ' "$inv" | head -1)
+        if [[ -n "$primary_phys" && -n "$sync_phys" && "$primary_phys" == "$sync_phys" ]]; then
+            findings+=("ha: primary and sync-replica share physical_host '$primary_phys' - no HA against host failure")
+        fi
+    fi
+
     # Section 11.3 additions: DNS, disk, RAM, CPU. All treated as warnings
     # rather than hard failures because they may be true positives in
     # transient conditions (DNS flap, mid-dump disk pressure, etc.) and
@@ -157,21 +215,31 @@ _preflight() {
         fi
     fi
     local disk_min_gb="${DHIS2_PREFLIGHT_DISK_MIN_GB:-10}"
-    local root_free_gb
-    root_free_gb=$(df -BG --output=avail / 2>/dev/null | tail -1 | tr -dc '0-9')
-    if [[ -n "$root_free_gb" && "$root_free_gb" -lt "$disk_min_gb" ]]; then
+    local root_free_gb=""
+    if df -BG --output=avail / >/dev/null 2>&1; then
+        root_free_gb=$(df -BG --output=avail / 2>/dev/null | tail -1 | tr -dc '0-9')
+    elif df -g / >/dev/null 2>&1; then
+        # macOS / BSD fallback
+        root_free_gb=$(df -g / 2>/dev/null | tail -1 | awk '{print $4}')
+    fi
+    if [[ -n "$root_free_gb" && "$root_free_gb" =~ ^[0-9]+$ ]] && (( root_free_gb < disk_min_gb )); then
         warnings+=("disk: controller / has ${root_free_gb}G free (threshold ${disk_min_gb}G)")
     fi
     local ram_min_mb="${DHIS2_PREFLIGHT_RAM_MIN_MB:-2048}"
-    local ram_mb
-    ram_mb=$(awk '/MemTotal:/ {printf "%d", $2/1024}' /proc/meminfo 2>/dev/null)
-    if [[ -n "$ram_mb" && "$ram_mb" -lt "$ram_min_mb" ]]; then
+    local ram_mb=""
+    if [[ -r /proc/meminfo ]]; then
+        ram_mb=$(awk '/MemTotal:/ {printf "%d", $2/1024}' /proc/meminfo 2>/dev/null)
+    elif command -v sysctl >/dev/null; then
+        local b; b=$(sysctl -n hw.memsize 2>/dev/null || echo 0)
+        ram_mb=$(( b / 1024 / 1024 ))
+    fi
+    if [[ -n "$ram_mb" && "$ram_mb" =~ ^[0-9]+$ ]] && (( ram_mb < ram_min_mb )); then
         warnings+=("memory: controller has ${ram_mb}MB total RAM (threshold ${ram_min_mb}MB)")
     fi
     local cpu_min="${DHIS2_PREFLIGHT_CPU_MIN:-2}"
-    local nproc
-    nproc=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 0)
-    if [[ -n "$nproc" && "$nproc" -lt "$cpu_min" ]]; then
+    local nproc=""
+    nproc=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo "")
+    if [[ -n "$nproc" && "$nproc" =~ ^[0-9]+$ ]] && (( nproc < cpu_min )); then
         warnings+=("cpu: controller has ${nproc} core(s) (threshold ${cpu_min})")
     fi
 
