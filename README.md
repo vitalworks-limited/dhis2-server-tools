@@ -685,6 +685,9 @@ the generated `tests/regression/last-run.md`.
 - [docs/vital-enhancements/gap-analysis-flyway-and-beyond.md](./docs/vital-enhancements/gap-analysis-flyway-and-beyond.md) — Flyway failure modes and the hardening they drove
 - [docs/vital-enhancements/wal-disk-safety-plan.md](./docs/vital-enhancements/wal-disk-safety-plan.md) — WAL disk-pressure defence-in-depth plan
 - [docs/vital-enhancements/ha-implementation-plan.md](./docs/vital-enhancements/ha-implementation-plan.md) — comprehensive HA deployment plan (Patroni, HAProxy, keepalived, LXD/SSH/hybrid topologies)
+- [docs/HA-Patroni.md](./docs/HA-Patroni.md) — HA Phase 1 operator guide (Patroni + etcd + HAProxy)
+- [docs/HA-Runbook-Failover.md](./docs/HA-Runbook-Failover.md) — HA failover runbook (8 scenarios)
+- [docs/vital-enhancements/ha-adr-01-dhis2-baseline.md](./docs/vital-enhancements/ha-adr-01-dhis2-baseline.md) through [ha-adr-08-rolling-upgrade-pause.md](./docs/vital-enhancements/ha-adr-08-rolling-upgrade-pause.md) — the 8 locked HA design decisions
 
 ---
 
