@@ -693,6 +693,62 @@ scenario_AU() {
     fi
 }
 
+scenario_AW() {
+    # WAL CLI family wired
+    local ok=true
+    grep -q "_wal_status" "$BIN/dhis2-db" || ok=false
+    grep -q "_wal_archive_status" "$BIN/dhis2-db" || ok=false
+    grep -q "_wal_retention" "$BIN/dhis2-db" || ok=false
+    grep -q "_wal_emergency_drain" "$BIN/dhis2-db" || ok=false
+    grep -q "_slot_drop" "$BIN/dhis2-db" || ok=false
+    $ok && _rec AW "dhis2-db wal + replication-slot families wired" mock PASS "all WAL subcommands present" \
+         || _rec AW "dhis2-db wal + replication-slot families wired" mock FAIL "missing WAL subcommand(s)"
+}
+
+scenario_AX() {
+    # Emergency drain + slot drop require --yes and write audit entries
+    local body
+    body=$(awk '/^_wal_emergency_drain\(\)/,/^}/' "$BIN/dhis2-db")
+    if echo "$body" | grep -q 'dhis2_cli_confirm' && echo "$body" | grep -q 'dhis2_log_audit'; then
+        _rec AX "emergency-drain is confirmation-gated + audited" mock PASS "safety wiring present"
+    else
+        _rec AX "emergency-drain is confirmation-gated + audited" mock FAIL "missing confirm or audit"
+    fi
+    body=$(awk '/^_slot_drop\(\)/,/^}/' "$BIN/dhis2-db")
+    if echo "$body" | grep -q 'Slot .* is ACTIVE' && echo "$body" | grep -q 'DHIS2_EXIT_SAFETY'; then
+        _rec AX2 "replication-slot drop refuses active slots without --force" mock PASS "active-slot guard present"
+    else
+        _rec AX2 "replication-slot drop refuses active slots without --force" mock FAIL "no active-slot guard"
+    fi
+}
+
+scenario_AY() {
+    # dhis2-doctor wal check
+    if grep -q "^_wal()" "$BIN/dhis2-doctor" \
+       && awk '/^_wal\(\)/,/^}/' "$BIN/dhis2-doctor" | grep -q "pg_wal filesystem" \
+       && awk '/^_wal\(\)/,/^}/' "$BIN/dhis2-doctor" | grep -q "replication slot"; then
+        _rec AY "dhis2-doctor wal cross-check present" mock PASS "doctor wal wired"
+    else
+        _rec AY "dhis2-doctor wal cross-check present" mock FAIL "doctor wal missing"
+    fi
+}
+
+scenario_AZ() {
+    # Role safeguards: max_wal_size default + archive-command preflight
+    if grep -q "max_wal_size = {{ pg_max_wal_size }}" "$ROOT/deploy/roles/postgres/templates/dhis-pg.conf.j2" \
+       && grep -q "max_wal_size = 4GB" "$ROOT/deploy/roles/postgres/templates/dhis-pg.conf.j2"; then
+        _rec AZ "postgres role has max_wal_size default" mock PASS "WAL retention bounded"
+    else
+        _rec AZ "postgres role has max_wal_size default" mock FAIL "no WAL bound default"
+    fi
+    if [[ -f "$ROOT/deploy/roles/postgres/tasks/wal-archive-preflight.yml" ]] \
+       && grep -q "wal-archive-preflight.yml" "$ROOT/deploy/roles/postgres/tasks/main.yml"; then
+        _rec AZ2 "archive-command preflight exists and is wired" mock PASS "preflight included"
+    else
+        _rec AZ2 "archive-command preflight exists and is wired" mock FAIL "preflight missing or not wired"
+    fi
+}
+
 scenario_AV() {
     # Gap 8: backup encryption (GPG) wired through create + verify + restore.
     # Use grep -z to allow multi-line matches since the gpg invocation
@@ -749,6 +805,7 @@ scenario_AA; scenario_AB; scenario_AC; scenario_AD; scenario_AE
 scenario_AF; scenario_AG; scenario_AH; scenario_AI; scenario_AJ; scenario_AK
 scenario_AL; scenario_AM; scenario_AN
 scenario_AO; scenario_AP; scenario_AQ; scenario_AR; scenario_AS; scenario_AT; scenario_AU; scenario_AV
+scenario_AW; scenario_AX; scenario_AY; scenario_AZ
 
 _write_report
 echo

@@ -1,10 +1,10 @@
 # Regression run report
 
-Generated: 2026-10-29T20:19:34Z
+Generated: 2026-11-01T07:38:37Z
 
 Mode: mock
 
-Results: PASS=60 FAIL=0 SKIP=2
+Results: PASS=66 FAIL=0 SKIP=2
 
 | ID | Scenario | Mode | Result | Notes |
 |----|----------|------|--------|-------|
@@ -70,3 +70,9 @@ Results: PASS=60 FAIL=0 SKIP=2
 | AV | dhis2-backup create supports --encrypt gpg --recipient | mock | PASS | encryption wired |
 | AV2 | dhis2-backup verify understands .gpg | mock | PASS | gpg verify branch present |
 | AV3 | dhis2-restore database decrypts .gpg transparently | mock | PASS | decrypt path present |
+| AW | dhis2-db wal + replication-slot families wired | mock | PASS | all WAL subcommands present |
+| AX | emergency-drain is confirmation-gated + audited | mock | PASS | safety wiring present |
+| AX2 | replication-slot drop refuses active slots without --force | mock | PASS | active-slot guard present |
+| AY | dhis2-doctor wal cross-check present | mock | PASS | doctor wal wired |
+| AZ | postgres role has max_wal_size default | mock | PASS | WAL retention bounded |
+| AZ2 | archive-command preflight exists and is wired | mock | PASS | preflight included |

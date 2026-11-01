@@ -636,6 +636,7 @@ the generated `tests/regression/last-run.md`.
 - [docs/CLI-Upgrades.md](./docs/CLI-Upgrades.md) — controlled upgrade workflow and database upgrade policy
 - [docs/CLI-Version-Pinning.md](./docs/CLI-Version-Pinning.md) — per-host DHIS2 patch pinning (strict vs lenient)
 - [docs/CLI-Flyway-Operations.md](./docs/CLI-Flyway-Operations.md) — Flyway inspection, failure recovery, baseline, upgrade preflight
+- [docs/CLI-WAL-Operations.md](./docs/CLI-WAL-Operations.md) — PostgreSQL WAL disk-safety: inspection, archive status, replication slots, emergency drain
 - [docs/CLI-Backup-Restore.md](./docs/CLI-Backup-Restore.md) — backup formats, GPG encryption, verify / test / restore, WAR integrity
 - [docs/CLI-Testing.md](./docs/CLI-Testing.md) — the three-tier test strategy
 - [docs/Migration-to-CLI.md](./docs/Migration-to-CLI.md) — equivalences between legacy commands and the CLI
@@ -682,6 +683,8 @@ the generated `tests/regression/last-run.md`.
 
 - [docs/vital-enhancements/dhis2-server-tools-implementation-requirements-regenerated.md](./docs/vital-enhancements/dhis2-server-tools-implementation-requirements-regenerated.md) — the implementation requirements that drove the CLI design
 - [docs/vital-enhancements/gap-analysis-flyway-and-beyond.md](./docs/vital-enhancements/gap-analysis-flyway-and-beyond.md) — Flyway failure modes and the hardening they drove
+- [docs/vital-enhancements/wal-disk-safety-plan.md](./docs/vital-enhancements/wal-disk-safety-plan.md) — WAL disk-pressure defence-in-depth plan
+- [docs/vital-enhancements/ha-implementation-plan.md](./docs/vital-enhancements/ha-implementation-plan.md) — comprehensive HA deployment plan (Patroni, HAProxy, keepalived, LXD/SSH/hybrid topologies)
 
 ---
 
