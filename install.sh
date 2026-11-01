@@ -51,6 +51,7 @@ commands=(
     dhis2-backup dhis2-restore dhis2-upgrade dhis2-proxy dhis2-tls
     dhis2-monitor dhis2-logs dhis2-doctor dhis2-security dhis2-vpn
     dhis2-doris dhis2-integration dhis2-vault dhis2-status
+    dhis2-cluster
 )
 
 if [[ "$ACTION" == uninstall ]]; then

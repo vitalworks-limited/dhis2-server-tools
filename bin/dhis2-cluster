@@ -1,0 +1,327 @@
+#!/usr/bin/env bash
+# USAGE_START
+# dhis2-cluster - Patroni HA cluster operations (HA Phase 1).
+#
+# Usage:
+#   dhis2-cluster status                              [--json]
+#   dhis2-cluster topology                            [--json]
+#   dhis2-cluster topology --check
+#   dhis2-cluster leader                              [--json]
+#   dhis2-cluster replicas                            [--json]
+#   dhis2-cluster lag                                 [--json]
+#   dhis2-cluster failover --to HOST [--yes]
+#   dhis2-cluster switchover --to HOST [--yes]
+#   dhis2-cluster reinit HOST [--yes]
+#   dhis2-cluster patroni-config show                 [--json]
+#   dhis2-cluster patroni-config edit
+#   dhis2-cluster etcd-health                         [--json]
+#   dhis2-cluster vip
+#   dhis2-cluster watch [--interval SECONDS]
+#   dhis2-cluster pause [--yes]
+#   dhis2-cluster resume [--yes]
+#
+# Reads use the Patroni REST API (/cluster, /leader, /replica).
+# Writes shell out to patronictl on the target host via Ansible.
+# All destructive paths (failover/switchover/reinit/pause/resume)
+# require explicit confirmation unless --yes is supplied (section 33).
+# Patroni REST credentials, if set, are redacted from all output.
+#
+# When dhis2_ha=false (default), every command exits 3 (preflight)
+# with a clear message. HA must be opted into via inventory.
+# USAGE_END
+set -Eeuo pipefail
+. "$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")/.." && pwd)/lib/common.sh"
+
+PATRONI_PORT="${DHIS2_PATRONI_REST_PORT:-8008}"
+
+main() {
+    dhis2_cli_parse_globals "$@"
+    set -- "${DHIS2_CLI_REMAINING[@]}"
+    [[ $# -eq 0 ]] && { dhis2_cli_show_help "$0"; exit "$DHIS2_EXIT_USAGE"; }
+    local sub="$1"; shift
+    _require_ha
+    case "$sub" in
+        status) _status ;;
+        topology) _topology "$@" ;;
+        leader) _leader ;;
+        replicas) _replicas ;;
+        lag) _lag ;;
+        failover) _failover "$@" ;;
+        switchover) _switchover "$@" ;;
+        reinit) _reinit "$@" ;;
+        patroni-config) _patroni_config "$@" ;;
+        etcd-health) _etcd_health ;;
+        vip) _vip ;;
+        watch) _watch "$@" ;;
+        pause) _pause ;;
+        resume) _resume ;;
+        --help|-h|help) dhis2_cli_show_help "$0"; exit 0 ;;
+        *) dhis2_log_error "Unknown subcommand: $sub"; exit "$DHIS2_EXIT_USAGE" ;;
+    esac
+}
+
+#
+# Opt-in guard: dhis2-cluster only works when dhis2_ha=true in the
+# inventory. We cheaply grep the inventory because this command runs
+# on the controller.
+#
+_require_ha() {
+    local inv; inv=$(dhis2_config_resolve_inventory)
+    if ! grep -qE '^[[:space:]]*dhis2_ha[[:space:]]*=[[:space:]]*(true|yes|1|True)' "$inv"; then
+        dhis2_log_error "HA is not enabled in this inventory (dhis2_ha!=true)."
+        dhis2_log_error "  See docs/HA-Patroni.md and docs/vital-enhancements/ha-implementation-plan.md"
+        exit "$DHIS2_EXIT_PREFLIGHT"
+    fi
+    if ! grep -q '^\[etcd\]' "$inv" 2>/dev/null; then
+        dhis2_log_error "HA requires an [etcd] inventory group (section 15b decision 3)."
+        exit "$DHIS2_EXIT_PREFLIGHT"
+    fi
+}
+
+# Pick any PG host for the REST API; the Patroni cluster is uniformly
+# addressable from any member.
+_pick_pg_host() {
+    local h
+    h=$(dhis2_inventory_group_hosts databases | head -1)
+    [[ -z "$h" ]] && { dhis2_log_error "No [databases] host in inventory"; exit "$DHIS2_EXIT_PREFLIGHT"; }
+    printf '%s' "$h"
+}
+
+# Query the Patroni REST API on a given host and strip any
+# auth-looking token in the response.
+_patroni_rest() {
+    local host="$1" path="$2"
+    dhis2_ansible_adhoc "$host" shell -a "curl -sSf -m 5 http://127.0.0.1:${PATRONI_PORT}${path}" -b -o 2>&1 | tail -n +2 | dhis2_log_redact
+}
+
+# Shell out to patronictl on a target host. Confirmation and audit
+# live in the caller.
+_patronictl() {
+    local host="$1"; shift
+    dhis2_ansible_adhoc "$host" shell -a "patronictl -c /etc/patroni/patroni.yml $*" -b -o 2>&1 | dhis2_log_redact
+}
+
+_status() {
+    local h; h=$(_pick_pg_host)
+    local json; json=$(_patroni_rest "$h" "/cluster" 2>&1 || true)
+    if [[ "$DHIS2_OPT_JSON" == true ]]; then
+        printf '%s\n' "$json"
+    else
+        dhis2_c_bold "Patroni cluster via $h"; echo
+        printf '%s\n' "$json" | python3 -c "
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+except Exception as e:
+    print('error parsing /cluster response:', e); sys.exit(1)
+members = d.get('members', [])
+print('scope:    ', d.get('scope', '?'))
+print('leader:   ', d.get('leader', '?'))
+print()
+rows = [('NAME','ROLE','STATE','LAG','HOST')]
+for m in members:
+    rows.append((m.get('name','?'), m.get('role','?'), m.get('state','?'), str(m.get('lag','?')), m.get('host','?')))
+w = [max(len(r[i]) for r in rows) for i in range(5)]
+for r in rows:
+    print('  '.join(c.ljust(w[i]) for i,c in enumerate(r)))
+"
+    fi
+}
+
+_topology() {
+    local do_check=false
+    for a in "$@"; do [[ "$a" == "--check" ]] && do_check=true; done
+    # Walk inventory, group by physical_host, enforce rules 1 & 2 from
+    # section 15b.
+    local inv; inv=$(dhis2_config_resolve_inventory)
+    local pg_hosts etcd_hosts
+    pg_hosts=$(dhis2_inventory_group_hosts databases)
+    etcd_hosts=$(dhis2_inventory_group_hosts etcd)
+    local errs=() rows=()
+    local h
+    for h in $etcd_hosts; do
+        local phys
+        phys=$(dhis2_inventory_host_vars_redacted "$h" 2>/dev/null | awk -F'[" ]+' '/"physical_host"/ {print $(NF-1); exit}')
+        rows+=("etcd|$h|${phys:-unset}")
+    done
+    for h in $pg_hosts; do
+        local phys role sync
+        phys=$(dhis2_inventory_host_vars_redacted "$h" 2>/dev/null | awk -F'[" ]+' '/"physical_host"/ {print $(NF-1); exit}')
+        role=$(dhis2_inventory_host_vars_redacted "$h" 2>/dev/null | awk -F'[" ]+' '/"ha_role"/ {print $(NF-1); exit}')
+        sync=$(dhis2_inventory_host_vars_redacted "$h" 2>/dev/null | awk -F'[" ]+' '/"ha_pg_sync_standby"/ {print $(NF-1); exit}')
+        rows+=("pg($role${sync:+,sync})|$h|${phys:-unset}")
+    done
+    if [[ "$DHIS2_OPT_JSON" == true ]]; then
+        local arr="[" first=true r
+        for r in "${rows[@]}"; do
+            local g rest hh pp
+            g="${r%%|*}"; rest="${r#*|}"; hh="${rest%%|*}"; pp="${rest##*|}"
+            $first || arr+=","; first=false
+            arr+="{\"group\":\"$g\",\"host\":\"$hh\",\"physical_host\":\"$pp\"}"
+        done
+        arr+="]"
+        dhis2_json_emit command=dhis2-cluster action=topology hosts="$arr"
+    else
+        dhis2_output_table "GROUP|HOST|PHYSICAL_HOST" "${rows[@]}"
+    fi
+    if $do_check; then
+        # Rule 1: 3 etcd on 3 distinct physical_host
+        local etcd_phys; etcd_phys=$(for h in $etcd_hosts; do dhis2_inventory_host_vars_redacted "$h" | awk -F'[" ]+' '/"physical_host"/ {print $(NF-1); exit}'; done | sort | uniq | wc -l | tr -d ' ')
+        local etcd_count; etcd_count=$(echo "$etcd_hosts" | grep -c '[^[:space:]]')
+        if (( etcd_count >= 3 && etcd_phys < 3 )); then
+            errs+=("rule 1: 3 etcd members must span 3 distinct physical_host (found $etcd_phys)")
+        fi
+        # Rule 2: sync-standby pair on distinct physical_host
+        local primary sync_rep
+        primary=""; sync_rep=""
+        for h in $pg_hosts; do
+            local role sync
+            role=$(dhis2_inventory_host_vars_redacted "$h" | awk -F'[" ]+' '/"ha_role"/ {print $(NF-1); exit}')
+            sync=$(dhis2_inventory_host_vars_redacted "$h" | awk -F'[" ]+' '/"ha_pg_sync_standby"/ {print $(NF-1); exit}')
+            [[ "$role" == "primary" ]] && primary="$h"
+            [[ "$sync" == "true" ]] && sync_rep="$h"
+        done
+        if [[ -n "$primary" && -n "$sync_rep" ]]; then
+            local p1 p2
+            p1=$(dhis2_inventory_host_vars_redacted "$primary" | awk -F'[" ]+' '/"physical_host"/ {print $(NF-1); exit}')
+            p2=$(dhis2_inventory_host_vars_redacted "$sync_rep" | awk -F'[" ]+' '/"physical_host"/ {print $(NF-1); exit}')
+            if [[ -n "$p1" && "$p1" == "$p2" ]]; then
+                errs+=("rule 2: primary and sync-replica are on the same physical_host '$p1'")
+            fi
+        fi
+        if (( ${#errs[@]} > 0 )); then
+            local e
+            for e in "${errs[@]}"; do dhis2_c_red "FAIL"; printf '  %s\n' "$e"; done
+            exit "$DHIS2_EXIT_PREFLIGHT"
+        fi
+        dhis2_status_ok "OK"; echo " - topology rules 1-2 pass"
+    fi
+}
+
+_leader() {
+    local h; h=$(_pick_pg_host)
+    _patroni_rest "$h" "/cluster" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('leader','?'))"
+}
+
+_replicas() {
+    local h; h=$(_pick_pg_host)
+    _patroni_rest "$h" "/cluster" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+for m in d.get('members', []):
+    if m.get('role') != 'leader':
+        print(f\"{m.get('name','?')}\troles={m.get('role','?')}\tstate={m.get('state','?')}\tlag={m.get('lag','?')}\")
+"
+}
+
+_lag() {
+    local h; h=$(_pick_pg_host)
+    _patroni_rest "$h" "/cluster" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+for m in d.get('members', []):
+    if m.get('role') != 'leader':
+        print(f\"{m.get('name','?')}\tlag_bytes={m.get('lag','?')}\")
+"
+}
+
+_failover() {
+    local to=""
+    while (( $# )); do case "$1" in --to) to="$2"; shift ;; --to=*) to="${1#*=}" ;; esac; shift || true; done
+    [[ -z "$to" ]] && { dhis2_log_error "Usage: dhis2-cluster failover --to HOST"; exit "$DHIS2_EXIT_USAGE"; }
+    dhis2_cli_confirm "FAILOVER the Patroni cluster to '$to'? This is a forced promotion - use switchover for a graceful planned move." "$to"
+    local h; h=$(_pick_pg_host)
+    _patronictl "$h" failover --candidate "$to" --force
+    dhis2_log_audit dhis2-cluster "{\"action\":\"failover\",\"to\":\"$to\"}" "ok"
+}
+
+_switchover() {
+    local to=""
+    while (( $# )); do case "$1" in --to) to="$2"; shift ;; --to=*) to="${1#*=}" ;; esac; shift || true; done
+    [[ -z "$to" ]] && { dhis2_log_error "Usage: dhis2-cluster switchover --to HOST"; exit "$DHIS2_EXIT_USAGE"; }
+    dhis2_cli_confirm "Graceful SWITCHOVER to '$to'? The current primary demotes to replica once '$to' is caught up." "$to"
+    local h; h=$(_pick_pg_host)
+    _patronictl "$h" switchover --candidate "$to" --force
+    dhis2_log_audit dhis2-cluster "{\"action\":\"switchover\",\"to\":\"$to\"}" "ok"
+}
+
+_reinit() {
+    local host="${1:-}"
+    [[ -z "$host" ]] && { dhis2_log_error "Usage: dhis2-cluster reinit HOST"; exit "$DHIS2_EXIT_USAGE"; }
+    dhis2_cli_confirm "REINIT '$host' - this wipes the local PG data directory and rebuilds from the current primary via pg_basebackup. Any un-replicated data on '$host' is LOST." "$host"
+    local h; h=$(_pick_pg_host)
+    _patronictl "$h" reinit --force "$(_cluster_scope "$h")" "$host"
+    dhis2_log_audit dhis2-cluster "{\"action\":\"reinit\",\"host\":\"$host\"}" "ok"
+}
+
+_cluster_scope() {
+    local h="$1"
+    dhis2_ansible_adhoc "$h" shell -a "awk '/^scope:/ {print \$2}' /etc/patroni/patroni.yml" -b -o 2>&1 | tail -1 | awk '{print $NF}'
+}
+
+_patroni_config() {
+    local sub="${1:-show}"
+    local h; h=$(_pick_pg_host)
+    case "$sub" in
+        show) _patroni_rest "$h" "/config" ;;
+        edit)
+            dhis2_log_warn "Editing Patroni DCS config live is dangerous. Use 'dhis2-cluster pause' first, then patronictl edit-config, then dhis2-cluster resume."
+            dhis2_ansible_adhoc "$h" shell -a "patronictl -c /etc/patroni/patroni.yml edit-config" -b -o
+            ;;
+        *) dhis2_log_error "Usage: dhis2-cluster patroni-config show|edit"; exit "$DHIS2_EXIT_USAGE" ;;
+    esac
+}
+
+_etcd_health() {
+    local etcd_hosts; etcd_hosts=$(dhis2_inventory_group_hosts etcd)
+    [[ -z "$etcd_hosts" ]] && { dhis2_log_error "No [etcd] group in inventory"; exit "$DHIS2_EXIT_PREFLIGHT"; }
+    local h; for h in $etcd_hosts; do
+        local out
+        out=$(dhis2_ansible_adhoc "$h" shell -a "etcdctl --endpoints=http://127.0.0.1:2379 endpoint health" -b -o 2>&1 | tail -1)
+        printf '  %-20s  %s\n' "$h" "$out"
+    done
+}
+
+_vip() {
+    local inv; inv=$(dhis2_config_resolve_inventory)
+    local vip
+    vip=$(awk -F= '/^[[:space:]]*ha_vip[[:space:]]*=/ {gsub(/[[:space:]]/,"",$2); print $2; exit}' "$inv")
+    if [[ -z "$vip" ]]; then
+        dhis2_log_warn "No ha_vip set (keepalived mode not configured; or ha_lb_mode=dns-rr)"
+        return 0
+    fi
+    local lb_hosts; lb_hosts=$(dhis2_inventory_group_hosts lb)
+    [[ -z "$lb_hosts" ]] && { dhis2_log_warn "No [lb] group - VIP ownership check skipped"; return 0; }
+    local h
+    for h in $lb_hosts; do
+        local holds
+        holds=$(dhis2_ansible_adhoc "$h" shell -a "ip addr show | grep -c '$vip'" -b -o 2>&1 | tail -1 | awk '{print $NF}')
+        [[ "${holds:-0}" -gt 0 ]] && printf '  %s holds VIP %s\n' "$h" "$vip"
+    done
+}
+
+_watch() {
+    local interval=5
+    while (( $# )); do case "$1" in --interval) interval="$2"; shift ;; --interval=*) interval="${1#*=}" ;; esac; shift || true; done
+    while true; do
+        clear 2>/dev/null || true
+        _status
+        sleep "$interval"
+    done
+}
+
+_pause() {
+    dhis2_cli_confirm "Pause Patroni's automatic failover? Operators should resume before leaving."
+    local h; h=$(_pick_pg_host)
+    _patronictl "$h" pause --wait
+    dhis2_log_audit dhis2-cluster '{"action":"pause"}' "ok"
+}
+
+_resume() {
+    dhis2_cli_confirm "Resume Patroni's automatic failover?"
+    local h; h=$(_pick_pg_host)
+    _patronictl "$h" resume --wait
+    dhis2_log_audit dhis2-cluster '{"action":"resume"}' "ok"
+}
+
+main "$@"
