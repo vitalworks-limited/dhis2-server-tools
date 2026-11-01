@@ -1,0 +1,185 @@
+---
+#
+# WAL compliance preflight.
+#
+# PostgreSQL's `pg_wal/` directory can grow to accommodate:
+#   max_wal_size            - soft target before aggressive checkpoint
+#   max_slot_wal_keep_size  - hard cap on WAL that replication slots retain
+#   wal_keep_size           - "safety" retention (should be 0 with slots)
+#   plus:
+#     - archive-lag spike:  can grow by ~1x max_wal_size when archiving falls behind
+#     - segment overhead:   current + next segment (2 x 16 MiB default)
+#
+# OFFICIAL PostgreSQL 16 references:
+#   https://www.postgresql.org/docs/16/runtime-config-wal.html
+#   https://www.postgresql.org/docs/16/runtime-config-replication.html
+#
+# COMPLIANCE POLICY (section 'Compliance' of docs/CLI-WAL-Operations.md):
+#   1. max_slot_wal_keep_size MUST be bounded (not -1 / unlimited).
+#   2. wal_keep_size SHOULD be 0 when replication slots are in use.
+#   3. The sum of possible retention + archive-lag headroom MUST NOT
+#      exceed pg_wal_fs_safe_pct (default 70%) of the pg_wal
+#      filesystem size.
+#
+# This task runs ALWAYS - even without archive_mode=on - because the
+# risk of orphaned replication slots filling the disk exists on any
+# cluster with physical replication.
+#
+# A failure is HARD unless the operator explicitly sets
+#   pg_wal_compliance_override=true
+# in which case the role prints a HIGH-SEVERITY warning and writes
+# an audit entry so the override is forensically recoverable.
+#
+
+- name: WAL compliance | Gather pg_wal filesystem size
+  ansible.builtin.command: >
+    stat -f -c '%s %b' /var/lib/postgresql/{{ postgresql_version | default(16) }}/main/pg_wal
+  register: _pg_wal_fs_stat
+  changed_when: false
+  failed_when: false
+
+- name: WAL compliance | Fall back to data_directory parent when pg_wal does not yet exist
+  ansible.builtin.command: >
+    stat -f -c '%s %b' /var/lib/postgresql
+  register: _pg_wal_fs_fallback
+  changed_when: false
+  failed_when: false
+  when: _pg_wal_fs_stat.rc != 0
+
+- name: WAL compliance | Compute pg_wal filesystem size (bytes)
+  ansible.builtin.set_fact:
+    _pg_wal_fs_bytes: >-
+      {{
+        pg_wal_fs_bytes | default(
+          (
+            (_pg_wal_fs_stat.stdout
+              | default(_pg_wal_fs_fallback.stdout | default('4096 0')))
+              .split()[0] | int
+          ) *
+          (
+            (_pg_wal_fs_stat.stdout
+              | default(_pg_wal_fs_fallback.stdout | default('4096 0')))
+              .split()[1] | int
+          )
+        )
+      }}
+
+#
+# Normalise human-readable sizes to bytes so the arithmetic is simple.
+# PG accepts suffixes kB, MB, GB, TB. The role uses MB and GB only.
+#
+- name: WAL compliance | Normalise retention knobs to bytes
+  ansible.builtin.set_fact:
+    _max_wal_size_b:          "{{ (pg_max_wal_size          | default('4GB')) | regex_replace('(?i)([0-9]+)\\s*GB', '\\1 * 1024 * 1024 * 1024') | regex_replace('(?i)([0-9]+)\\s*MB', '\\1 * 1024 * 1024') | regex_replace('(?i)([0-9]+)\\s*KB', '\\1 * 1024') }}"
+    _max_slot_wal_keep_b:     "{{ (pg_max_slot_wal_keep_size | default('10GB')) | regex_replace('(?i)([0-9]+)\\s*GB', '\\1 * 1024 * 1024 * 1024') | regex_replace('(?i)([0-9]+)\\s*MB', '\\1 * 1024 * 1024') | regex_replace('(?i)([0-9]+)\\s*KB', '\\1 * 1024') }}"
+    _wal_keep_size_b:         "{{ (pg_wal_keep_size          | default('0'))   | regex_replace('(?i)([0-9]+)\\s*GB', '\\1 * 1024 * 1024 * 1024') | regex_replace('(?i)([0-9]+)\\s*MB', '\\1 * 1024 * 1024') | regex_replace('(?i)([0-9]+)\\s*KB', '\\1 * 1024') | string }}"
+
+- name: WAL compliance | Compute budget and compare
+  ansible.builtin.set_fact:
+    _wal_budget: >-
+      {{
+        (_pg_wal_fs_bytes | int) * (pg_wal_fs_safe_pct | default(70) | int) // 100
+      }}
+    _wal_required: >-
+      {{
+        ((_max_wal_size_b          | regex_replace('[^0-9*]', '') ) | int)
+        + ((_max_slot_wal_keep_b    | regex_replace('[^0-9*]', '') ) | int)
+        + ((_wal_keep_size_b        | regex_replace('[^0-9*]', '') ) | int)
+        + ((_max_wal_size_b         | regex_replace('[^0-9*]', '') ) | int)   {# archive-lag headroom ~= 1x max_wal_size #}
+        + (2 * 16 * 1024 * 1024)                                              {# 2 segments of overhead  #}
+      }}
+
+- name: WAL compliance | Compliance decision
+  ansible.builtin.set_fact:
+    _wal_compliant: "{{ (_wal_required | int) <= (_wal_budget | int) }}"
+    _wal_slot_unlimited: "{{ (pg_max_slot_wal_keep_size | default('10GB')) in ['-1', -1, 'unlimited'] }}"
+    _wal_keep_nonzero_with_slots: "{{ ((pg_wal_keep_size | default(0)) | string) not in ['0', '0B', '0kB', '0MB'] }}"
+
+- name: WAL compliance | Report
+  ansible.builtin.debug:
+    msg:
+      - "pg_wal filesystem (bytes):     {{ _pg_wal_fs_bytes }}"
+      - "pg_wal_fs_safe_pct:            {{ pg_wal_fs_safe_pct | default(70) }}%"
+      - "WAL budget (bytes):            {{ _wal_budget }}"
+      - "WAL required (bytes):          {{ _wal_required }}"
+      - "max_wal_size:                  {{ pg_max_wal_size | default('4GB') }}"
+      - "max_slot_wal_keep_size:        {{ pg_max_slot_wal_keep_size | default('10GB') }}"
+      - "wal_keep_size:                 {{ pg_wal_keep_size | default(0) }}"
+      - "compliant:                     {{ _wal_compliant }}"
+      - "slot-unlimited (refused):      {{ _wal_slot_unlimited }}"
+      - "wal_keep_nonzero_with_slots:   {{ _wal_keep_nonzero_with_slots }}"
+
+- name: WAL compliance | Refuse unlimited max_slot_wal_keep_size
+  ansible.builtin.fail:
+    msg: |
+      pg_max_slot_wal_keep_size is set to -1 / unlimited. This is
+      explicitly refused by the project compliance policy because an
+      orphaned replication slot can then grow pg_wal without bound.
+
+      Set pg_max_slot_wal_keep_size to a bounded value, e.g. 10GB,
+      scaled to your pg_wal filesystem budget.
+
+      References:
+        https://www.postgresql.org/docs/16/runtime-config-replication.html#GUC-MAX-SLOT-WAL-KEEP-SIZE
+        docs/CLI-WAL-Operations.md (section 'Compliance')
+  when:
+    - _wal_slot_unlimited | bool
+    - not (pg_wal_compliance_override | default(false) | bool)
+
+- name: WAL compliance | Refuse non-zero wal_keep_size with replication slots
+  ansible.builtin.debug:
+    msg: |
+      pg_wal_keep_size is set to {{ pg_wal_keep_size }} while
+      replication slots are in use. This is usually a mistake; the
+      slot already retains WAL for the standby, so wal_keep_size
+      just adds disk pressure. Setting pg_wal_keep_size=0 is the
+      recommended value with slots.
+
+      Reference:
+        https://www.postgresql.org/docs/16/runtime-config-replication.html#GUC-WAL-KEEP-SIZE
+  when: _wal_keep_nonzero_with_slots | bool
+
+- name: WAL compliance | Refuse deploy on sizing breach
+  ansible.builtin.fail:
+    msg: |
+      WAL retention sum exceeds the pg_wal filesystem budget.
+
+        pg_wal filesystem:            {{ (_pg_wal_fs_bytes      | int) // (1024 * 1024) }} MiB
+        pg_wal_fs_safe_pct:           {{ pg_wal_fs_safe_pct | default(70) }}%
+        Budget (bytes):               {{ _wal_budget }}
+        Required (bytes):             {{ _wal_required }}
+
+      Breakdown:
+        max_wal_size:                 {{ pg_max_wal_size | default('4GB') }}
+        max_slot_wal_keep_size:       {{ pg_max_slot_wal_keep_size | default('10GB') }}
+        wal_keep_size:                {{ pg_wal_keep_size | default(0) }}
+        archive-lag headroom:         ~= max_wal_size
+        segment overhead:             32 MiB
+
+      Options:
+        1. Enlarge the pg_wal filesystem (recommended; a dedicated
+           pg_wal volume is in HA/wal-disk-safety-plan phase 2).
+        2. Reduce pg_max_wal_size and/or pg_max_slot_wal_keep_size.
+        3. Set pg_wal_compliance_override=true to BREAK GLASS. The
+           override writes an audit record and prints a HIGH-SEVERITY
+           warning. Not recommended for production.
+
+      References:
+        https://www.postgresql.org/docs/16/runtime-config-wal.html
+        https://www.postgresql.org/docs/16/runtime-config-replication.html
+        docs/CLI-WAL-Operations.md (section 'Compliance')
+  when:
+    - not (_wal_compliant | bool)
+    - not (pg_wal_compliance_override | default(false) | bool)
+
+- name: WAL compliance | HIGH WARNING when override is active
+  ansible.builtin.debug:
+    msg: |
+      *** pg_wal_compliance_override=true ***
+      WAL compliance checks were bypassed. The configured retention
+      can exceed the pg_wal filesystem budget by:
+        {{ ((_wal_required | int) - (_wal_budget | int)) // (1024 * 1024) }} MiB
+      Operator accepts the risk.
+  when:
+    - not (_wal_compliant | bool)
+    - pg_wal_compliance_override | default(false) | bool

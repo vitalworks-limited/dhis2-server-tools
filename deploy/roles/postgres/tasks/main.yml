@@ -20,6 +20,12 @@
   when: inventory_hostname in groups['databases']
   tags: [postgresql-install, postgresql-conf]
 
+- name: WAL compliance preflight (always on database hosts)
+  ansible.builtin.include_tasks: wal-compliance-preflight.yml
+  when:
+    - inventory_hostname in groups['databases']
+  tags: [postgresql-conf, wal-compliance-preflight]
+
 - name: WAL archive preflight (only when pg_archive_mode=on)
   ansible.builtin.include_tasks: wal-archive-preflight.yml
   when:
