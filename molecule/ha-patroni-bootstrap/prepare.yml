@@ -1,0 +1,25 @@
+---
+- name: Prepare - install base packages for HA role tasks
+  hosts: all
+  gather_facts: true
+  tasks:
+    - name: Base prerequisites
+      ansible.builtin.apt:
+        name:
+          - python3
+          - python3-pip
+          - ufw
+          - curl
+          - ca-certificates
+          - rsync
+        state: present
+        update_cache: true
+
+    - name: Copy repository into the container
+      ansible.posix.synchronize:
+        src: "{{ lookup('env', 'MOLECULE_PROJECT_DIRECTORY') | default(playbook_dir ~ '/../..', true) }}/"
+        dest: /opt/dhis2-server-tools/
+        rsync_opts:
+          - "--exclude=.git"
+          - "--exclude=.github"
+          - "--exclude=molecule/*/junit.xml"

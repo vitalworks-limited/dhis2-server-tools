@@ -154,7 +154,7 @@ jobs:
       matrix:
         python-version: ['3.11']
         ansible-version: ['10.7.0']
-        scenario: ['cli-smoke', 'dhis-conf-preservation', 'upgrade-monitor-migrations']
+        scenario: ['cli-smoke', 'dhis-conf-preservation', 'upgrade-monitor-migrations', 'ha-patroni-bootstrap']
       fail-fast: false
     steps:
       - uses: actions/checkout@v4

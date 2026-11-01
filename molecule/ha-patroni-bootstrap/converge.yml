@@ -1,0 +1,35 @@
+---
+#
+# Converge - validate the HA role tasks parse and the templates
+# render against the inventory shape from section 15b decision 6
+# (ha_role host var on [databases] members).
+#
+# We deliberately run with --check against the two role play layers
+# that would attempt real network / systemd side effects (etcd
+# bootstrap and Patroni daemon start). Full end-to-end runs happen
+# on real Ubuntu 22.04 hosts; see docs/HA-Patroni.md section
+# "Local reproducible test" for the Vagrant recipe.
+#
+
+- name: Converge - render etcd role (check mode)
+  hosts: etcd
+  gather_facts: true
+  roles:
+    - role: /opt/dhis2-server-tools/deploy/roles/etcd
+  check_mode: true
+
+- name: Converge - render patroni role (check mode)
+  hosts: databases
+  gather_facts: true
+  roles:
+    - role: /opt/dhis2-server-tools/deploy/roles/patroni
+  check_mode: true
+  vars:
+    postgresql_version: 16
+
+- name: Converge - render haproxy-pg role (check mode)
+  hosts: databases
+  gather_facts: true
+  roles:
+    - role: /opt/dhis2-server-tools/deploy/roles/haproxy-pg
+  check_mode: true

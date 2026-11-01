@@ -1,10 +1,10 @@
 # Regression run report
 
-Generated: 2026-11-01T07:38:37Z
+Generated: 2026-11-01T09:26:18Z
 
 Mode: mock
 
-Results: PASS=66 FAIL=0 SKIP=2
+Results: PASS=79 FAIL=0 SKIP=2
 
 | ID | Scenario | Mode | Result | Notes |
 |----|----------|------|--------|-------|
@@ -76,3 +76,16 @@ Results: PASS=66 FAIL=0 SKIP=2
 | AY | dhis2-doctor wal cross-check present | mock | PASS | doctor wal wired |
 | AZ | postgres role has max_wal_size default | mock | PASS | WAL retention bounded |
 | AZ2 | archive-command preflight exists and is wired | mock | PASS | preflight included |
+| BA | HA roles etcd/patroni/haproxy-pg present | mock | PASS | all three HA roles exist |
+| BB | etcd role templates renders correct cluster bootstrap | mock | PASS | etcd templates present |
+| BC | patroni template has scope, slots, pg_rewind | mock | PASS | patroni template correct |
+| BD | haproxy-pg routes writes to /leader + reads to /replica | mock | PASS | both listeners wired |
+| BE | dhis2-cluster exposes all 13 subcommands | mock | PASS | all subcommands wired |
+| BF | failover/switchover/reinit all confirmation-gated | mock | PASS | all three gated |
+| BG | dhis2-cluster refuses without dhis2_ha=true | mock | PASS | preflight guard present |
+| BH | preflight rejects 3-etcd-same-physical_host | mock | PASS | rule 1 enforced |
+| BI | preflight rejects primary+sync on same physical_host | mock | PASS | rule 2 enforced |
+| BJ | postgres role delegates to Patroni when dhis2_ha=true | mock | PASS | delegation task present |
+| BK | dhis2.yml gates HA import on dhis2_ha=true | mock | PASS | no-regression preserved |
+| BL | patroni role masks OS postgresql service | mock | PASS | OS pg masked |
+| BM | dhis2-cluster output passes through secret redaction | mock | PASS | redaction wired |

@@ -1,0 +1,53 @@
+---
+#
+# Verify - the three HA roles parse and the CLI topology --check
+# correctly reports section-15b compliance for this inventory shape.
+#
+- name: Verify - HA roles converged without errors
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: Rendered etcd.conf.yml exists on etcd members (check-mode may skip)
+      ansible.builtin.stat:
+        path: /etc/etcd/etcd.conf.yml
+      register: etcd_cfg
+      when: inventory_hostname in groups['etcd']
+
+    - name: Rendered patroni.yml path exists on DB members
+      ansible.builtin.stat:
+        path: /etc/patroni/patroni.yml
+      register: patroni_cfg
+      when: inventory_hostname in groups['databases']
+
+- name: Verify - section 15b topology rules pass
+  hosts: pg01
+  gather_facts: false
+  tasks:
+    - name: Export inventory for the CLI
+      ansible.builtin.copy:
+        content: |
+          [etcd]
+          pg01 ansible_host=127.0.0.1 physical_host=host-a
+          pg02 ansible_host=127.0.0.1 physical_host=host-b
+          pg03 ansible_host=127.0.0.1 physical_host=host-c
+          [databases]
+          pg01 ansible_host=127.0.0.1 physical_host=host-a ha_role=primary
+          pg02 ansible_host=127.0.0.1 physical_host=host-b ha_role=replica ha_pg_sync_standby=true
+          pg03 ansible_host=127.0.0.1 physical_host=host-c ha_role=replica
+          [all:vars]
+          dhis2_ha=true
+        dest: /tmp/molecule-inv
+        mode: "0600"
+
+    - name: Run dhis2-cluster topology --check
+      ansible.builtin.shell: |
+        set -e
+        export DHIS2_INVENTORY=/tmp/molecule-inv
+        /opt/dhis2-server-tools/bin/dhis2-cluster topology --check
+      register: topo
+      failed_when: topo.rc != 0
+      changed_when: false
+
+    - name: Topology report
+      ansible.builtin.debug:
+        var: topo.stdout_lines

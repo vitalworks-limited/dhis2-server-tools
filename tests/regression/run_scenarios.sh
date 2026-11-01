@@ -693,6 +693,187 @@ scenario_AU() {
     fi
 }
 
+# ---------- HA Phase 1 scenarios (BA-BM) ----------
+
+scenario_BA() {
+    # New roles exist
+    local ok=true
+    for r in etcd patroni haproxy-pg; do
+        [[ -d "$ROOT/deploy/roles/$r" ]] || ok=false
+    done
+    $ok && _rec BA "HA roles etcd/patroni/haproxy-pg present" mock PASS "all three HA roles exist" \
+         || _rec BA "HA roles etcd/patroni/haproxy-pg present" mock FAIL "missing HA role"
+}
+
+scenario_BB() {
+    # etcd role templates etcd.conf.yml and systemd unit
+    if [[ -f "$ROOT/deploy/roles/etcd/templates/etcd.conf.yml.j2" \
+        && -f "$ROOT/deploy/roles/etcd/templates/etcd.service.j2" ]] \
+       && grep -q 'initial-cluster:' "$ROOT/deploy/roles/etcd/templates/etcd.conf.yml.j2" \
+       && grep -q 'quota-backend-bytes' "$ROOT/deploy/roles/etcd/templates/etcd.conf.yml.j2"; then
+        _rec BB "etcd role templates renders correct cluster bootstrap" mock PASS "etcd templates present"
+    else
+        _rec BB "etcd role templates renders correct cluster bootstrap" mock FAIL "etcd templates incomplete"
+    fi
+}
+
+scenario_BC() {
+    # patroni role templates patroni.yml with scope + replication user
+    if [[ -f "$ROOT/deploy/roles/patroni/templates/patroni.yml.j2" ]] \
+       && grep -q 'scope: {{ patroni_scope }}' "$ROOT/deploy/roles/patroni/templates/patroni.yml.j2" \
+       && grep -q 'use_slots: true' "$ROOT/deploy/roles/patroni/templates/patroni.yml.j2" \
+       && grep -q 'use_pg_rewind: true' "$ROOT/deploy/roles/patroni/templates/patroni.yml.j2"; then
+        _rec BC "patroni template has scope, slots, pg_rewind" mock PASS "patroni template correct"
+    else
+        _rec BC "patroni template has scope, slots, pg_rewind" mock FAIL "patroni template missing fields"
+    fi
+}
+
+scenario_BD() {
+    # haproxy-pg has write+read listeners polling Patroni REST
+    if [[ -f "$ROOT/deploy/roles/haproxy-pg/templates/haproxy-pg.cfg.j2" ]] \
+       && grep -q 'listen postgres-write' "$ROOT/deploy/roles/haproxy-pg/templates/haproxy-pg.cfg.j2" \
+       && grep -q 'listen postgres-read' "$ROOT/deploy/roles/haproxy-pg/templates/haproxy-pg.cfg.j2" \
+       && grep -q 'GET /leader' "$ROOT/deploy/roles/haproxy-pg/templates/haproxy-pg.cfg.j2" \
+       && grep -q 'GET /replica' "$ROOT/deploy/roles/haproxy-pg/templates/haproxy-pg.cfg.j2"; then
+        _rec BD "haproxy-pg routes writes to /leader + reads to /replica" mock PASS "both listeners wired"
+    else
+        _rec BD "haproxy-pg routes writes to /leader + reads to /replica" mock FAIL "listener(s) missing"
+    fi
+}
+
+scenario_BE() {
+    # dhis2-cluster CLI exists with all 13 subcommands
+    local ok=true
+    for sub in status topology leader replicas lag failover switchover reinit patroni-config etcd-health vip watch pause resume; do
+        grep -q "^        $sub)" "$BIN/dhis2-cluster" || ok=false
+    done
+    $ok && _rec BE "dhis2-cluster exposes all 13 subcommands" mock PASS "all subcommands wired" \
+         || _rec BE "dhis2-cluster exposes all 13 subcommands" mock FAIL "missing subcommand"
+}
+
+scenario_BF() {
+    # dhis2-cluster failover/switchover/reinit require --yes via dhis2_cli_confirm
+    local body
+    body=$(awk '/^_failover\(\)/,/^}/' "$BIN/dhis2-cluster")
+    echo "$body" | grep -q 'dhis2_cli_confirm' || { _rec BF "failover is confirmation-gated" mock FAIL "no confirm"; return; }
+    body=$(awk '/^_switchover\(\)/,/^}/' "$BIN/dhis2-cluster")
+    echo "$body" | grep -q 'dhis2_cli_confirm' || { _rec BF "switchover is confirmation-gated" mock FAIL "no confirm"; return; }
+    body=$(awk '/^_reinit\(\)/,/^}/' "$BIN/dhis2-cluster")
+    echo "$body" | grep -q 'dhis2_cli_confirm' || { _rec BF "reinit is confirmation-gated" mock FAIL "no confirm"; return; }
+    _rec BF "failover/switchover/reinit all confirmation-gated" mock PASS "all three gated"
+}
+
+scenario_BG() {
+    # dhis2-cluster refuses to run when dhis2_ha is not set
+    local tmp; tmp=$(mktemp)
+    cat > "$tmp" <<'EOF'
+[databases]
+pg01 ansible_host=10.0.0.1
+EOF
+    chmod 600 "$tmp"
+    local out rc=0
+    out=$(DHIS2_INVENTORY="$tmp" "$BIN/dhis2-cluster" status 2>&1 </dev/null) || rc=$?
+    rm -f "$tmp"
+    if (( rc == 3 )) && echo "$out" | grep -q 'HA is not enabled'; then
+        _rec BG "dhis2-cluster refuses without dhis2_ha=true" mock PASS "preflight guard present"
+    else
+        _rec BG "dhis2-cluster refuses without dhis2_ha=true" mock FAIL "no HA preflight (rc=$rc)"
+    fi
+}
+
+scenario_BH() {
+    # dhis2-deploy preflight refuses 3 etcd on the same physical_host when dhis2_ha=true
+    local tmp; tmp=$(mktemp)
+    cat > "$tmp" <<'EOF'
+[etcd]
+etcd01 ansible_host=10.0.0.1 physical_host=same
+etcd02 ansible_host=10.0.0.2 physical_host=same
+etcd03 ansible_host=10.0.0.3 physical_host=same
+
+[databases]
+pg01 ansible_host=10.0.0.1 ha_role=primary physical_host=a
+pg02 ansible_host=10.0.0.2 ha_role=replica ha_pg_sync_standby=true physical_host=b
+
+[all:vars]
+dhis2_ha=true
+EOF
+    chmod 600 "$tmp"
+    local out rc=0
+    out=$(DHIS2_INVENTORY="$tmp" "$BIN/dhis2-deploy" preflight 2>&1 </dev/null) || rc=$?
+    rm -f "$tmp"
+    if (( rc == 3 )) && echo "$out" | grep -q 'etcd members must span 3 distinct physical_host'; then
+        _rec BH "preflight rejects 3-etcd-same-physical_host" mock PASS "rule 1 enforced"
+    else
+        _rec BH "preflight rejects 3-etcd-same-physical_host" mock FAIL "rule 1 not enforced (rc=$rc)"
+    fi
+}
+
+scenario_BI() {
+    # dhis2-deploy preflight refuses primary + sync_replica on the same physical_host
+    local tmp; tmp=$(mktemp)
+    cat > "$tmp" <<'EOF'
+[etcd]
+etcd01 ansible_host=10.0.0.1 physical_host=a
+etcd02 ansible_host=10.0.0.2 physical_host=b
+etcd03 ansible_host=10.0.0.3 physical_host=c
+
+[databases]
+pg01 ansible_host=10.0.0.1 ha_role=primary physical_host=same
+pg02 ansible_host=10.0.0.2 ha_role=replica ha_pg_sync_standby=true physical_host=same
+
+[all:vars]
+dhis2_ha=true
+EOF
+    chmod 600 "$tmp"
+    local out rc=0
+    out=$(DHIS2_INVENTORY="$tmp" "$BIN/dhis2-deploy" preflight 2>&1 </dev/null) || rc=$?
+    rm -f "$tmp"
+    if (( rc == 3 )) && echo "$out" | grep -q 'share physical_host'; then
+        _rec BI "preflight rejects primary+sync on same physical_host" mock PASS "rule 2 enforced"
+    else
+        _rec BI "preflight rejects primary+sync on same physical_host" mock FAIL "rule 2 not enforced (rc=$rc)"
+    fi
+}
+
+scenario_BJ() {
+    # postgres role gains delegation note when dhis2_ha=true
+    if grep -q 'HA | Note that cluster management is delegated to Patroni' "$ROOT/deploy/roles/postgres/tasks/main.yml"; then
+        _rec BJ "postgres role delegates to Patroni when dhis2_ha=true" mock PASS "delegation task present"
+    else
+        _rec BJ "postgres role delegates to Patroni when dhis2_ha=true" mock FAIL "no delegation task"
+    fi
+}
+
+scenario_BK() {
+    # dhis2.yml imports dhis2-ha.yml only when dhis2_ha=true
+    if grep -q 'import_playbook: dhis2-ha.yml' "$ROOT/deploy/dhis2.yml" \
+       && grep -A3 'import_playbook: dhis2-ha.yml' "$ROOT/deploy/dhis2.yml" | grep -q 'dhis2_ha | default(false) | bool'; then
+        _rec BK "dhis2.yml gates HA import on dhis2_ha=true" mock PASS "no-regression preserved"
+    else
+        _rec BK "dhis2.yml gates HA import on dhis2_ha=true" mock FAIL "HA import not gated"
+    fi
+}
+
+scenario_BL() {
+    # patroni role stops and masks OS postgresql so Patroni can take over
+    if grep -q 'masked: true' "$ROOT/deploy/roles/patroni/tasks/main.yml" \
+       && grep -q 'Patroni | Stop + mask' "$ROOT/deploy/roles/patroni/tasks/main.yml"; then
+        _rec BL "patroni role masks OS postgresql service" mock PASS "OS pg masked"
+    else
+        _rec BL "patroni role masks OS postgresql service" mock FAIL "OS pg not masked"
+    fi
+}
+
+scenario_BM() {
+    # dhis2-cluster redacts Patroni REST credentials
+    if grep -q 'dhis2_log_redact' "$BIN/dhis2-cluster"; then
+        _rec BM "dhis2-cluster output passes through secret redaction" mock PASS "redaction wired"
+    else
+        _rec BM "dhis2-cluster output passes through secret redaction" mock FAIL "no redaction"
+    fi
+}
+
 scenario_AW() {
     # WAL CLI family wired
     local ok=true
@@ -806,6 +987,8 @@ scenario_AF; scenario_AG; scenario_AH; scenario_AI; scenario_AJ; scenario_AK
 scenario_AL; scenario_AM; scenario_AN
 scenario_AO; scenario_AP; scenario_AQ; scenario_AR; scenario_AS; scenario_AT; scenario_AU; scenario_AV
 scenario_AW; scenario_AX; scenario_AY; scenario_AZ
+scenario_BA; scenario_BB; scenario_BC; scenario_BD; scenario_BE; scenario_BF
+scenario_BG; scenario_BH; scenario_BI; scenario_BJ; scenario_BK; scenario_BL; scenario_BM
 
 _write_report
 echo

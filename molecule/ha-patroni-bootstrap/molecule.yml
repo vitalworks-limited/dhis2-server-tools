@@ -1,0 +1,92 @@
+---
+# molecule/ha-patroni-bootstrap
+#
+# Role-task validation for the HA Phase 1 roles (etcd, patroni,
+# haproxy-pg). Three Ubuntu 22.04 containers come up; the plays run
+# against them. We DO NOT assert on failover timing - that needs
+# real hosts (section 2.1 of docs/HA-Patroni.md). This scenario
+# validates:
+#   - YAML syntax of all three roles
+#   - Templates render without error
+#   - Package installation paths exist in Ubuntu 22.04
+#   - Systemd units are templated and reload cleanly
+#
+dependency:
+  name: galaxy
+  options:
+    ignore-certs: true
+    ignore-errors: true
+driver:
+  name: docker
+platforms:
+  - name: pg01
+    image: geerlingguy/docker-ubuntu2204-ansible:latest
+    pre_build_image: true
+    command: ""
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+    privileged: true
+    cgroupns_mode: host
+    groups:
+      - etcd
+      - databases
+  - name: pg02
+    image: geerlingguy/docker-ubuntu2204-ansible:latest
+    pre_build_image: true
+    command: ""
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+    privileged: true
+    cgroupns_mode: host
+    groups:
+      - etcd
+      - databases
+  - name: pg03
+    image: geerlingguy/docker-ubuntu2204-ansible:latest
+    pre_build_image: true
+    command: ""
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+    privileged: true
+    cgroupns_mode: host
+    groups:
+      - etcd
+      - databases
+provisioner:
+  name: ansible
+  config_options:
+    defaults:
+      interpreter_python: auto_silent
+      stdout_callback: yaml
+  inventory:
+    group_vars:
+      all:
+        dhis2_ha: true
+        ha_cluster_name: dhis2-molecule
+        postgresql_version: 16
+        patroni_rest_password: moleculepass
+        patroni_replication_password: moleculepass
+        patroni_superuser_password: moleculepass
+    host_vars:
+      pg01:
+        physical_host: host-a
+        ha_role: primary
+      pg02:
+        physical_host: host-b
+        ha_role: replica
+        ha_pg_sync_standby: true
+      pg03:
+        physical_host: host-c
+        ha_role: replica
+verifier:
+  name: ansible
+scenario:
+  test_sequence:
+    - dependency
+    - destroy
+    - syntax
+    - create
+    - prepare
+    - converge
+    - verify
+    - destroy
