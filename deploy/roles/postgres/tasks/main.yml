@@ -1,4 +1,20 @@
 ---
+#
+# postgres role entry.
+#
+# Dispatch:
+#   dhis2_ha=false (default)  - install + configure vanilla PostgreSQL
+#                               via lxd.yml / ssh.yml (unchanged).
+#   dhis2_ha=true             - install PG BINARIES + extensions only,
+#                               then delegate cluster management to
+#                               the patroni role (see dhis2.yml). The
+#                               OS postgresql service is stopped and
+#                               masked by the patroni role.
+#
+# Section 15b of the HA plan: no inventory restructure required. The
+# existing [databases] group is reused; per-host ha_role=primary|replica
+# selects behaviour at the Patroni level.
+#
 - name: Including tasks | {{ ansible_connection }}
   ansible.builtin.include_tasks: "{{ ansible_connection }}.yml"
   when: inventory_hostname in groups['databases']
@@ -10,3 +26,15 @@
     - inventory_hostname in groups['databases']
     - pg_archive_mode | default('off') == 'on'
   tags: [postgresql-conf, wal-archive-preflight]
+
+- name: HA | Note that cluster management is delegated to Patroni
+  ansible.builtin.debug:
+    msg: |
+      dhis2_ha=true - PostgreSQL on {{ inventory_hostname }} will be
+      managed by Patroni (see roles/patroni). The OS postgresql
+      service will be stopped and masked when the patroni role runs.
+      Operator surface: dhis2-cluster, patronictl.
+  when:
+    - inventory_hostname in groups['databases']
+    - dhis2_ha | default(false) | bool
+  tags: [postgresql-install, patroni-install]

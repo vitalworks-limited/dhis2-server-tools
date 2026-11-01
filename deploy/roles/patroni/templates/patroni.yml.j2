@@ -1,0 +1,106 @@
+#
+# patroni.yml - managed by dhis2-server-tools / roles/patroni.
+# Do not edit by hand. Operator overrides go in inventory variables.
+#
+# See docs/HA-Patroni.md for the full operator guide.
+#
+
+scope: {{ patroni_scope }}
+name: {{ patroni_name }}
+namespace: /dhis2/
+
+restapi:
+  listen: {{ patroni_rest_bind }}:{{ patroni_rest_port }}
+  connect_address: {{ ansible_default_ipv4.address }}:{{ patroni_rest_port }}
+{% if patroni_rest_user | length > 0 and patroni_rest_password | length > 0 %}
+  authentication:
+    username: {{ patroni_rest_user }}
+    password: "{{ patroni_rest_password }}"
+{% endif %}
+
+etcd3:
+  hosts: {{ patroni_etcd_hosts | map('regex_replace', '$', ':' ~ patroni_etcd_port) | list | join(',') }}
+  protocol: {{ patroni_etcd_protocol }}
+
+bootstrap:
+  dcs:
+    ttl: {{ patroni_ttl }}
+    loop_wait: {{ patroni_loop_wait }}
+    retry_timeout: {{ patroni_retry_timeout }}
+    maximum_lag_on_failover: {{ patroni_maximum_lag_on_failover }}
+    synchronous_mode: {{ patroni_synchronous_mode | lower }}
+    synchronous_mode_strict: {{ patroni_synchronous_mode_strict | lower }}
+    postgresql:
+      use_pg_rewind: true
+      use_slots: true
+      parameters:
+        max_connections: {{ pg_max_connections }}
+{% if pg_shared_buffers is defined %}
+        shared_buffers: {{ pg_shared_buffers }}
+{% endif %}
+{% if pg_work_mem is defined %}
+        work_mem: {{ pg_work_mem }}
+{% endif %}
+{% if pg_maintenance_work_mem is defined %}
+        maintenance_work_mem: {{ pg_maintenance_work_mem }}
+{% endif %}
+{% if pg_effective_cache_size is defined %}
+        effective_cache_size: {{ pg_effective_cache_size }}
+{% endif %}
+        max_wal_size: {{ pg_max_wal_size }}
+        min_wal_size: {{ pg_min_wal_size }}
+        wal_level: replica
+        hot_standby: 'on'
+        max_wal_senders: 10
+        max_replication_slots: 10
+        synchronous_commit: {{ 'on' if patroni_synchronous_mode | bool else 'off' }}
+{% if pg_archive_mode | default('off') == 'on' %}
+        archive_mode: 'on'
+        archive_command: "{{ pg_archive_command }}"
+{% endif %}
+  initdb:
+    - encoding: UTF8
+    - locale: en_US.UTF-8
+    - data-checksums
+  pg_hba:
+    - host replication {{ patroni_replication_user }} 0.0.0.0/0 md5
+    - host all all 0.0.0.0/0 md5
+  users:
+    {{ patroni_superuser }}:
+      password: "{{ patroni_superuser_password }}"
+      options:
+        - superuser
+    {{ patroni_replication_user }}:
+      password: "{{ patroni_replication_password }}"
+      options:
+        - replication
+
+postgresql:
+  listen: 0.0.0.0:5432
+  connect_address: {{ ansible_default_ipv4.address }}:5432
+  data_dir: {{ patroni_data_dir }}
+  bin_dir: /usr/lib/postgresql/{{ postgresql_version }}/bin
+  pgpass: /tmp/pgpass0
+  authentication:
+    replication:
+      username: {{ patroni_replication_user }}
+      password: "{{ patroni_replication_password }}"
+    superuser:
+      username: {{ patroni_superuser }}
+      password: "{{ patroni_superuser_password }}"
+  parameters:
+    unix_socket_directories: /var/run/postgresql
+    # Hostname kept out of application_name because the standby name
+    # is what Patroni uses in synchronous_standby_names.
+  create_replica_methods:
+    - basebackup
+  basebackup:
+    checkpoint: 'fast'
+
+{# Sync-standby tag: Patroni's "sync_standby" is DCS-driven. We only
+   hint it here when the operator opted into ha_pg_sync_standby. #}
+tags:
+  nofailover: false
+  noloadbalance: false
+  clonefrom: false
+  nosync: {{ (not (ha_pg_sync_standby | default(false) | bool)) | lower }}

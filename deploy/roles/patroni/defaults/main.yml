@@ -1,0 +1,62 @@
+---
+#
+# Patroni role defaults. Patroni manages PostgreSQL - we do NOT run
+# the OS postgresql service alongside; the role stops and masks it.
+#
+
+patroni_user: postgres
+patroni_group: postgres
+patroni_conf_dir: /etc/patroni
+patroni_log_dir: /var/log/patroni
+patroni_data_dir: "/var/lib/postgresql/{{ postgresql_version }}/main"
+patroni_bin: "{{ patroni_bin_override | default('/usr/local/bin/patroni') }}"
+patroni_pip_extras: "[etcd3]"
+
+# Scope identifies the cluster inside the DCS. One per environment.
+ha_cluster_name: dhis2
+patroni_scope: "{{ ha_cluster_name }}"
+patroni_name: "{{ inventory_hostname }}"
+
+# REST API. HAProxy polls this to route writes/reads. Localhost-only
+# by default; the firewall layer opens it to HAProxy hosts.
+patroni_rest_bind: "0.0.0.0"
+patroni_rest_port: 8008
+# Credentials - override in a vault file. Default empty = anonymous
+# (acceptable only inside a locked-down management network).
+patroni_rest_user: patroni
+patroni_rest_password: ""
+
+# Streaming replication user. Patroni creates this role.
+patroni_replication_user: replicator
+patroni_replication_password: ""   # vaulted
+
+# superuser (for Patroni's own bootstrap operations)
+patroni_superuser: postgres
+patroni_superuser_password: ""     # vaulted
+
+# DCS loop + failover timing. Defaults match Patroni's recommended
+# values for a sub-minute failover.
+patroni_ttl: 30
+patroni_loop_wait: 10
+patroni_retry_timeout: 10
+# How many bytes of replication lag disqualify a replica from failover
+patroni_maximum_lag_on_failover: 1048576   # 1 MiB
+
+# Synchronous replication. The 1 sync + 1 async topology comes from
+# the HA plan. Only effective when at least one replica has
+# ha_pg_sync_standby=true.
+patroni_synchronous_mode: true
+patroni_synchronous_mode_strict: false
+
+# PostgreSQL parameters that Patroni writes into the cluster DCS and
+# applies on every member. These are shared with the single-node
+# postgres role defaults so the operator experience is consistent.
+pg_max_wal_size: 4GB
+pg_min_wal_size: 80MB
+pg_max_connections: 400
+# archive_mode etc flow in via the HA Phase 3 wal-g integration
+
+# etcd client config. Discovered from the [etcd] inventory group.
+patroni_etcd_hosts: "{{ groups['etcd'] | map('extract', hostvars) | map(attribute='ansible_default_ipv4') | map(attribute='address') | list }}"
+patroni_etcd_port: 2379
+patroni_etcd_protocol: http    # https when ha_etcd_tls=true

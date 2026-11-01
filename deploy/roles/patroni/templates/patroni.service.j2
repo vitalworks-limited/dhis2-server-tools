@@ -1,0 +1,24 @@
+[Unit]
+Description=Patroni (DHIS2 HA PostgreSQL manager)
+Documentation=https://patroni.readthedocs.io
+After=network-online.target etcd.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User={{ patroni_user }}
+Group={{ patroni_group }}
+ExecStart={{ patroni_bin }} {{ patroni_conf_dir }}/patroni.yml
+KillMode=process
+Restart=on-failure
+RestartSec=5s
+TimeoutSec=60
+LimitNOFILE=65536
+
+# Patroni writes to the PG data_dir; it does NOT need to be hardened
+# with ProtectHome etc because postgresql needs filesystem access.
+# We rely on filesystem permissions (0700 on data_dir, 0640 on
+# patroni.yml).
+
+[Install]
+WantedBy=multi-user.target
