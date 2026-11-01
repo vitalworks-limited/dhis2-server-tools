@@ -1,0 +1,20 @@
+[Unit]
+Description=HAProxy for PostgreSQL (dhis2-server-tools HA)
+Documentation=https://docs.haproxy.org
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+EnvironmentFile=-/etc/default/haproxy
+ExecStartPre=/usr/sbin/haproxy -c -f /etc/haproxy/haproxy-pg.cfg
+ExecStart=/usr/sbin/haproxy -Ws -f /etc/haproxy/haproxy-pg.cfg -p /run/haproxy-pg.pid
+ExecReload=/usr/sbin/haproxy -c -f /etc/haproxy/haproxy-pg.cfg
+ExecReload=/bin/kill -USR2 $MAINPID
+KillMode=mixed
+Restart=on-failure
+RestartSec=5s
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

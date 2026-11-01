@@ -1,0 +1,28 @@
+---
+# haproxy-pg role defaults.
+#
+# This HAProxy is separate from the application-tier reverse proxy
+# (the existing `proxy` role for nginx / apache2 / openresty). It
+# routes PostgreSQL client connections to the current Patroni leader
+# (writes) and to any up replica (reads).
+#
+
+ha_pg_lb_write_port: 5000   # app points dhis.conf at this
+ha_pg_lb_read_port: 5001    # analytics / read-only tooling
+
+ha_pg_haproxy_user: haproxy
+ha_pg_haproxy_stats_socket: /run/haproxy/pg.sock
+ha_pg_haproxy_log_facility: local0
+
+# Patroni REST endpoint used for health checks. Must match
+# patroni_rest_port in the patroni role.
+ha_pg_patroni_rest_port: 8008
+
+# Health-check cadence. 2s inter + 3 fall + 2 rise = at most
+# ~6 seconds from a dead primary to HAProxy repointing writes.
+ha_pg_check_inter: 2s
+ha_pg_check_fall: 3
+ha_pg_check_rise: 2
+
+# Candidate server list: all PG hosts.
+ha_pg_candidates: "{{ groups['databases'] }}"

@@ -1,0 +1,39 @@
+---
+#
+# dhis2-ha.yml - HA plays for Phase 1 of the HA plan.
+#
+# Imported from deploy/dhis2.yml only when dhis2_ha is truthy. For
+# every single-node deployment this file is a no-op (the import is
+# gated).
+#
+# Phase 1 scope: etcd + patroni + haproxy-pg.
+# Phase 2 (deferred): app HA + redis + keepalived.
+# Phase 3 (deferred): wal-g + PITR.
+#
+
+- name: HA | etcd DCS cluster
+  hosts: etcd
+  become: true
+  gather_facts: true
+  roles:
+    - role: etcd
+      tags: [etcd-install]
+  tags: [ha, etcd]
+
+- name: HA | PostgreSQL cluster via Patroni
+  hosts: databases
+  become: true
+  gather_facts: true
+  roles:
+    - role: patroni
+      tags: [patroni-install]
+  tags: [ha, patroni]
+
+- name: HA | PostgreSQL connection router
+  hosts: "{{ 'pg_lb' if groups['pg_lb'] | default([]) | length > 0 else 'databases' }}"
+  become: true
+  gather_facts: true
+  roles:
+    - role: haproxy-pg
+      tags: [haproxy-pg-install]
+  tags: [ha, haproxy-pg]

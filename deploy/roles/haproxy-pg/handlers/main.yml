@@ -1,0 +1,15 @@
+---
+- name: Validate and reload haproxy-pg
+  ansible.builtin.shell: |
+    set -e
+    haproxy -c -f /etc/haproxy/haproxy-pg.cfg
+    systemctl reload haproxy-pg || systemctl restart haproxy-pg
+  args:
+    executable: /bin/bash
+
+- name: Reload systemd and restart haproxy-pg
+  ansible.builtin.systemd:
+    name: haproxy-pg
+    state: restarted
+    daemon_reload: true
+    enabled: true

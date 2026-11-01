@@ -1,0 +1,66 @@
+---
+#
+# haproxy-pg role.
+#
+# Runs only when dhis2_ha=true. May be deployed on dedicated [pg_lb]
+# hosts, on the application hosts (co-located with the app LB), or on
+# the PG hosts themselves (Zalando's pattern). We don't prescribe
+# placement here - the inventory does.
+#
+
+- name: haproxy-pg | Install haproxy
+  ansible.builtin.apt:
+    name: haproxy
+    state: present
+    update_cache: true
+  when: ansible_facts['os_family'] | default('') == 'Debian'
+
+- name: haproxy-pg | Ensure runtime directory
+  ansible.builtin.file:
+    path: /run/haproxy
+    state: directory
+    owner: "{{ ha_pg_haproxy_user }}"
+    group: "{{ ha_pg_haproxy_user }}"
+    mode: "0755"
+
+- name: haproxy-pg | Render haproxy-pg.cfg
+  ansible.builtin.template:
+    src: haproxy-pg.cfg.j2
+    dest: /etc/haproxy/haproxy-pg.cfg
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Validate and reload haproxy-pg
+
+- name: haproxy-pg | Install systemd unit
+  ansible.builtin.template:
+    src: haproxy-pg.service.j2
+    dest: /etc/systemd/system/haproxy-pg.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Reload systemd and restart haproxy-pg
+
+- name: haproxy-pg | Open firewall for pg routing ports
+  ansible.builtin.ufw:
+    rule: allow
+    port: "{{ item }}"
+    proto: tcp
+    comment: "pg {{ item }} (haproxy-pg)"
+  loop:
+    - "{{ ha_pg_lb_write_port }}"
+    - "{{ ha_pg_lb_read_port }}"
+  when: ansible_facts['os_family'] | default('') == 'Debian'
+
+- name: haproxy-pg | Enable and start
+  ansible.builtin.systemd:
+    name: haproxy-pg
+    state: started
+    enabled: true
+    daemon_reload: true
+
+- name: haproxy-pg | Wait for write port to accept
+  ansible.builtin.wait_for:
+    host: "127.0.0.1"
+    port: "{{ ha_pg_lb_write_port }}"
+    timeout: 60

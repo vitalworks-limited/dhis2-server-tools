@@ -6,6 +6,17 @@
   roles:
     - role: pre-install
 
+# HA plays - only effective when dhis2_ha=true AND an [etcd] group is
+# populated. The individual plays inside dhis2-ha.yml target the HA
+# groups ([etcd], [databases], [pg_lb]). For single-node deployments
+# [etcd] is empty, so the etcd play is a no-op; the patroni play
+# would still try to run against [databases] without ha knobs, so we
+# gate the import.
+- name: HA | import dhis2-ha playbook
+  ansible.builtin.import_playbook: dhis2-ha.yml
+  when:
+    - dhis2_ha | default(false) | bool
+
 - name: WireGuard VPN bring-up (early — SSH data plane)
   ansible.builtin.import_playbook: playbooks/wireguard.yml
   when: wireguard_data_plane | default(false) | bool
