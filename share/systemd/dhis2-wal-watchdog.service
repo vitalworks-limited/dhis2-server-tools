@@ -1,0 +1,30 @@
+[Unit]
+Description=DHIS2 pg_wal watchdog (dhis2-server-tools)
+Documentation=file:///opt/dhis2-server-tools/docs/CLI-WAL-Operations.md
+After=network-online.target postgresql.service
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+# The watchdog is deliberately independent of Prometheus/Munin so it
+# works on every supported deployment architecture. It logs to
+# journald + a dedicated file; downstream alerting (if any) tails
+# the file or scrapes journald.
+Environment=DHIS2_TOOLS_HOME=/opt/dhis2-server-tools
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+StandardOutput=append:/var/log/dhis2-server-tools/wal-watchdog.log
+StandardError=append:/var/log/dhis2-server-tools/wal-watchdog.log
+# Compliance + status one-liner. Exit code semantics:
+#   0  all green
+#   6  threshold breached (filesystem use OR archive lag OR slot retention)
+#   8  compliance refused config (e.g. max_slot_wal_keep_size=-1)
+# Non-zero exit surfaces as a FAILED unit in journalctl, which the
+# operator's existing alerting (Munin/Grafana/Zabbix) can catch.
+ExecStart=/bin/bash -c 'echo === $(date -u +%FT%TZ) ===; /usr/local/bin/dhis2-db wal status --json || true; /usr/local/bin/dhis2-db wal compliance --json'
+Nice=19
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+
+[Install]
+WantedBy=multi-user.target

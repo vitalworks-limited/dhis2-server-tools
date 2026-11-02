@@ -1,0 +1,16 @@
+[Unit]
+Description=DHIS2 pg_wal watchdog timer (every 5 minutes)
+Documentation=file:///opt/dhis2-server-tools/docs/CLI-WAL-Operations.md
+
+[Timer]
+# First run 30s after boot, then every 5 minutes. Persistent so a
+# missed run (host rebooted during the interval) is still fired on
+# next boot.
+OnBootSec=30s
+OnUnitActiveSec=5min
+AccuracySec=30s
+Persistent=true
+Unit=dhis2-wal-watchdog.service
+
+[Install]
+WantedBy=timers.target

@@ -59,7 +59,15 @@ if [[ "$ACTION" == uninstall ]]; then
         link="$BINDIR/$c"
         [[ -L "$link" ]] && rm -f "$link"
     done
-    echo "Removed symlinks from $BINDIR. $PREFIX and state directories left untouched."
+    # Stop and remove the WAL watchdog timer, leaving its log file in
+    # place for operator reference.
+    if [[ $EUID -eq 0 ]]; then
+        systemctl disable --now dhis2-wal-watchdog.timer 2>/dev/null || true
+        rm -f /etc/systemd/system/dhis2-wal-watchdog.service \
+              /etc/systemd/system/dhis2-wal-watchdog.timer
+        systemctl daemon-reload 2>/dev/null || true
+    fi
+    echo "Removed symlinks from $BINDIR and the WAL watchdog unit. $PREFIX and state directories left untouched."
     exit 0
 fi
 
@@ -75,6 +83,27 @@ rsync -a --delete \
 # Protect any existing user inventory under /etc.
 mkdir -p /etc/dhis2-server-tools /var/log/dhis2-server-tools /var/lib/dhis2-server-tools
 chmod 750 /etc/dhis2-server-tools /var/log/dhis2-server-tools /var/lib/dhis2-server-tools
+
+# WAL Phase 2: install the dhis2-wal-watchdog systemd timer. Runs
+# every 5 minutes against the local DB host and exits non-zero when
+# any WAL threshold is breached - journald marks the unit as FAILED
+# which the operator's existing alerting can catch. See
+# docs/CLI-WAL-Operations.md section 'Phase 2 watchdog'.
+if [[ -d /etc/systemd/system && $EUID -eq 0 ]]; then
+    install -m 0644 "$PREFIX/share/systemd/dhis2-wal-watchdog.service" /etc/systemd/system/
+    install -m 0644 "$PREFIX/share/systemd/dhis2-wal-watchdog.timer"   /etc/systemd/system/
+    systemctl daemon-reload 2>/dev/null || true
+    # Only enable automatically when a [databases] host is reachable
+    # from the controller - the watchdog is DB-aware. Operators who
+    # want it elsewhere enable manually.
+    if command -v dhis2-inventory >/dev/null 2>&1 && \
+       dhis2-inventory list 2>/dev/null | grep -q '\[databases\]'; then
+        systemctl enable --now dhis2-wal-watchdog.timer 2>/dev/null || true
+        echo "  enabled dhis2-wal-watchdog.timer (5-min WAL safety check)"
+    else
+        echo "  installed dhis2-wal-watchdog.timer (enable with: systemctl enable --now dhis2-wal-watchdog.timer)"
+    fi
+fi
 
 # Install logrotate for CLI audit + bundle growth (section 30).
 if [[ -d /etc/logrotate.d && $EUID -eq 0 ]]; then
