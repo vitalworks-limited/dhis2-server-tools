@@ -94,6 +94,22 @@ pg_wal_fs_safe_pct: 70
 pg_wal_compliance_override: false
 
 #
+# WAL Phase 2 - dedicated pg_wal filesystem.
+#
+# When pg_wal_volume is set, roles/postgres/tasks/pg-wal-volume.yml
+# formats and mounts a dedicated block device at the pg_wal path.
+# Guarantees that WAL ENOSPC cannot affect the DATA volume.
+#
+# Opt-in only. Default role behaviour is unchanged.
+#
+# pg_wal_volume: /dev/sdb              # block device path
+# pg_wal_fstype: ext4                  # ext4 | xfs
+# pg_wal_volume_force: false           # overwrite an existing filesystem
+# pg_wal_volume_migrate: false         # migrate an existing cluster
+#                                      # (requires PG stopped first;
+#                                      #  see docs/HA-Runbook-WAL-Volume-Migration.md)
+
+#
 # Continuous WAL archiving. Default OFF to match the existing single-
 # node deployment. When set to 'on', pg_archive_command MUST also be
 # set to a valid shell command and the role will run

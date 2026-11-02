@@ -26,6 +26,14 @@
     - inventory_hostname in groups['databases']
   tags: [postgresql-conf, wal-compliance-preflight]
 
+- name: Dedicated pg_wal volume (opt-in via pg_wal_volume=/dev/XXX)
+  ansible.builtin.include_tasks: pg-wal-volume.yml
+  when:
+    - inventory_hostname in groups['databases']
+    - pg_wal_volume is defined
+    - pg_wal_volume | length > 0
+  tags: [postgresql-install, pg-wal-volume]
+
 - name: WAL archive preflight (only when pg_archive_mode=on)
   ansible.builtin.include_tasks: wal-archive-preflight.yml
   when:

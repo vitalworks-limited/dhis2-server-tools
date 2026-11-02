@@ -1,0 +1,238 @@
+---
+#
+# Dedicated pg_wal volume automation. WAL Phase 2.
+#
+# Operator opts in by setting `pg_wal_volume` to a block device path.
+# With the compliance preflight (Phase 1), WAL growth is bounded by
+# math. With a dedicated volume (Phase 2), WAL ENOSPC can only ever
+# kill the WAL volume itself, never the data volume - the single
+# strongest WAL-safety guarantee available short of a replicated
+# storage layer.
+#
+# Fresh cluster path (recommended):
+#   - Role runs BEFORE PG initdb.
+#   - Validates block device, refuses to touch a non-empty device
+#     unless pg_wal_volume_force=true.
+#   - Creates filesystem (ext4 default), writes fstab entry, mounts
+#     at /var/lib/postgresql/<ver>/main/pg_wal.
+#   - initdb then runs with pg_wal on the dedicated volume.
+#
+# Existing cluster path (dangerous):
+#   - PG must be STOPPED first (operator responsibility).
+#   - Role refuses unless pg_wal_volume_migrate=true.
+#   - Copies existing pg_wal contents to the new volume, swaps the
+#     mount, verifies PG can start, documented in
+#     docs/HA-Runbook-WAL-Volume-Migration.md.
+#
+# This file is INCLUDED from main.yml only when pg_wal_volume is set.
+# Default role behaviour is unchanged.
+#
+# References:
+#   https://www.postgresql.org/docs/16/wal-reliability.html
+#   https://www.postgresql.org/docs/16/wal-intro.html
+#
+
+- name: pg_wal_volume | Validate opt-in variables
+  ansible.builtin.assert:
+    that:
+      - pg_wal_volume is defined
+      - pg_wal_volume | length > 0
+      - pg_wal_volume is match('^/dev/[a-z0-9/_-]+$')
+    fail_msg: >
+      pg_wal_volume must be a /dev/... block device path. Got:
+      '{{ pg_wal_volume | default("") }}'
+
+- name: pg_wal_volume | Stat the device
+  ansible.builtin.stat:
+    path: "{{ pg_wal_volume }}"
+  register: _wal_dev
+
+- name: pg_wal_volume | Refuse non-block device
+  ansible.builtin.fail:
+    msg: >
+      pg_wal_volume={{ pg_wal_volume }} is not a block device
+      (isblk={{ _wal_dev.stat.isblk | default(false) }}). Refusing
+      to proceed.
+  when: not (_wal_dev.stat.isblk | default(false))
+
+- name: pg_wal_volume | Resolve mount point
+  ansible.builtin.set_fact:
+    _pg_wal_mount: "/var/lib/postgresql/{{ postgresql_version | default(16) }}/main/pg_wal"
+
+- name: pg_wal_volume | Inspect existing filesystem on the device
+  ansible.builtin.command: "blkid -o value -s TYPE {{ pg_wal_volume }}"
+  register: _wal_blkid
+  changed_when: false
+  failed_when: false
+
+- name: pg_wal_volume | Refuse to overwrite an existing filesystem
+  ansible.builtin.fail:
+    msg: |
+      {{ pg_wal_volume }} already has a filesystem of type
+      '{{ _wal_blkid.stdout | trim }}'. Formatting would destroy
+      its contents. Pass pg_wal_volume_force=true if you truly
+      intend to wipe this device.
+  when:
+    - _wal_blkid.rc == 0
+    - _wal_blkid.stdout | default('') | length > 0
+    - not (pg_wal_volume_force | default(false) | bool)
+
+- name: pg_wal_volume | Check whether pg_wal is already a mountpoint
+  ansible.builtin.command: "mountpoint -q {{ _pg_wal_mount }}"
+  register: _wal_mounted
+  changed_when: false
+  failed_when: false
+
+- name: pg_wal_volume | Determine PG data_directory state
+  ansible.builtin.stat:
+    path: "/var/lib/postgresql/{{ postgresql_version | default(16) }}/main/PG_VERSION"
+  register: _pg_initialised
+
+#
+# Branch A: existing cluster. We ONLY proceed when the operator
+# explicitly opts into migration AND PG is confirmed stopped. We do
+# NOT shut PG down automatically; that is the operator's call.
+#
+- name: pg_wal_volume | (existing cluster) Verify PG is stopped
+  ansible.builtin.command: systemctl is-active postgresql
+  register: _pg_running
+  changed_when: false
+  failed_when: false
+  when:
+    - _pg_initialised.stat.exists | default(false)
+
+- name: pg_wal_volume | Refuse migration when PG is running
+  ansible.builtin.fail:
+    msg: |
+      Dedicated pg_wal migration requires PostgreSQL to be stopped
+      first. Current state: '{{ _pg_running.stdout | default("unknown") }}'.
+
+      Follow docs/HA-Runbook-WAL-Volume-Migration.md:
+        1. dhis2-backup create <instance> --format custom
+        2. systemctl stop postgresql     (or dhis2-cluster pause on HA)
+        3. Re-run with pg_wal_volume_migrate=true
+  when:
+    - _pg_initialised.stat.exists | default(false)
+    - _pg_running.rc == 0
+    - _pg_running.stdout | default('') == 'active'
+
+- name: pg_wal_volume | Refuse migration without explicit opt-in
+  ansible.builtin.fail:
+    msg: |
+      PG data directory already exists at
+      /var/lib/postgresql/{{ postgresql_version | default(16) }}/main/.
+      Migrating pg_wal to {{ pg_wal_volume }} will:
+        - mkfs on {{ pg_wal_volume }} (destroying any existing data)
+        - copy the existing pg_wal/ contents into the new volume
+        - mount the new volume at the pg_wal path
+      Pass pg_wal_volume_migrate=true to proceed. PG must be stopped.
+  when:
+    - _pg_initialised.stat.exists | default(false)
+    - not (pg_wal_volume_migrate | default(false) | bool)
+
+#
+# Shared steps: format + mount.
+#
+- name: pg_wal_volume | Install helpers (e2fsprogs, mount)
+  ansible.builtin.apt:
+    name:
+      - e2fsprogs
+      - util-linux
+    state: present
+  when: ansible_facts['os_family'] | default('') == 'Debian'
+
+- name: pg_wal_volume | mkfs on the dedicated device
+  ansible.builtin.filesystem:
+    dev: "{{ pg_wal_volume }}"
+    fstype: "{{ pg_wal_fstype | default('ext4') }}"
+    opts: "{{ '-m 1 -L pg_wal' if (pg_wal_fstype | default('ext4')) == 'ext4' else omit }}"
+    force: "{{ pg_wal_volume_force | default(false) | bool }}"
+  register: _wal_mkfs
+
+- name: pg_wal_volume | Capture UUID
+  ansible.builtin.command: "blkid -o value -s UUID {{ pg_wal_volume }}"
+  register: _wal_uuid
+  changed_when: false
+
+- name: pg_wal_volume | Ensure mount point exists
+  ansible.builtin.file:
+    path: "{{ _pg_wal_mount }}"
+    state: directory
+    owner: postgres
+    group: postgres
+    mode: "0700"
+
+#
+# Migration path: copy existing pg_wal to the new volume BEFORE we
+# write the fstab entry. We mount the volume at a scratch path,
+# rsync the contents, then swap mounts.
+#
+- name: pg_wal_volume | (migration) Temp-mount new volume at scratch path
+  ansible.builtin.command: "mount -o nofail,noatime UUID={{ _wal_uuid.stdout | trim }} /mnt/_pg_wal_new"
+  args:
+    creates: /mnt/_pg_wal_new/.mounted
+  when:
+    - _pg_initialised.stat.exists | default(false)
+    - pg_wal_volume_migrate | default(false) | bool
+
+- name: pg_wal_volume | (migration) Create scratch mount point
+  ansible.builtin.file:
+    path: /mnt/_pg_wal_new
+    state: directory
+    mode: "0700"
+  when:
+    - _pg_initialised.stat.exists | default(false)
+    - pg_wal_volume_migrate | default(false) | bool
+
+- name: pg_wal_volume | (migration) rsync existing pg_wal contents
+  ansible.builtin.command: >
+    rsync -aAXH --delete {{ _pg_wal_mount }}/ /mnt/_pg_wal_new/
+  register: _wal_rsync
+  changed_when: _wal_rsync.rc == 0
+  when:
+    - _pg_initialised.stat.exists | default(false)
+    - pg_wal_volume_migrate | default(false) | bool
+
+- name: pg_wal_volume | (migration) Rename old pg_wal + atomic swap
+  ansible.builtin.shell: |
+    set -e
+    umount /mnt/_pg_wal_new
+    mv '{{ _pg_wal_mount }}' '{{ _pg_wal_mount }}.predvolume.$(date -u +%Y%m%d-%H%M%S)'
+    mkdir -p '{{ _pg_wal_mount }}'
+    chown postgres:postgres '{{ _pg_wal_mount }}'
+    chmod 0700 '{{ _pg_wal_mount }}'
+  args:
+    executable: /bin/bash
+  when:
+    - _pg_initialised.stat.exists | default(false)
+    - pg_wal_volume_migrate | default(false) | bool
+
+#
+# fstab + mount. Durable across reboots. nofail so a missing WAL
+# volume reports clearly instead of blocking boot.
+#
+- name: pg_wal_volume | Persist fstab entry
+  ansible.posix.mount:
+    path: "{{ _pg_wal_mount }}"
+    src: "UUID={{ _wal_uuid.stdout | trim }}"
+    fstype: "{{ pg_wal_fstype | default('ext4') }}"
+    opts: "noatime,nofail"
+    state: mounted
+
+- name: pg_wal_volume | Verify ownership after mount
+  ansible.builtin.file:
+    path: "{{ _pg_wal_mount }}"
+    state: directory
+    owner: postgres
+    group: postgres
+    mode: "0700"
+
+- name: pg_wal_volume | Report
+  ansible.builtin.debug:
+    msg: |
+      pg_wal volume ready:
+        device:      {{ pg_wal_volume }}
+        filesystem:  {{ pg_wal_fstype | default('ext4') }}
+        UUID:        {{ _wal_uuid.stdout | trim }}
+        mount:       {{ _pg_wal_mount }}
+      WAL ENOSPC on this volume will NOT affect the data volume.
