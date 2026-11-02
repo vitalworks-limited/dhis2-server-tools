@@ -1,10 +1,10 @@
 # Regression run report
 
-Generated: 2026-11-01T10:44:12Z
+Generated: 2026-11-02T06:25:16Z
 
 Mode: mock
 
-Results: PASS=85 FAIL=0 SKIP=2
+Results: PASS=89 FAIL=0 SKIP=2
 
 | ID | Scenario | Mode | Result | Notes |
 |----|----------|------|--------|-------|
@@ -40,7 +40,7 @@ Results: PASS=85 FAIL=0 SKIP=2
 | Z | unknown source version recorded with confidence | mock | PASS | monitor task records UNKNOWN lineage + confidence |
 | AA | install.sh is controller-only | mock | PASS | installer touches local PREFIX only |
 | AB | managed VMs do not need the CLI repo | mock | PASS | all stateful ops routed through Ansible |
-| AC | controller loss does not stop runtime services | mock | PASS | no controller daemon installed |
+| AC | controller loss does not stop runtime services | mock | PASS | no data-path daemon installed by install.sh |
 | AD | controller coordinates multi-host operations | mock | PASS | upgrade orchestrates backup+instance+deploy |
 | AE | environments isolate inventory | mock | PASS | config resolver honors --environment |
 | AF | dhis2-db flyway failed-row gate | mock | PASS | query against flyway_schema_history is wired |
@@ -95,3 +95,7 @@ Results: PASS=85 FAIL=0 SKIP=2
 | BQ | dhis2-db wal compliance computes budget and exits 6/8 on breach | mock | PASS | compliance subcommand correct |
 | BR | dhis2-doctor wal integrates compliance via dhis2-db wal compliance | mock | PASS | doctor compliance wired |
 | BR2 | patroni template includes compliance knobs | mock | PASS | max_slot_wal_keep_size + archive_timeout rendered |
+| BS | pg_wal_volume task has fresh + migration paths + safety gates | mock | PASS | role task complete |
+| BT | wal-watchdog service+timer present + wired to dhis2-db wal | mock | PASS | watchdog units present |
+| BU | install.sh wires the watchdog + uninstall removes it | mock | PASS | installer wired |
+| BV | dhis2-db wal volume + watchdog status subcommands present | mock | PASS | Phase 2 CLI complete |

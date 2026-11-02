@@ -59,6 +59,8 @@
 #   dhis2-db wal checkpoint                   [--host HOST]
 #   dhis2-db wal emergency-drain --yes        [--host HOST]
 #   dhis2-db wal compliance                   [--host HOST] [--json]
+#   dhis2-db wal volume status                [--host HOST] [--json]
+#   dhis2-db wal watchdog status              [--host HOST] [--json]
 #   dhis2-db replication-slot list            [--host HOST] [--json]
 #   dhis2-db replication-slot drop NAME [--force] [--yes]
 #   dhis2-db replication-slot advance NAME --to LSN [--yes]
@@ -773,6 +775,8 @@ _wal() {
         checkpoint) _wal_checkpoint ;;
         emergency-drain) _wal_emergency_drain "$@" ;;
         compliance) _wal_compliance ;;
+        volume) _wal_volume "$@" ;;
+        watchdog) _wal_watchdog "$@" ;;
         --help|-h|help)
             awk '/^# -------- WAL disk safety/,/^#$/' "$0" | sed 's/^# \{0,1\}//'
             exit 0
@@ -973,6 +977,124 @@ _wal_compliance() {
             exit "$DHIS2_EXIT_HEALTH"
         fi
         dhis2_status_ok "OK"; echo " - WAL configuration is compliant"
+    fi
+}
+
+#
+# WAL Phase 2 inspection commands.
+#
+# dhis2-db wal volume status [--host HOST] [--json]
+#   Reports the device, filesystem, mount point, size, and used %
+#   of the pg_wal filesystem. Distinguishes "dedicated volume" from
+#   "shared with data directory". Non-zero exit when pg_wal is on
+#   the data volume AND the operator intended a dedicated volume
+#   (based on inventory variable).
+#
+# dhis2-db wal watchdog status [--host HOST] [--json]
+#   Reports systemd timer state + last run + last journal line.
+#
+_wal_volume() {
+    local sub="${1:-status}"; shift || true
+    case "$sub" in
+        status) _wal_volume_status ;;
+        *) dhis2_log_error "Usage: dhis2-db wal volume status"; exit "$DHIS2_EXIT_USAGE" ;;
+    esac
+}
+
+_wal_volume_status() {
+    local out
+    out=$(dhis2_ansible_adhoc "$DB_HOST" shell -a "
+        set -eo pipefail
+        dd=\$(sudo -u postgres psql -X -tAc 'SHOW data_directory' 2>/dev/null || echo /var/lib/postgresql/16/main)
+        wal=\$dd/pg_wal
+        # Device backing the pg_wal path
+        dev=\$(df -P \"\$wal\" 2>/dev/null | awk 'NR>1 {print \$1; exit}')
+        # Device backing the data_directory
+        dev_dd=\$(df -P \"\$dd\"  2>/dev/null | awk 'NR>1 {print \$1; exit}')
+        fs_type=\$(findmnt -no FSTYPE --target \"\$wal\" 2>/dev/null)
+        fs_size=\$(df -B1 \"\$wal\" 2>/dev/null | awk 'NR>1 {print \$2}')
+        fs_used=\$(df -B1 \"\$wal\" 2>/dev/null | awk 'NR>1 {print \$3}')
+        fs_pct=\$(df      \"\$wal\" 2>/dev/null | awk 'NR>1 {print \$5}' | tr -d '%')
+        dedicated=false
+        [[ \"\$dev\" != \"\$dev_dd\" ]] && dedicated=true
+        echo wal_mount=\"\$wal\"
+        echo wal_device=\$dev
+        echo data_device=\$dev_dd
+        echo fstype=\$fs_type
+        echo size_bytes=\$fs_size
+        echo used_bytes=\$fs_used
+        echo used_pct=\$fs_pct
+        echo dedicated=\$dedicated
+    " -b -o 2>&1 | tail -n +2)
+
+    local wal_mount wal_device data_device fstype size used pct dedicated
+    wal_mount=$(echo    "$out" | awk -F= '/^wal_mount=/   {print $2; exit}')
+    wal_device=$(echo   "$out" | awk -F= '/^wal_device=/  {print $2; exit}')
+    data_device=$(echo  "$out" | awk -F= '/^data_device=/ {print $2; exit}')
+    fstype=$(echo       "$out" | awk -F= '/^fstype=/      {print $2; exit}')
+    size=$(echo         "$out" | awk -F= '/^size_bytes=/  {print $2; exit}')
+    used=$(echo         "$out" | awk -F= '/^used_bytes=/  {print $2; exit}')
+    pct=$(echo          "$out" | awk -F= '/^used_pct=/    {print $2; exit}')
+    dedicated=$(echo    "$out" | awk -F= '/^dedicated=/   {print $2; exit}')
+
+    if [[ "$DHIS2_OPT_JSON" == true ]]; then
+        dhis2_json_emit command=dhis2-db-wal action=volume host="$DB_HOST" \
+            mount="$wal_mount" wal_device="$wal_device" data_device="$data_device" \
+            fstype="$fstype" size_bytes="${size:-0}" used_bytes="${used:-0}" used_pct="${pct:-0}" \
+            dedicated="${dedicated:-false}"
+    else
+        dhis2_c_bold "pg_wal volume on $DB_HOST"; echo
+        printf '  mount:        %s\n' "$wal_mount"
+        printf '  wal device:   %s\n' "$wal_device"
+        printf '  data device:  %s\n' "$data_device"
+        printf '  filesystem:   %s\n' "${fstype:-?}"
+        printf '  size:         %s MiB\n' "$(( ${size:-0} / 1024 / 1024 ))"
+        printf '  used:         %s MiB (%s%%)\n' "$(( ${used:-0} / 1024 / 1024 ))" "${pct:-?}"
+        if [[ "$dedicated" == "true" ]]; then
+            dhis2_status_ok "DEDICATED"; echo " - WAL ENOSPC cannot affect the data volume"
+        else
+            dhis2_c_yellow "SHARED"; echo " - pg_wal lives on the same filesystem as data_directory"
+            dhis2_log_info "Phase 2 lets you move pg_wal to its own volume:"
+            dhis2_log_info "  inventory: pg_wal_volume=/dev/sdb"
+            dhis2_log_info "  (existing cluster: see docs/HA-Runbook-WAL-Volume-Migration.md)"
+        fi
+    fi
+}
+
+_wal_watchdog() {
+    local sub="${1:-status}"; shift || true
+    case "$sub" in
+        status) _wal_watchdog_status ;;
+        *) dhis2_log_error "Usage: dhis2-db wal watchdog status"; exit "$DHIS2_EXIT_USAGE" ;;
+    esac
+}
+
+_wal_watchdog_status() {
+    local out
+    out=$(dhis2_ansible_adhoc "$DB_HOST" shell -a "
+        set +e
+        systemctl is-active  dhis2-wal-watchdog.timer   2>/dev/null | sed 's/^/timer_active=/'
+        systemctl is-enabled dhis2-wal-watchdog.timer   2>/dev/null | sed 's/^/timer_enabled=/'
+        systemctl show -p LastTriggerUSec,NextElapseUSecMonotonic dhis2-wal-watchdog.timer 2>/dev/null | sed 's/^/timer_/'
+        echo last_service_result=\$(systemctl show -p Result   dhis2-wal-watchdog.service | cut -d= -f2)
+        echo last_service_rc=\$(systemctl    show -p ExecMainStatus dhis2-wal-watchdog.service | cut -d= -f2)
+    " -b -o 2>&1 | tail -n +2)
+
+    if [[ "$DHIS2_OPT_JSON" == true ]]; then
+        local timer_active timer_enabled last_result last_rc
+        timer_active=$(echo "$out" | awk -F= '/^timer_active=/           {print $2; exit}')
+        timer_enabled=$(echo "$out" | awk -F= '/^timer_enabled=/         {print $2; exit}')
+        last_result=$(echo "$out" | awk -F= '/^last_service_result=/     {print $2; exit}')
+        last_rc=$(echo "$out" | awk -F= '/^last_service_rc=/             {print $2; exit}')
+        dhis2_json_emit command=dhis2-db-wal action=watchdog host="$DB_HOST" \
+            timer_active="${timer_active:-unknown}" \
+            timer_enabled="${timer_enabled:-unknown}" \
+            last_service_result="${last_result:-unknown}" \
+            last_service_rc="${last_rc:-0}"
+    else
+        dhis2_c_bold "dhis2-wal-watchdog on $DB_HOST"; echo
+        echo "$out"
+        dhis2_log_info "Tail the watchdog log: journalctl -u dhis2-wal-watchdog.service -n 40"
     fi
 }
 

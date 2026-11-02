@@ -687,6 +687,7 @@ the generated `tests/regression/last-run.md`.
 - [docs/vital-enhancements/ha-implementation-plan.md](./docs/vital-enhancements/ha-implementation-plan.md) — comprehensive HA deployment plan (Patroni, HAProxy, keepalived, LXD/SSH/hybrid topologies)
 - [docs/HA-Patroni.md](./docs/HA-Patroni.md) — HA Phase 1 operator guide (Patroni + etcd + HAProxy)
 - [docs/HA-Runbook-Failover.md](./docs/HA-Runbook-Failover.md) — HA failover runbook (8 scenarios)
+- [docs/HA-Runbook-WAL-Volume-Migration.md](./docs/HA-Runbook-WAL-Volume-Migration.md) — migrate an existing cluster's pg_wal onto a dedicated volume
 - [docs/vital-enhancements/ha-adr-01-dhis2-baseline.md](./docs/vital-enhancements/ha-adr-01-dhis2-baseline.md) through [ha-adr-08-rolling-upgrade-pause.md](./docs/vital-enhancements/ha-adr-08-rolling-upgrade-pause.md) — the 8 locked HA design decisions
 
 ---

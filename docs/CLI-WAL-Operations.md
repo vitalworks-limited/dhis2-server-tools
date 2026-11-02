@@ -132,6 +132,64 @@ The role proceeds, writes an audit entry to
 `/var/log/dhis2-server-tools/audit.ndjson`, and prints the exact
 overage in MiB so the operator can act on the risk.
 
+## Phase 2 — dedicated pg_wal volume
+
+Compliance (above) keeps WAL within budget mathematically. A
+**dedicated `pg_wal` filesystem** is the hardware-level
+belt-and-braces: even if a bug or an operator mistake exceeds the
+configured ceiling, a WAL ENOSPC event only kills the WAL volume,
+never the data volume.
+
+Opt in with an inventory host var:
+
+```ini
+[databases]
+pg01 ansible_host=10.0.1.21 pg_wal_volume=/dev/sdb
+```
+
+Fresh clusters: the role formats and mounts `/dev/sdb` at
+`pg_wal/` *before* `initdb` runs. WAL is on the dedicated volume
+from day one.
+
+Existing clusters: migration is a documented runbook that requires
+PG stopped first and `pg_wal_volume_migrate=true`. See
+[docs/HA-Runbook-WAL-Volume-Migration.md](./HA-Runbook-WAL-Volume-Migration.md).
+
+Inspection:
+
+```bash
+dhis2-db wal volume status           # DEDICATED | SHARED, size, used %
+dhis2-db wal volume status --json
+```
+
+## Phase 2 watchdog
+
+A systemd timer runs every 5 minutes and surfaces WAL issues even
+on deployments without Prometheus or Munin alerting.
+
+- Unit:   `/etc/systemd/system/dhis2-wal-watchdog.service`
+- Timer:  `/etc/systemd/system/dhis2-wal-watchdog.timer`
+- Log:    `/var/log/dhis2-server-tools/wal-watchdog.log`
+
+The service calls `dhis2-db wal status --json` and
+`dhis2-db wal compliance --json`; non-zero exit (6 or 8) is
+surfaced as a FAILED unit in `systemctl` and journald. Operators
+scraping `systemctl status --failed` or wiring journald to their
+alerting stack catch WAL incidents without any Prometheus setup.
+
+```bash
+dhis2-db wal watchdog status
+journalctl -u dhis2-wal-watchdog.service -n 40
+```
+
+The watchdog is installed and enabled automatically by
+`install.sh` when a `[databases]` host is reachable. Operators who
+want to disable it:
+
+```bash
+sudo systemctl disable --now dhis2-wal-watchdog.timer
+```
+
 ## Prevention
 
 The `postgres` role now sets safe defaults for WAL retention:

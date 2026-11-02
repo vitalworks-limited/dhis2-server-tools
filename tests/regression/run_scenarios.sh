@@ -444,13 +444,24 @@ scenario_AB() {
 }
 
 scenario_AC() {
-    # Scenario AC - controller unavailable: runtime services continue
-    # This is a property of the architecture, not the CLI. We confirm that
-    # install.sh does not create any always-on service on the controller.
-    if ! grep -qE 'systemctl.*enable|systemctl.*start' "$ROOT/install.sh"; then
-        _rec AC "controller loss does not stop runtime services" mock PASS "no controller daemon installed"
+    # Scenario AC - controller unavailable: runtime services continue.
+    # Architecture property. The installer may enable OBSERVATIONAL
+    # helpers on the controller (e.g. the WAL watchdog that reads
+    # DB state and alerts) because those do not sit in the data path -
+    # losing them stops alerting, not DHIS2 itself. We verify that:
+    #   1. The installer enables ONLY the dhis2-wal-watchdog.timer
+    #      and no other systemd units.
+    #   2. Managed VMs' runtime services (nginx, tomcat9, postgresql,
+    #      patroni, etcd, haproxy-pg) are installed by their roles,
+    #      NOT by install.sh.
+    local offenders
+    offenders=$(grep -E 'systemctl.*(enable|start)' "$ROOT/install.sh" \
+                | grep -v 'dhis2-wal-watchdog' \
+                | grep -v '^\s*#')
+    if [[ -z "$offenders" ]]; then
+        _rec AC "controller loss does not stop runtime services" mock PASS "no data-path daemon installed by install.sh"
     else
-        _rec AC "controller loss does not stop runtime services" mock FAIL "installer enables a daemon"
+        _rec AC "controller loss does not stop runtime services" mock FAIL "unexpected enabled daemon(s): $offenders"
     fi
 }
 
@@ -937,6 +948,58 @@ scenario_BR() {
     fi
 }
 
+# ---------- WAL Phase 2 scenarios (BS-BV) ----------
+
+scenario_BS() {
+    # pg-wal-volume.yml exists, is wired, has fresh + migration paths
+    local f="$ROOT/deploy/roles/postgres/tasks/pg-wal-volume.yml"
+    local ok=true
+    [[ -f "$f" ]] || ok=false
+    grep -q 'pg-wal-volume.yml' "$ROOT/deploy/roles/postgres/tasks/main.yml" || ok=false
+    grep -q 'Refuse migration when PG is running' "$f" || ok=false
+    grep -q 'Refuse migration without explicit opt-in' "$f" || ok=false
+    grep -q 'Refuse to overwrite an existing filesystem' "$f" || ok=false
+    $ok && _rec BS "pg_wal_volume task has fresh + migration paths + safety gates" mock PASS "role task complete" \
+         || _rec BS "pg_wal_volume task has fresh + migration paths + safety gates" mock FAIL "role task incomplete"
+}
+
+scenario_BT() {
+    # Watchdog systemd unit + timer ship with the repo
+    local svc="$ROOT/share/systemd/dhis2-wal-watchdog.service"
+    local tmr="$ROOT/share/systemd/dhis2-wal-watchdog.timer"
+    local ok=true
+    [[ -f "$svc" && -f "$tmr" ]] || ok=false
+    grep -q 'dhis2-db wal status' "$svc" || ok=false
+    grep -q 'dhis2-db wal compliance' "$svc" || ok=false
+    grep -q 'OnUnitActiveSec=5min' "$tmr" || ok=false
+    $ok && _rec BT "wal-watchdog service+timer present + wired to dhis2-db wal" mock PASS "watchdog units present" \
+         || _rec BT "wal-watchdog service+timer present + wired to dhis2-db wal" mock FAIL "watchdog units missing"
+}
+
+scenario_BU() {
+    # install.sh installs + enables the watchdog, and uninstall removes it
+    local ok=true
+    grep -q 'dhis2-wal-watchdog.service' "$ROOT/install.sh" || ok=false
+    grep -q 'dhis2-wal-watchdog.timer'   "$ROOT/install.sh" || ok=false
+    grep -q 'systemctl enable --now dhis2-wal-watchdog.timer' "$ROOT/install.sh" || ok=false
+    grep -q 'systemctl disable --now dhis2-wal-watchdog.timer' "$ROOT/install.sh" || ok=false
+    $ok && _rec BU "install.sh wires the watchdog + uninstall removes it" mock PASS "installer wired" \
+         || _rec BU "install.sh wires the watchdog + uninstall removes it" mock FAIL "installer incomplete"
+}
+
+scenario_BV() {
+    # dhis2-db wal volume status + dhis2-db wal watchdog status wired
+    local body
+    body=$(awk '/^_wal_volume\(\)/,/^_wal_emergency_drain\(\)/' "$BIN/dhis2-db")
+    local ok=true
+    echo "$body" | grep -q 'dedicated=false' || ok=false
+    echo "$body" | grep -q 'wal_device' || ok=false
+    grep -q '_wal_watchdog_status' "$BIN/dhis2-db" || ok=false
+    grep -q 'dhis2-wal-watchdog.timer' "$BIN/dhis2-db" || ok=false
+    $ok && _rec BV "dhis2-db wal volume + watchdog status subcommands present" mock PASS "Phase 2 CLI complete" \
+         || _rec BV "dhis2-db wal volume + watchdog status subcommands present" mock FAIL "Phase 2 CLI incomplete"
+}
+
 scenario_AW() {
     # WAL CLI family wired
     local ok=true
@@ -1053,6 +1116,7 @@ scenario_AW; scenario_AX; scenario_AY; scenario_AZ
 scenario_BA; scenario_BB; scenario_BC; scenario_BD; scenario_BE; scenario_BF
 scenario_BG; scenario_BH; scenario_BI; scenario_BJ; scenario_BK; scenario_BL; scenario_BM
 scenario_BN; scenario_BO; scenario_BP; scenario_BQ; scenario_BR
+scenario_BS; scenario_BT; scenario_BU; scenario_BV
 
 _write_report
 echo
