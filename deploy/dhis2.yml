@@ -6,6 +6,19 @@
   roles:
     - role: pre-install
 
+# Boombox fact-based tunings - only when dhis2_architecture=boombox.
+# Runs after pre-install and BEFORE postgres so the computed facts
+# (pg_shared_buffers, heap_memory_size, pg_max_wal_size, TLS_TYPE)
+# are already set when the downstream roles consume them.
+- name: Boombox | fact-based tunings
+  hosts: all:!127.0.0.1
+  become: true
+  gather_facts: true
+  roles:
+    - role: boombox
+      when: dhis2_architecture | default('lxd') == 'boombox'
+  tags: [boombox]
+
 # HA plays - only effective when dhis2_ha=true AND an [etcd] group is
 # populated. The individual plays inside dhis2-ha.yml target the HA
 # groups ([etcd], [databases], [pg_lb]). For single-node deployments

@@ -1,0 +1,59 @@
+---
+#
+# boombox role defaults.
+#
+# The role runs ONLY when dhis2_architecture=boombox. It computes
+# fact-based tunings and exports them as set_facts so the downstream
+# roles (postgres, create-instance, proxy, monitoring) consume the
+# same values the operator sees reported by `dhis2-doctor boombox`.
+#
+# Every value is an UPPER BOUND the role will NOT exceed when
+# auto-computing. The operator can override any variable per host
+# in inventory and the role honours that override (the role only
+# sets a value when the operator has not).
+#
+
+#
+# Mode selection. Set at init time by `dhis2-deploy init`.
+#   production  - fqdn + email required; Let's Encrypt default;
+#                 hardened preflight.
+#   workshop    - fqdn optional; self-signed default; warnings
+#                 over failures.
+#
+boombox_mode: production
+
+#
+# Resource budget. The role will not auto-assign more than these
+# shares of RAM to any single service, leaving the rest for the OS
+# cache, buffers, and burst headroom.
+#
+boombox_pg_ram_fraction: 0.25           # shared_buffers target
+boombox_pg_cache_fraction: 0.60         # effective_cache_size
+boombox_pg_maint_fraction: 0.10         # maintenance_work_mem
+boombox_pg_maint_min_mb: 256
+boombox_pg_maint_max_mb: 2048
+boombox_jvm_ram_fraction: 0.40          # Tomcat heap
+boombox_jvm_heap_max_gb: 32             # hard upper cap
+
+#
+# Connection headroom. 20 * nproc is a reasonable minimum for a
+# DHIS2 workload with a single Tomcat; raise if you expect to add
+# an analytics worker.
+#
+boombox_pg_connections_per_cpu: 20
+boombox_pg_connections_floor: 100
+
+#
+# WAL compliance targets (feed into max_wal_size / max_slot_wal_keep_size).
+#   wal_size_fs_fraction  - fraction of root FS budget we're willing
+#                           to dedicate to pg_wal headroom
+#   wal_size_max_gb       - hard upper cap even on huge disks
+#
+boombox_wal_size_fs_fraction: 0.10
+boombox_wal_size_max_gb: 16
+
+#
+# Reporting - the role sets this fact so downstream code (and
+# `dhis2-doctor boombox`) can tell it is on a boombox cleanly.
+#
+boombox_detected: true

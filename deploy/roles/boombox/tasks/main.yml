@@ -1,0 +1,104 @@
+---
+#
+# boombox role entry.
+#
+# Fact-based tunings computed from the host's RAM / CPU / disk.
+# Every value is overridable in inventory - the role only sets a
+# value when the operator has NOT already set it.
+#
+# Runs on the single boombox host (ansible_connection=local).
+# Section 11.3 "preflight MUST be read-only" is honoured: no
+# packages are installed and no services are started by this role;
+# it only sets facts.
+#
+
+- name: boombox | Gather resource facts
+  ansible.builtin.setup:
+    gather_subset:
+      - '!all'
+      - '!min'
+      - hardware
+      - processor
+      - mounts
+  when: ansible_memtotal_mb is not defined
+
+- name: boombox | Report host resources
+  ansible.builtin.debug:
+    msg:
+      - "boombox mode:       {{ boombox_mode | default('production') }}"
+      - "host RAM:           {{ ansible_memtotal_mb }} MiB"
+      - "host CPUs:          {{ ansible_processor_vcpus | default(ansible_processor_count) }}"
+      - "root FS free bytes: {{ (ansible_mounts | selectattr('mount', 'eq', '/') | map(attribute='size_available') | first) | default('?') }}"
+
+#
+# Compute every tunable. The role uses `default()` on the operator-
+# facing variable name so an inventory-level override wins.
+#
+- name: boombox | Compute PostgreSQL tunings
+  ansible.builtin.set_fact:
+    pg_shared_buffers: "{{ pg_shared_buffers | default( (ansible_memtotal_mb * boombox_pg_ram_fraction) | round | int | string + 'MB' ) }}"
+    pg_effective_cache_size: "{{ pg_effective_cache_size | default( (ansible_memtotal_mb * boombox_pg_cache_fraction) | round | int | string + 'MB' ) }}"
+    pg_maintenance_work_mem: "{{ pg_maintenance_work_mem | default(
+         [[(ansible_memtotal_mb * boombox_pg_maint_fraction) | round | int, boombox_pg_maint_min_mb] | max,
+           boombox_pg_maint_max_mb] | min | string + 'MB' ) }}"
+    pg_max_connections: "{{ pg_max_connections | default(
+         [(ansible_processor_vcpus | default(ansible_processor_count) | int) * boombox_pg_connections_per_cpu,
+          boombox_pg_connections_floor] | max ) }}"
+
+- name: boombox | Compute work_mem from max_connections
+  ansible.builtin.set_fact:
+    pg_work_mem: "{{ pg_work_mem | default(
+         [(ansible_memtotal_mb * 0.05 / (pg_max_connections | int)) | round | int, 4] | max
+         | string + 'MB' ) }}"
+
+- name: boombox | Compute JVM heap for Tomcat/DHIS2
+  ansible.builtin.set_fact:
+    heap_memory_size: "{{ heap_memory_size | default(
+         [(ansible_memtotal_mb * boombox_jvm_ram_fraction) | round | int,
+          boombox_jvm_heap_max_gb * 1024] | min
+         | string + 'M' ) }}"
+
+#
+# WAL compliance targets. The role prefers:
+#   max_wal_size            = min(wal_size_max_gb, wal_size_fs_fraction * root_free)
+#   max_slot_wal_keep_size  = 2 * max_wal_size (keeps the compliance
+#                             preflight comfortable)
+#
+- name: boombox | Compute WAL compliance targets
+  ansible.builtin.set_fact:
+    _boombox_root_free_bytes: "{{ (ansible_mounts | selectattr('mount', 'eq', '/') | map(attribute='size_available') | first) | default(0) }}"
+
+- name: boombox | Compute pg_max_wal_size (compliance-safe)
+  ansible.builtin.set_fact:
+    pg_max_wal_size: "{{ pg_max_wal_size | default(
+         [((_boombox_root_free_bytes | int) * boombox_wal_size_fs_fraction / 1024 / 1024 / 1024) | round | int,
+          boombox_wal_size_max_gb] | min
+         | string + 'GB' ) }}"
+
+- name: boombox | Derive pg_max_slot_wal_keep_size (2x pg_max_wal_size)
+  ansible.builtin.set_fact:
+    pg_max_slot_wal_keep_size: "{{ pg_max_slot_wal_keep_size | default(
+         ( (pg_max_wal_size | regex_replace('[^0-9]', '') | int) * 2 ) | string + 'GB'
+         ) }}"
+
+#
+# TLS / fqdn defaults by mode. The create-instance role honours
+# TLS_TYPE if set; we only set it when the operator has not.
+#
+- name: boombox | Default TLS mode by boombox_mode
+  ansible.builtin.set_fact:
+    TLS_TYPE: "{{ TLS_TYPE | default( 'letsencrypt' if boombox_mode == 'production' else 'selfsigned' ) }}"
+
+- name: boombox | Report computed tunings
+  ansible.builtin.debug:
+    msg:
+      - "pg_shared_buffers:           {{ pg_shared_buffers }}"
+      - "pg_effective_cache_size:     {{ pg_effective_cache_size }}"
+      - "pg_work_mem:                 {{ pg_work_mem }}"
+      - "pg_maintenance_work_mem:     {{ pg_maintenance_work_mem }}"
+      - "pg_max_connections:          {{ pg_max_connections }}"
+      - "heap_memory_size:            {{ heap_memory_size }}"
+      - "pg_max_wal_size:             {{ pg_max_wal_size }}"
+      - "pg_max_slot_wal_keep_size:   {{ pg_max_slot_wal_keep_size }}"
+      - "TLS_TYPE:                    {{ TLS_TYPE }}"
+      - "boombox mode:                {{ boombox_mode }}"
