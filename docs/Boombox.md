@@ -179,16 +179,26 @@ The two instances share:
 That is OK for workshop + small single-site. For real isolation
 across instances, use LXD.
 
-## Migrating to LXD later (Phase 4)
+## Migrating to LXD later
 
 If you outgrow boombox (performance ceiling, multi-tenant need,
-upgrade to HA), a dedicated migration subcommand is planned:
+upgrade to HA), use the automated migration:
 
 ```bash
-dhis2-deploy migrate boombox-to-lxd    # Phase 4 - not yet shipped
+# 1. plan + preflight only (no changes)
+dhis2-deploy migrate boombox-to-lxd
+
+# 2. dry-run - prints every command that would run
+dhis2-deploy migrate boombox-to-lxd --dry-run
+
+# 3. actually execute (requires --yes + typed instance name)
+dhis2-deploy migrate boombox-to-lxd --execute --yes --instance hmis
 ```
 
-Until Phase 4 lands, the manual migration path is:
+Full runbook with 13 stages, rollback paths, and known limitations:
+[docs/Boombox-to-LXD-Migration.md](./Boombox-to-LXD-Migration.md).
+
+If you need to migrate manually instead:
 1. `dhis2-backup create <instance> --format custom --verify`
 2. Provision a new host or wipe this one.
 3. `dhis2-deploy init --architecture lxd` on the new host.

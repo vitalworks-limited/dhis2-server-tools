@@ -1,10 +1,10 @@
 # Regression run report
 
-Generated: 2026-11-03T10:44:04Z
+Generated: 2026-11-03T11:05:34Z
 
 Mode: mock
 
-Results: PASS=95 FAIL=0 SKIP=2
+Results: PASS=100 FAIL=0 SKIP=2
 
 | ID | Scenario | Mode | Result | Notes |
 |----|----------|------|--------|-------|
@@ -105,3 +105,8 @@ Results: PASS=95 FAIL=0 SKIP=2
 | BY | preflight refuses boombox + dhis2_ha=true | mock | PASS | rule 13 enforced |
 | BZ | boombox role + playbook + doctor all wired | mock | PASS | integration complete |
 | BZ2 | resource shortfalls are warnings (locked decision 1) | mock | PASS | warnings not fails |
+| CA | migrate boombox-to-lxd refuses non-boombox inventories | mock | PASS | architecture gate present |
+| CB | migrate --execute refuses without --yes | mock | PASS | safety guard present |
+| CC | migrate --dry-run prints full plan including destructive stages | mock | PASS | dry-run complete |
+| CD | migrate has rollback-pre + operator-restore + audit records | mock | PASS | safety paths wired |
+| CE | post-migration inventory is LXD-shaped | mock | PASS | renderer correct |

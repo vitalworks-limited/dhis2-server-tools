@@ -1060,6 +1060,75 @@ EOF
     fi
 }
 
+scenario_CA() {
+    # migrate boombox-to-lxd exists and refuses non-boombox inventories
+    if ! grep -q 'migrate) _migrate' "$BIN/dhis2-deploy"; then
+        _rec CA "dhis2-deploy migrate subcommand wired" mock FAIL "migrate not wired"
+        return
+    fi
+    local tmp; tmp=$(mktemp)
+    cat > "$tmp" <<'EOF'
+[databases]
+pg01 ansible_host=10.0.0.1
+[instances]
+hmis ansible_host=10.0.0.2
+[all:vars]
+dhis2_architecture=lxd
+EOF
+    chmod 600 "$tmp"
+    local out rc=0
+    out=$(DHIS2_INVENTORY="$tmp" "$BIN/dhis2-deploy" migrate boombox-to-lxd 2>&1 </dev/null) || rc=$?
+    rm -f "$tmp"
+    if (( rc == 3 )) && echo "$out" | grep -q 'requires dhis2_architecture=boombox'; then
+        _rec CA "migrate boombox-to-lxd refuses non-boombox inventories" mock PASS "architecture gate present"
+    else
+        _rec CA "migrate boombox-to-lxd refuses non-boombox inventories" mock FAIL "architecture gate missing (rc=$rc)"
+    fi
+}
+
+scenario_CB() {
+    # --execute refuses without --yes
+    if grep -q 'refuses to proceed without --yes' "$BIN/dhis2-deploy"; then
+        _rec CB "migrate --execute refuses without --yes" mock PASS "safety guard present"
+    else
+        _rec CB "migrate --execute refuses without --yes" mock FAIL "safety guard missing"
+    fi
+}
+
+scenario_CC() {
+    # Dry-run prints the full plan including destructive stages
+    if grep -q '_migrate_boombox_dryrun' "$BIN/dhis2-deploy" \
+       && awk '/_migrate_boombox_dryrun\(\)/,/^}/' "$BIN/dhis2-deploy" | grep -q 'Stage 6 - install LXD' \
+       && awk '/_migrate_boombox_dryrun\(\)/,/^}/' "$BIN/dhis2-deploy" | grep -q 'Stage 9 - restore'; then
+        _rec CC "migrate --dry-run prints full plan including destructive stages" mock PASS "dry-run complete"
+    else
+        _rec CC "migrate --dry-run prints full plan including destructive stages" mock FAIL "dry-run incomplete"
+    fi
+}
+
+scenario_CD() {
+    # Automatic rollback for pre-destructive; operator-handoff for post-destructive. Both audited.
+    local body; body=$(awk '/^_migrate_boombox_execute\(\)/,/^main \"\$@\"/' "$BIN/dhis2-deploy")
+    local ok=true
+    echo "$body" | grep -q 'rollback-pre' || ok=false
+    echo "$body" | grep -q 'operator-restore' || ok=false
+    echo "$body" | grep -q 'destructive-point' || ok=false
+    echo "$body" | grep -q 'dhis2_log_audit' || ok=false
+    $ok && _rec CD "migrate has rollback-pre + operator-restore + audit records" mock PASS "safety paths wired" \
+         || _rec CD "migrate has rollback-pre + operator-restore + audit records" mock FAIL "safety paths incomplete"
+}
+
+scenario_CE() {
+    # LXD inventory renderer produces the expected shape
+    if awk '/_migrate_boombox_render_lxd_inventory\(\)/,/^}/' "$BIN/dhis2-deploy" | grep -q 'ansible_connection=lxd' \
+       && awk '/_migrate_boombox_render_lxd_inventory\(\)/,/^}/' "$BIN/dhis2-deploy" | grep -q 'dhis2_architecture=lxd' \
+       && awk '/_migrate_boombox_render_lxd_inventory\(\)/,/^}/' "$BIN/dhis2-deploy" | grep -q '\[databases\]'; then
+        _rec CE "post-migration inventory is LXD-shaped" mock PASS "renderer correct"
+    else
+        _rec CE "post-migration inventory is LXD-shaped" mock FAIL "renderer missing fields"
+    fi
+}
+
 scenario_BZ() {
     # Boombox role + dispatcher wiring: role exists; dhis2.yml gates on
     # dhis2_architecture=boombox; dhis2-doctor exposes a boombox check
@@ -1211,6 +1280,7 @@ scenario_BG; scenario_BH; scenario_BI; scenario_BJ; scenario_BK; scenario_BL; sc
 scenario_BN; scenario_BO; scenario_BP; scenario_BQ; scenario_BR
 scenario_BS; scenario_BT; scenario_BU; scenario_BV
 scenario_BW; scenario_BX; scenario_BY; scenario_BZ
+scenario_CA; scenario_CB; scenario_CC; scenario_CD; scenario_CE
 
 _write_report
 echo

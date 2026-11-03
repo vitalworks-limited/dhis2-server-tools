@@ -687,6 +687,7 @@ the generated `tests/regression/last-run.md`.
 - [docs/vital-enhancements/wal-disk-safety-plan.md](./docs/vital-enhancements/wal-disk-safety-plan.md) — WAL disk-pressure defence-in-depth plan
 - [docs/vital-enhancements/ha-implementation-plan.md](./docs/vital-enhancements/ha-implementation-plan.md) — comprehensive HA deployment plan (Patroni, HAProxy, keepalived, LXD/SSH/hybrid topologies)
 - [docs/Boombox.md](./docs/Boombox.md) — all-in-one single-host operator guide (no LXD)
+- [docs/Boombox-to-LXD-Migration.md](./docs/Boombox-to-LXD-Migration.md) — automated migration from boombox to the LXD topology
 - [docs/HA-Patroni.md](./docs/HA-Patroni.md) — HA Phase 1 operator guide (Patroni + etcd + HAProxy)
 - [docs/HA-Runbook-Failover.md](./docs/HA-Runbook-Failover.md) — HA failover runbook (8 scenarios)
 - [docs/HA-Runbook-WAL-Volume-Migration.md](./docs/HA-Runbook-WAL-Volume-Migration.md) — migrate an existing cluster's pg_wal onto a dedicated volume
