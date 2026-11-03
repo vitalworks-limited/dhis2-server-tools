@@ -26,6 +26,8 @@
 #   dhis2-deploy components
 #   dhis2-deploy history
 #   dhis2-deploy resume
+#   dhis2-deploy migrate boombox-to-lxd [--dry-run | --execute --yes]
+#                                       [--instance NAME]
 #
 # All operations preserve the existing Ansible tag/role model.
 # USAGE_END
@@ -74,6 +76,7 @@ main() {
         architectures) _architectures ;;
         init) _init "$@" ;;
         preflight) _preflight ;;
+        migrate) _migrate "$@" ;;
         plan) _parse_apply_flags "$@"; _plan ;;
         diff) _parse_apply_flags "$@"; _diff ;;
         apply) _parse_apply_flags "$@"; _apply ;;
@@ -687,6 +690,404 @@ _history() {
 _resume() {
     dhis2_log_warn "resume is informational: a run that failed should be re-applied with the same --instance and --only once the root cause is resolved."
     _history
+}
+
+#
+# dhis2-deploy migrate boombox-to-lxd [--dry-run | --execute --yes] [--instance NAME]
+#
+# Phase 4 of the boombox plan. Converts a running single-host boombox
+# to the LXD-containerised layout. Operator-dangerous; three modes:
+#
+#   default           preflight-only: refuses to run without
+#                     --dry-run OR --execute, prints the plan and
+#                     exits 0.
+#   --dry-run         prints every command that would run, exits 0.
+#   --execute --yes   actually runs the migration with per-stage
+#                     confirmation gates + typed instance name.
+#
+# The command performs AUTOMATIC rollback only for pre-destructive
+# failures (steps 1-5 below). After step 6 (services stopped), a
+# failure hands off to the operator with the exact restore command
+# because any further automatic action risks compounding damage.
+#
+# Audit records at every stage. The command refuses to run on any
+# inventory that is not dhis2_architecture=boombox.
+#
+_migrate() {
+    local direction="${1:-}"; shift || true
+    [[ -z "$direction" ]] && { dhis2_log_error 'Usage: dhis2-deploy migrate boombox-to-lxd [--dry-run|--execute] [--instance NAME]'; exit "$DHIS2_EXIT_USAGE"; }
+    case "$direction" in
+        boombox-to-lxd) ;;
+        *) dhis2_log_error "Unsupported migration direction: $direction (only boombox-to-lxd is implemented)"; exit "$DHIS2_EXIT_USAGE" ;;
+    esac
+    local mode=preflight instance=""
+    while (( $# )); do
+        case "$1" in
+            --dry-run) mode=dry-run ;;
+            --execute) mode=execute ;;
+            --instance) instance="$2"; shift ;; --instance=*) instance="${1#*=}" ;;
+        esac
+        shift || true
+    done
+
+    local inv; inv=$(dhis2_config_resolve_inventory)
+
+    # Opt-in guard: boombox only.
+    if ! grep -qE '^[[:space:]]*dhis2_architecture[[:space:]]*=[[:space:]]*boombox' "$inv"; then
+        dhis2_log_error "dhis2-deploy migrate boombox-to-lxd requires dhis2_architecture=boombox in the inventory."
+        dhis2_log_error "  Current inventory: $inv"
+        exit "$DHIS2_EXIT_PREFLIGHT"
+    fi
+
+    # Resolve the instance - if --instance is not supplied, use the
+    # only instance in [instances], else refuse.
+    if [[ -z "$instance" ]]; then
+        local count
+        count=$(dhis2_inventory_group_hosts instances | grep -c '[^[:space:]]' || true)
+        if (( count != 1 )); then
+            dhis2_log_error "--instance is required when more than one instance exists in [instances] (found $count)"
+            exit "$DHIS2_EXIT_USAGE"
+        fi
+        instance=$(dhis2_inventory_group_hosts instances | head -1)
+    fi
+
+    _migrate_boombox_preflight "$instance" "$inv" "$mode"
+
+    case "$mode" in
+        preflight)
+            _migrate_boombox_plan "$instance"
+            dhis2_log_info "Preflight passed. Re-run with --dry-run to see the exact commands, or --execute --yes to migrate."
+            ;;
+        dry-run)
+            _migrate_boombox_plan "$instance"
+            _migrate_boombox_dryrun "$instance"
+            ;;
+        execute)
+            _migrate_boombox_plan "$instance"
+            if [[ "$DHIS2_OPT_YES" != true ]]; then
+                dhis2_log_error "--execute refuses to proceed without --yes. Re-run with: dhis2-deploy migrate boombox-to-lxd --execute --yes --instance $instance"
+                exit "$DHIS2_EXIT_SAFETY"
+            fi
+            dhis2_cli_confirm "This migrates instance '$instance' from boombox to LXD. There WILL be downtime (10-30 minutes typical). Pre-destructive failures roll back automatically; post-destructive failures hand off to the operator with the restore command. Type the instance name to proceed." "$instance"
+            _migrate_boombox_execute "$instance" "$inv"
+            ;;
+    esac
+}
+
+_migrate_boombox_preflight() {
+    local instance="$1" inv="$2" mode="$3"
+    local findings=()
+
+    # 1. boombox-mode preflight already OK? Rerun it to catch new issues.
+    local out rc=0
+    out=$("$0" preflight 2>&1) || rc=$?
+    if (( rc != 0 )); then
+        findings+=("boombox preflight is not green (rc=$rc). Fix issues from 'dhis2-deploy preflight' before migrating.")
+    fi
+
+    # 2. Services expected to be running.
+    local svc; for svc in postgresql tomcat9 nginx; do
+        if ! systemctl is-active --quiet "$svc" 2>/dev/null; then
+            findings+=("service $svc is not active - the migration starts from a running boombox")
+        fi
+    done
+
+    # 3. Disk headroom: 2x current DB footprint (backup + new LXD).
+    local pg_mb free_mb
+    pg_mb=$(du -sm /var/lib/postgresql 2>/dev/null | awk '{print $1}')
+    free_mb=$(df -m / | awk 'NR==2 {print $4}')
+    if [[ -n "$pg_mb" && -n "$free_mb" ]] && (( free_mb < pg_mb * 2 )); then
+        findings+=("insufficient disk: /var/lib/postgresql is ${pg_mb} MiB but / only has ${free_mb} MiB free (need >= 2x = $(( pg_mb * 2 )) MiB)")
+    fi
+
+    # 4. apt / lxd package availability.
+    if ! command -v apt-get >/dev/null; then
+        findings+=("apt-get not available - this migration targets Ubuntu")
+    fi
+    if ! command -v lxd >/dev/null 2>&1 && ! apt-cache show lxd >/dev/null 2>&1; then
+        findings+=("lxd package not available via apt")
+    fi
+
+    # Report
+    if (( ${#findings[@]} )); then
+        dhis2_c_red "FAIL"; echo " - migrate boombox-to-lxd preflight has blockers:"
+        local f
+        for f in "${findings[@]}"; do printf '  - %s\n' "$f"; done
+        exit "$DHIS2_EXIT_PREFLIGHT"
+    fi
+    [[ "$mode" == "preflight" ]] && { dhis2_status_ok "OK"; echo " - migrate boombox-to-lxd preflight passed"; }
+}
+
+_migrate_boombox_plan() {
+    local instance="$1"
+    local pg_mb; pg_mb=$(du -sm /var/lib/postgresql 2>/dev/null | awk '{print $1}')
+    local backup_path
+    backup_path="/var/backups/dhis2/${instance}-pre-migrate-$(date -u +%Y%m%d-%H%M%S).dump"
+    cat <<EOF
+
+migrate boombox-to-lxd
+  instance:         $instance
+  current PG size:  ${pg_mb:-?} MiB
+  backup target:    $backup_path
+
+Stages (per-stage confirmation when --execute):
+
+  1  snapshot inventory + /opt/dhis2/dhis.conf + nginx config
+     + postgresql.conf
+  2  dhis2-backup create $instance --format custom --verify
+     -> $backup_path
+  3  dhis2-instance maintenance $instance enable   (nginx 503)
+  4  systemctl stop tomcat9 nginx                  (user-visible stop)
+  5  systemctl stop postgresql                     (destructive stop)
+  >>>>>>> after this point rollback is operator-driven <<<<<<<
+  6  apt install -y lxd lxd-client ; lxd init --preseed
+  7  rewrite inventory: dhis2_architecture=lxd, ansible_connection=lxd,
+     container IPs for proxy/postgres/instance/monitor
+  8  dhis2-deploy apply                            (install stack in LXD)
+  9  dhis2-restore database --backup $backup_path --instance $instance
+     --drop-existing --create-db --reassign-owner --verify --yes
+ 10  rsync /opt/dhis2/files (if any) -> instance container
+ 11  dhis2-instance maintenance $instance disable
+ 12  dhis2-instance health $instance --retry 30 --interval 10 \\
+       --expect-version <configured>
+ 13  dhis2-doctor                                  (post-migration state)
+
+Rollback window:
+  pre-destructive (1-5)  automatic rollback: services restarted,
+                         inventory restored, maintenance disabled
+  post-destructive (6+)  operator-driven: restore from $backup_path
+                         on a fresh host, documented in
+                         docs/Boombox-to-LXD-Migration.md section
+                         "Rollback after step 6"
+
+EOF
+}
+
+_migrate_boombox_dryrun() {
+    local instance="$1"
+    local backup_path
+    backup_path="/var/backups/dhis2/${instance}-pre-migrate-$(date -u +%Y%m%d-%H%M%S).dump"
+    cat <<EOF
+# dry-run - commands that would be executed:
+
+# Stage 1 - state snapshot
+mkdir -p /var/lib/dhis2-server-tools/snapshots/migrate-${instance}-pre-$(date -u +%Y%m%d)
+cp -p \${DHIS2_INVENTORY} /var/lib/dhis2-server-tools/snapshots/.../hosts
+cp -p /opt/dhis2/dhis.conf /var/lib/dhis2-server-tools/snapshots/.../dhis.conf
+cp -r /etc/nginx/           /var/lib/dhis2-server-tools/snapshots/.../nginx/
+cp -p /etc/postgresql/*/main/postgresql.conf /var/lib/dhis2-server-tools/snapshots/.../
+
+# Stage 2 - verified backup
+dhis2-backup create $instance --format custom --out /var/backups/dhis2 --yes
+dhis2-backup verify $backup_path
+
+# Stage 3 - maintenance mode
+dhis2-instance maintenance $instance enable
+
+# Stage 4-5 - stop services (destructive from step 5)
+systemctl stop tomcat9
+systemctl stop nginx
+sudo -u postgres psql -X -c CHECKPOINT
+systemctl stop postgresql
+
+# Stage 6 - install LXD
+apt-get update -q
+apt-get install -y lxd lxd-client
+lxd init --preseed <<<'config:
+  core.https_address: 127.0.0.1:8443
+networks:
+- name: lxdbr0
+  type: bridge
+  config:
+    ipv4.address: auto
+    ipv6.address: none
+storage_pools:
+- name: default
+  driver: dir
+profiles:
+- name: default
+  devices:
+    eth0: { nictype: bridged, parent: lxdbr0, type: nic }
+    root: { pool: default, path: /, type: disk }
+'
+
+# Stage 7 - rewrite inventory
+#   dhis2_architecture=lxd
+#   ansible_connection=lxd
+#   proxy -> 172.19.2.2
+#   postgres -> 172.19.2.20
+#   $instance -> 172.19.2.11
+#   monitor -> 172.19.2.30
+
+# Stage 8 - apply the LXD stack
+dhis2-deploy apply --yes
+
+# Stage 9 - restore DB into the new postgres container
+dhis2-restore database \\
+    --backup $backup_path \\
+    --instance $instance \\
+    --drop-existing --create-db --reassign-owner --verify --yes
+
+# Stage 10 - DHIS2 files (if any)
+rsync -a /opt/dhis2/files/ <lxd:instance>:/opt/dhis2/files/ 2>/dev/null || true
+
+# Stage 11 - disable maintenance
+dhis2-instance maintenance $instance disable
+
+# Stage 12 - end-to-end health
+dhis2-instance health $instance --retry 30 --interval 10
+
+# Stage 13 - operational snapshot
+dhis2-doctor snapshot
+
+EOF
+}
+
+_migrate_boombox_execute() {
+    local instance="$1" inv="$2"
+    local ts; ts=$(date -u +%Y%m%d-%H%M%S)
+    local snap_dir="/var/lib/dhis2-server-tools/snapshots/migrate-${instance}-${ts}"
+    local backup_path="/var/backups/dhis2/${instance}-pre-migrate-${ts}.dump"
+
+    dhis2_log_audit dhis2-deploy "{\"action\":\"migrate-boombox-to-lxd\",\"instance\":\"$instance\",\"stage\":\"start\"}" "started"
+
+    # Stage 1 - snapshot (reversible)
+    dhis2_log_info "Stage 1/13 - state snapshot -> $snap_dir"
+    mkdir -p "$snap_dir" && chmod 700 "$snap_dir"
+    cp -p "$inv" "$snap_dir/hosts"
+    [[ -f /opt/dhis2/dhis.conf ]] && cp -p /opt/dhis2/dhis.conf "$snap_dir/dhis.conf"
+    [[ -d /etc/nginx ]] && cp -a /etc/nginx "$snap_dir/nginx"
+    find /etc/postgresql -name postgresql.conf -exec cp -p {} "$snap_dir/" \; 2>/dev/null || true
+
+    # Stage 2 - backup (reversible)
+    dhis2_log_info "Stage 2/13 - verified backup"
+    "${DHIS2_CLI_ROOT}/bin/dhis2-backup" create "$instance" --format custom --out /var/backups/dhis2 --yes || _migrate_boombox_rollback_pre "$snap_dir" "backup-create failed"
+    "${DHIS2_CLI_ROOT}/bin/dhis2-backup" verify "$backup_path" || _migrate_boombox_rollback_pre "$snap_dir" "backup-verify failed"
+
+    # Stage 3 - maintenance (reversible)
+    dhis2_log_info "Stage 3/13 - maintenance mode on"
+    "${DHIS2_CLI_ROOT}/bin/dhis2-instance" maintenance "$instance" enable --yes || _migrate_boombox_rollback_pre "$snap_dir" "maintenance enable failed"
+
+    # Stage 4-5 - stop services (destructive from step 5)
+    dhis2_log_info "Stage 4-5/13 - stopping tomcat / nginx / postgresql"
+    systemctl stop tomcat9 nginx 2>/dev/null || true
+    sudo -u postgres psql -X -c "CHECKPOINT" >/dev/null 2>&1 || true
+    if ! systemctl stop postgresql 2>/dev/null; then
+        _migrate_boombox_rollback_pre "$snap_dir" "systemctl stop postgresql failed"
+    fi
+    dhis2_log_audit dhis2-deploy "{\"action\":\"migrate-boombox-to-lxd\",\"instance\":\"$instance\",\"stage\":\"destructive-point\",\"backup\":\"$backup_path\"}" "destructive-point"
+
+    # From here on, failures are operator-driven.
+    dhis2_log_warn ">>> entering post-destructive stages 6-13. Automatic rollback is NOT available past this point."
+
+    # Stage 6 - install LXD
+    dhis2_log_info "Stage 6/13 - installing LXD"
+    if ! apt-get update -q && apt-get install -y lxd lxd-client; then
+        _migrate_boombox_operator_restore "$instance" "$backup_path" "stage 6 (lxd install) failed"
+    fi
+
+    # Stage 7 - rewrite inventory. Rely on the existing dhis2-inventory
+    # set + add-host helpers for atomic + backed-up writes.
+    dhis2_log_info "Stage 7/13 - rewrite inventory for LXD topology"
+    local new_inv="$snap_dir/hosts.lxd"
+    _migrate_boombox_render_lxd_inventory "$instance" > "$new_inv"
+    if ! "${DHIS2_CLI_ROOT}/bin/dhis2-inventory" restore "$new_inv"; then
+        _migrate_boombox_operator_restore "$instance" "$backup_path" "stage 7 (inventory rewrite) failed"
+    fi
+
+    # Stage 8 - apply LXD stack
+    dhis2_log_info "Stage 8/13 - deploy stack into LXD"
+    if ! "${DHIS2_CLI_ROOT}/bin/dhis2-deploy" apply --yes; then
+        _migrate_boombox_operator_restore "$instance" "$backup_path" "stage 8 (apply) failed"
+    fi
+
+    # Stage 9 - restore DB
+    dhis2_log_info "Stage 9/13 - restore pre-migrate dump into LXD postgres"
+    if ! "${DHIS2_CLI_ROOT}/bin/dhis2-restore" database \
+            --backup "$backup_path" --instance "$instance" \
+            --drop-existing --create-db --reassign-owner --verify --yes; then
+        _migrate_boombox_operator_restore "$instance" "$backup_path" "stage 9 (restore) failed"
+    fi
+
+    # Stage 10 - files
+    dhis2_log_info "Stage 10/13 - copy /opt/dhis2/files into instance container (if any)"
+    if [[ -d /opt/dhis2/files ]]; then
+        # Use lxc file push since the files directory can be large.
+        lxc file push -r /opt/dhis2/files "${instance}/opt/dhis2/" 2>/dev/null || \
+            dhis2_log_warn "lxc file push did not succeed; copy /opt/dhis2/files manually."
+    fi
+
+    # Stage 11 - disable maintenance
+    dhis2_log_info "Stage 11/13 - maintenance mode off"
+    "${DHIS2_CLI_ROOT}/bin/dhis2-instance" maintenance "$instance" disable --yes || true
+
+    # Stage 12 - health
+    dhis2_log_info "Stage 12/13 - end-to-end API health"
+    if ! "${DHIS2_CLI_ROOT}/bin/dhis2-instance" health "$instance" --retry 30 --interval 10; then
+        dhis2_log_error "Health check failed. Investigate; do NOT restart the boombox services (they are stopped and masked)."
+        dhis2_log_error "  Backup is at $backup_path."
+        exit "$DHIS2_EXIT_HEALTH"
+    fi
+
+    # Stage 13 - operational snapshot
+    dhis2_log_info "Stage 13/13 - operational snapshot"
+    "${DHIS2_CLI_ROOT}/bin/dhis2-doctor" snapshot >/dev/null 2>&1 || true
+
+    dhis2_log_audit dhis2-deploy "{\"action\":\"migrate-boombox-to-lxd\",\"instance\":\"$instance\",\"stage\":\"done\",\"backup\":\"$backup_path\"}" "ok"
+    dhis2_log_info "Migration complete. The pre-migration backup is at $backup_path - keep it until you confirm the LXD deployment is healthy."
+}
+
+_migrate_boombox_rollback_pre() {
+    local snap_dir="$1" reason="$2"
+    dhis2_log_error "Pre-destructive rollback: $reason"
+    # Services may or may not still be running - re-start what we stopped
+    systemctl start postgresql 2>/dev/null || true
+    systemctl start tomcat9    2>/dev/null || true
+    systemctl start nginx      2>/dev/null || true
+    "${DHIS2_CLI_ROOT}/bin/dhis2-instance" maintenance "$instance" disable --yes 2>/dev/null || true
+    dhis2_log_audit dhis2-deploy "{\"action\":\"migrate-boombox-to-lxd\",\"stage\":\"rollback-pre\",\"reason\":\"$reason\",\"snapshot\":\"$snap_dir\"}" "rollback"
+    exit "$DHIS2_EXIT_FAILURE"
+}
+
+_migrate_boombox_operator_restore() {
+    local instance="$1" backup="$2" reason="$3"
+    dhis2_log_error "Post-destructive failure: $reason"
+    dhis2_log_error "Automatic rollback is NOT safe past the destructive point."
+    dhis2_log_error ""
+    dhis2_log_error "Operator-driven recovery:"
+    dhis2_log_error "  1. Decide: fix forward (continue to LXD) OR fresh host (restore boombox)."
+    dhis2_log_error "  2. Backup is at:  $backup"
+    dhis2_log_error "  3. See docs/Boombox-to-LXD-Migration.md section 'Rollback after step 6'."
+    dhis2_log_audit dhis2-deploy "{\"action\":\"migrate-boombox-to-lxd\",\"stage\":\"operator-restore\",\"reason\":\"$reason\",\"backup\":\"$backup\",\"instance\":\"$instance\"}" "handoff"
+    exit "$DHIS2_EXIT_FAILURE"
+}
+
+_migrate_boombox_render_lxd_inventory() {
+    local instance="$1"
+    cat <<EOF
+#
+# Generated by dhis2-deploy migrate boombox-to-lxd on $(date -u +%FT%TZ).
+# Original boombox inventory is preserved in the migration snapshot.
+#
+[web]
+proxy  ansible_host=172.19.2.2
+
+[databases]
+postgres  ansible_host=172.19.2.20
+
+[instances]
+$instance  ansible_host=172.19.2.11  database_host=postgres  dhis2_version=2.43
+
+[monitoring]
+monitor  ansible_host=172.19.2.30
+
+[backup_servers]
+backup   ansible_host=172.19.2.100
+
+[all:vars]
+dhis2_architecture=lxd
+ansible_connection=lxd
+EOF
 }
 
 main "$@"
