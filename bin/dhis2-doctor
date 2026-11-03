@@ -25,6 +25,9 @@
 #   dhis2-doctor wal                          (pg_wal size, archive lag,
 #                                              replication slot retention,
 #                                              long transactions)
+#   dhis2-doctor boombox                      (boombox host cross-check:
+#                                              architecture, co-tenant
+#                                              listeners, resources, UFW)
 #
 # All checks are read-only unless --fix is passed; only well-understood
 # low-risk fixes are applied with --fix (section 23.2):
@@ -51,15 +54,21 @@ main() {
             --quick) scope=quick ;;
             --full) scope=full ;;
             --fix|fix) scope="fix" ;;
-            network|database|proxy|memory|config|storage|services|tls|backup|upgrade-readiness|snapshot|compare|bundle|instance|wal) scope="$1"; shift || true; extra_arg="${1:-}" ;;
+            network|database|proxy|memory|config|storage|services|tls|backup|upgrade-readiness|snapshot|compare|bundle|instance|wal|boombox) scope="$1"; shift || true; extra_arg="${1:-}" ;;
             --help|-h|help) dhis2_cli_show_help "$0"; exit 0 ;;
         esac
     fi
     case "$scope" in
         fix) _fix; return ;;
         quick) _controller; _inventory_check ;;
-        full|all) _controller; _inventory_check; _network; _services; _database; _wal; _proxy; _memory; _tls; _backup; _config ;;
+        full|all)
+            _controller; _inventory_check; _network; _services; _database; _wal; _proxy; _memory; _tls; _backup; _config
+            local _bb_arch
+            _bb_arch=$(awk -F= '/^[[:space:]]*dhis2_architecture[[:space:]]*=/ {gsub(/[[:space:]]/,"",$2); print $2; exit}' "$(dhis2_config_resolve_inventory)")
+            [[ "$_bb_arch" == "boombox" ]] && _boombox
+            ;;
         wal) _wal ;;
+        boombox) _boombox ;;
         network) _network ;;
         database) _database ;;
         proxy) _proxy ;;
@@ -297,6 +306,74 @@ _compare() {
     local a="$1" b="$2"
     [[ -z "$a" || -z "$b" ]] && { dhis2_log_error "Usage: dhis2-doctor compare SNAP_A SNAP_B"; exit "$DHIS2_EXIT_USAGE"; }
     diff -ruN "$a" "$b" | dhis2_log_redact
+}
+
+#
+# dhis2-doctor boombox - all-in-one host cross-check.
+# Section 11 of docs/vital-enhancements/boombox-plan.md.
+#
+# Reports:
+#   - architecture + mode (production / workshop)
+#   - the four co-located services (nginx, tomcat, postgresql, munin)
+#     and whether they listen on the expected sockets
+#   - the fact-based tunings in effect vs host resources
+#   - any LXD traces (should be absent per locked decision 3)
+#   - UFW posture
+#
+_boombox() {
+    local inv; inv=$(dhis2_config_resolve_inventory)
+    local arch mode
+    arch=$(awk -F= '/^[[:space:]]*dhis2_architecture[[:space:]]*=/ {gsub(/[[:space:]]/,"",$2); print $2; exit}' "$inv")
+    mode=$(awk -F= '/^[[:space:]]*boombox_mode[[:space:]]*=/ {gsub(/[[:space:]]/,"",$2); print $2; exit}' "$inv")
+
+    dhis2_c_bold "Boombox"; echo
+    if [[ "$arch" != "boombox" ]]; then
+        _record_warn "dhis2_architecture is '$arch', not 'boombox' - this check is intended for boombox inventories"
+        return
+    fi
+    _record_ok "architecture: boombox"
+    _record_ok "mode:         ${mode:-production}"
+
+    # LXD must not be installed on the single host.
+    if command -v lxc >/dev/null 2>&1; then
+        _record_fail "LXD is installed on the single host - boombox refuses this (purge lxd or switch architecture)"
+    else
+        _record_ok "LXD not installed (as required)"
+    fi
+
+    # Service listeners.
+    local port svc listener
+    for pair in "80/nginx" "443/nginx" "5432/postgresql" "8080/tomcat"; do
+        port="${pair%%/*}"; svc="${pair##*/}"
+        if command -v ss >/dev/null 2>&1; then
+            listener=$(ss -tnlp 2>/dev/null | awk -v p=":$port" '$4 ~ p { for (i=1;i<=NF;i++) if ($i ~ /users:/) print $i }' | head -1)
+            if [[ -n "$listener" ]]; then
+                _record_ok "port $port listener: $listener"
+            else
+                _record_warn "port $port: no listener (expected $svc)"
+            fi
+        fi
+    done
+
+    # Resource vs tunings.
+    if [[ -r /proc/meminfo ]]; then
+        local total_mb; total_mb=$(awk '/MemTotal:/ {printf "%d", $2/1024}' /proc/meminfo)
+        _record_ok "host RAM: ${total_mb} MiB"
+        [[ "$total_mb" -lt 4096 ]] && _record_warn "host RAM < 4 GiB - small-deployment territory"
+    fi
+    local nproc; nproc=$(nproc 2>/dev/null || echo 0)
+    _record_ok "host CPUs: $nproc"
+    [[ "$nproc" -lt 2 ]] && _record_warn "host CPUs < 2 - demo territory"
+
+    # UFW posture (production mode only).
+    if [[ "${mode:-production}" == "production" ]]; then
+        if command -v ufw >/dev/null 2>&1; then
+            local ufw_state; ufw_state=$(ufw status 2>/dev/null | awk '/Status:/ {print $2}')
+            [[ "$ufw_state" == "active" ]] \
+                && _record_ok "ufw: active" \
+                || _record_fail "ufw: $ufw_state (production mode requires active)"
+        fi
+    fi
 }
 
 #
