@@ -987,6 +987,99 @@ scenario_BU() {
          || _rec BU "install.sh wires the watchdog + uninstall removes it" mock FAIL "installer incomplete"
 }
 
+# ---------- Boombox Phase 1 scenarios (BW-BZ) ----------
+
+scenario_BW() {
+    # architectures lists boombox as SUPPORTED
+    local out; out=$("$BIN/dhis2-deploy" architectures 2>&1 || true)
+    if echo "$out" | grep -q 'boombox.*SUPPORTED'; then
+        _rec BW "dhis2-deploy architectures lists boombox as SUPPORTED" mock PASS "boombox is first-class"
+    else
+        _rec BW "dhis2-deploy architectures lists boombox as SUPPORTED" mock FAIL "boombox not listed"
+    fi
+    # JSON output includes boombox
+    local jout; jout=$("$BIN/dhis2-deploy" architectures --json 2>&1 || true)
+    if echo "$jout" | grep -q '"name":"boombox","state":"SUPPORTED"'; then
+        _rec BW2 "architectures --json includes boombox" mock PASS "JSON schema updated"
+    else
+        _rec BW2 "architectures --json includes boombox" mock FAIL "JSON missing boombox"
+    fi
+}
+
+scenario_BX() {
+    # init --architecture boombox writes a working inventory with the required bits.
+    # The CLI resolves DHIS2_CLI_ROOT at startup, so to redirect where the
+    # inventory lands we clone the repo into a scratch dir and invoke the
+    # scratch copy of the binary.
+    local td; td=$(mktemp -d)
+    mkdir -p "$td/bin" "$td/lib" "$td/deploy/inventory"
+    cp -R "$ROOT/bin"/* "$td/bin/" 2>/dev/null
+    cp -R "$ROOT/lib"/* "$td/lib/" 2>/dev/null
+    cp -R "$ROOT/deploy"/*.yml "$td/deploy/" 2>/dev/null
+    cp "$ROOT/VERSION" "$td/VERSION" 2>/dev/null || echo "0.0.0-test" > "$td/VERSION"
+    "$td/bin/dhis2-deploy" init --architecture boombox --mode workshop </dev/null >/dev/null 2>&1 || true
+    local wrote="$td/deploy/inventory/hosts"
+    local ok=true
+    [[ -f "$wrote" ]] || ok=false
+    grep -q 'dhis2_architecture=boombox' "$wrote" 2>/dev/null || ok=false
+    grep -q 'boombox_mode=workshop' "$wrote" 2>/dev/null || ok=false
+    grep -q 'ansible_connection=local' "$wrote" 2>/dev/null || ok=false
+    rm -rf "$td"
+    $ok && _rec BX "init --architecture boombox writes a valid inventory" mock PASS "boombox init works" \
+         || _rec BX "init --architecture boombox writes a valid inventory" mock FAIL "inventory missing boombox markers"
+}
+
+scenario_BY() {
+    # preflight refuses dhis2_ha=true when dhis2_architecture=boombox
+    local tmp; tmp=$(mktemp)
+    cat > "$tmp" <<'EOF'
+127.0.0.1 ansible_connection=local
+[web]
+127.0.0.1
+[databases]
+127.0.0.1
+[instances]
+hmis ansible_host=127.0.0.1 database_host=127.0.0.1
+[monitoring]
+127.0.0.1
+[all:vars]
+dhis2_architecture=boombox
+boombox_mode=production
+dhis2_ha=true
+fqdn=hmis.example.org
+email=ops@example.org
+EOF
+    chmod 600 "$tmp"
+    local out rc=0
+    out=$(DHIS2_INVENTORY="$tmp" "$BIN/dhis2-deploy" preflight 2>&1 </dev/null) || rc=$?
+    rm -f "$tmp"
+    if (( rc == 3 )) && echo "$out" | grep -q 'dhis2_ha=true is incompatible with dhis2_architecture=boombox'; then
+        _rec BY "preflight refuses boombox + dhis2_ha=true" mock PASS "rule 13 enforced"
+    else
+        _rec BY "preflight refuses boombox + dhis2_ha=true" mock FAIL "rule 13 not enforced (rc=$rc)"
+    fi
+}
+
+scenario_BZ() {
+    # Boombox role + dispatcher wiring: role exists; dhis2.yml gates on
+    # dhis2_architecture=boombox; dhis2-doctor exposes a boombox check
+    local ok=true
+    [[ -f "$ROOT/deploy/roles/boombox/defaults/main.yml" ]] || ok=false
+    [[ -f "$ROOT/deploy/roles/boombox/tasks/main.yml"    ]] || ok=false
+    grep -q "role: boombox" "$ROOT/deploy/dhis2.yml" || ok=false
+    grep -q "dhis2_architecture | default('lxd') == 'boombox'" "$ROOT/deploy/dhis2.yml" || ok=false
+    grep -q "^_boombox()" "$BIN/dhis2-doctor" || ok=false
+    $ok && _rec BZ "boombox role + playbook + doctor all wired" mock PASS "integration complete" \
+         || _rec BZ "boombox role + playbook + doctor all wired" mock FAIL "integration incomplete"
+    # Preflight warns on < 4 GiB RAM but does NOT fail (locked decision 1)
+    if awk '/boombox: resource warnings/,/fi$/' "$BIN/dhis2-deploy" | grep -q '<4 GiB recommended' \
+       || grep -q '<4 GiB recommended' "$BIN/dhis2-deploy"; then
+        _rec BZ2 "resource shortfalls are warnings (locked decision 1)" mock PASS "warnings not fails"
+    else
+        _rec BZ2 "resource shortfalls are warnings (locked decision 1)" mock FAIL "wording missing"
+    fi
+}
+
 scenario_BV() {
     # dhis2-db wal volume status + dhis2-db wal watchdog status wired
     local body
@@ -1117,6 +1210,7 @@ scenario_BA; scenario_BB; scenario_BC; scenario_BD; scenario_BE; scenario_BF
 scenario_BG; scenario_BH; scenario_BI; scenario_BJ; scenario_BK; scenario_BL; scenario_BM
 scenario_BN; scenario_BO; scenario_BP; scenario_BQ; scenario_BR
 scenario_BS; scenario_BT; scenario_BU; scenario_BV
+scenario_BW; scenario_BX; scenario_BY; scenario_BZ
 
 _write_report
 echo

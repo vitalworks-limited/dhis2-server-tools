@@ -57,6 +57,7 @@ for analytics, WireGuard for admin access, and alerting hooks.
 | **LXD single-host** | SUPPORTED | One Ubuntu host runs proxy, PostgreSQL, DHIS2, and monitoring as LXD containers. |
 | **Distributed SSH** | SUPPORTED | Separate physical / virtual servers for proxy, PostgreSQL, DHIS2 app, and monitoring. The controller orchestrates them over SSH. |
 | **Hybrid LXD + SSH** | SUPPORTED | Any mix of LXD-managed and SSH-managed hosts; `ansible_connection` is resolved per host. |
+| **Boombox** | SUPPORTED | Every service on one Ubuntu host, no containers (systemd native). Workshop + small single-site production. See [docs/Boombox.md](./docs/Boombox.md). |
 | **Docker** | NOT IMPLEMENTED | Explicitly not supported until implemented and tested. |
 | **Kubernetes** | NOT IMPLEMENTED | Explicitly not supported until implemented and tested. |
 
@@ -685,6 +686,7 @@ the generated `tests/regression/last-run.md`.
 - [docs/vital-enhancements/gap-analysis-flyway-and-beyond.md](./docs/vital-enhancements/gap-analysis-flyway-and-beyond.md) — Flyway failure modes and the hardening they drove
 - [docs/vital-enhancements/wal-disk-safety-plan.md](./docs/vital-enhancements/wal-disk-safety-plan.md) — WAL disk-pressure defence-in-depth plan
 - [docs/vital-enhancements/ha-implementation-plan.md](./docs/vital-enhancements/ha-implementation-plan.md) — comprehensive HA deployment plan (Patroni, HAProxy, keepalived, LXD/SSH/hybrid topologies)
+- [docs/Boombox.md](./docs/Boombox.md) — all-in-one single-host operator guide (no LXD)
 - [docs/HA-Patroni.md](./docs/HA-Patroni.md) — HA Phase 1 operator guide (Patroni + etcd + HAProxy)
 - [docs/HA-Runbook-Failover.md](./docs/HA-Runbook-Failover.md) — HA failover runbook (8 scenarios)
 - [docs/HA-Runbook-WAL-Volume-Migration.md](./docs/HA-Runbook-WAL-Volume-Migration.md) — migrate an existing cluster's pg_wal onto a dedicated volume

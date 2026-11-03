@@ -1,10 +1,10 @@
 # Regression run report
 
-Generated: 2026-11-02T06:25:16Z
+Generated: 2026-11-03T10:44:04Z
 
 Mode: mock
 
-Results: PASS=89 FAIL=0 SKIP=2
+Results: PASS=95 FAIL=0 SKIP=2
 
 | ID | Scenario | Mode | Result | Notes |
 |----|----------|------|--------|-------|
@@ -99,3 +99,9 @@ Results: PASS=89 FAIL=0 SKIP=2
 | BT | wal-watchdog service+timer present + wired to dhis2-db wal | mock | PASS | watchdog units present |
 | BU | install.sh wires the watchdog + uninstall removes it | mock | PASS | installer wired |
 | BV | dhis2-db wal volume + watchdog status subcommands present | mock | PASS | Phase 2 CLI complete |
+| BW | dhis2-deploy architectures lists boombox as SUPPORTED | mock | PASS | boombox is first-class |
+| BW2 | architectures --json includes boombox | mock | PASS | JSON schema updated |
+| BX | init --architecture boombox writes a valid inventory | mock | PASS | boombox init works |
+| BY | preflight refuses boombox + dhis2_ha=true | mock | PASS | rule 13 enforced |
+| BZ | boombox role + playbook + doctor all wired | mock | PASS | integration complete |
+| BZ2 | resource shortfalls are warnings (locked decision 1) | mock | PASS | warnings not fails |
