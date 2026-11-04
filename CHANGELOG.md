@@ -1,5 +1,75 @@
 # Changelog
 
+> This repository is the `vitalworks-limited` fork of
+> `dhis2/dhis2-server-tools`. The `0.x` line below tracks the CLI
+> family and enhancements shipped by this fork; entries below the
+> divider are inherited from the upstream `1.x` line.
+
+## [0.2.0](https://github.com/vitalworks-limited/dhis2-server-tools/compare/v0.1.0...v0.2.0) (2026-11-04)
+
+### 🎉 New Features
+
+- **Boombox architecture**: all-in-one single-host DHIS2 with
+  fact-based tuning (`pg_shared_buffers`, `heap_memory_size`,
+  `pg_max_wal_size`, etc.), production + workshop modes, 15 preflight
+  checks, `dhis2-doctor boombox`. Refuses when `lxc` is installed or
+  `dhis2_ha=true`. See `docs/Boombox.md`.
+- **Automated boombox → LXD migration** (`dhis2-deploy migrate
+  boombox-to-lxd`) with four modes: preflight / `--detect-drift` /
+  `--dry-run` / `--execute`. Multi-instance via repeated
+  `--instance`, transactional `--rotate-db-password`, preservation of
+  `/etc/nginx/conf.d`, `/etc/nginx/snippets`, and
+  `postgresql(@).service.d` overrides. 13 stages with automatic
+  rollback on 1–5 and operator-handoff on 6+. See
+  `docs/Boombox-to-LXD-Migration.md`.
+- **HA Phase 1**: Patroni + etcd + HAProxy roles; `dhis2-cluster`
+  with 13 confirmation-gated subcommands; deploy-time refusal of
+  unsafe topologies (3 etcd on same `physical_host`, primary+sync
+  colocated); MinIO role; rolling-upgrade auto-pause. See
+  `docs/HA-Patroni.md` + 8 locked ADRs.
+- **WAL disk-safety**: WAL-budget defaults (`max_wal_size`,
+  `max_slot_wal_keep_size`, `wal_keep_size`, `archive_timeout`,
+  `log_checkpoints`), `dhis2-db wal` subcommands (status,
+  archive-status, retention, compliance, flush, checkpoint,
+  emergency-drain, volume status, watchdog status),
+  `dhis2-db replication-slot`, `dhis2-doctor wal`, wal-watchdog
+  systemd timer. Archive-command preflight.
+- **Flyway operations**: `dhis2-db flyway` (info, history, pending,
+  failed, locks, unlock, repair, baseline, validate, source-version);
+  `repair` never attempts arbitrary SQL. Upgrade preflight blocks on
+  prior failed migrations, stuck locks, PG major mismatch, and
+  unknown source lineage.
+- **Configured-DB resolver**: `dhis2-backup create` and
+  `dhis2-restore database` now parse `/opt/dhis2/dhis.conf`
+  (`connection.url`, `connection.username`) so operators who renamed
+  the database are no longer stuck with the `<instance> == db`
+  assumption.
+- **GPG-encrypted backups**: `dhis2-backup create ... --encrypt gpg
+  --recipient KEY_ID` wraps the dump for off-host storage.
+- **Live-test harness**: `tests/live/{Vagrantfile,run.sh}` + opt-in
+  `.github/workflows/live-matrix.yml` for round-trip verification on
+  a self-hosted `live-lxd` runner.
+
+### 📚 Documentation
+
+- Full operator command reference in main README (incl.
+  `dhis2-cluster`); new workflow sections for WAL ops, Boombox, HA,
+  and Migrate boombox→LXD.
+- `docs/CLI.md` documents every environment variable
+  (`DHIS2_TOOLS_HOME`, `DHIS2_INVENTORY`, `DHIS2_ENVIRONMENT`,
+  `DHIS2_LOG_LEVEL`, `DHIS2_NO_COLOR`, `DHIS2_STATE_DIR`) + the
+  canonical inventory search order.
+- Role READMEs refreshed: boombox, postgres, patroni, etcd,
+  haproxy-pg, backups.
+
+### ✅ Tests
+
+- 105 passing regression scenarios (A–CJ), 0 failures, 2 skipped.
+- 33 CLI smoke-test assertions.
+- 47 pytest unit tests.
+
+---
+
 ## [1.13.2](https://github.com/dhis2/dhis2-server-tools/compare/v1.13.1...v1.13.2) (2026-10-12)
 
 
