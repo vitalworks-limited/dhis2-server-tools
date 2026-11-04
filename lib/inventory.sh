@@ -141,3 +141,39 @@ dhis2_inventory_validate_syntax() {
         _dhis2_inv_parse_ini_to_json "$inv" >/dev/null
     fi
 }
+
+# Resolve the DHIS2 configured database name/user/host for an instance by
+# parsing /opt/dhis2/dhis.conf on the instance host. Honours operator
+# renames (e.g. `connection.url = jdbc:postgresql://db/hmis_prod`)
+# instead of assuming <instance> == database name.
+#
+# Usage: dhis2_instance_configured_db <instance> [db|user|host]
+# Prints the requested field (default: db) and returns 0 on success.
+# Returns 2 (and prints the instance name as a conservative fallback)
+# if the file cannot be read or parsed — preserving existing behaviour
+# for pristine installs where instance==db==user.
+dhis2_instance_configured_db() {
+    local instance="$1" field="${2:-db}"
+    [[ -z "$instance" ]] && { dhis2_log_error "dhis2_instance_configured_db: instance required"; return 2; }
+    local raw url user host db
+    if ! raw=$(dhis2_ansible_adhoc "$instance" shell \
+            -a "cat /opt/dhis2/dhis.conf 2>/dev/null || true" -b -o 2>/dev/null); then
+        case "$field" in db|user) printf '%s\n' "$instance" ;; host) printf '%s\n' "" ;; esac
+        return 2
+    fi
+    url=$(printf '%s\n' "$raw" | awk -F'=' '/^[[:space:]]*connection\.url[[:space:]]*=/ {sub(/^[^=]*=[[:space:]]*/,""); print; exit}')
+    user=$(printf '%s\n' "$raw" | awk -F'=' '/^[[:space:]]*connection\.username[[:space:]]*=/ {gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); print $2; exit}')
+    if [[ "$url" =~ jdbc:postgresql://([^/:?]+)(:[0-9]+)?/([A-Za-z0-9_-]+) ]]; then
+        host="${BASH_REMATCH[1]}"
+        db="${BASH_REMATCH[3]}"
+    fi
+    [[ -z "$db"   ]] && db="$instance"
+    [[ -z "$user" ]] && user="$instance"
+    case "$field" in
+        db)   printf '%s\n' "$db" ;;
+        user) printf '%s\n' "$user" ;;
+        host) printf '%s\n' "${host:-}" ;;
+        *)    dhis2_log_error "dhis2_instance_configured_db: unknown field '$field'"; return 2 ;;
+    esac
+    return 0
+}

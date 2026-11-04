@@ -75,6 +75,22 @@ _parse() {
         shift || true
     done
     [[ -z "$BACKUP" ]] && { dhis2_log_error "--backup required"; exit "$DHIS2_EXIT_USAGE"; }
+
+    # If DBNAME / OWNER were not supplied explicitly, resolve them from
+    # dhis.conf on the instance host (so operators who renamed the
+    # database are not stuck with the instance-name assumption).
+    if [[ -n "$INSTANCE" ]]; then
+        if [[ -z "$DBNAME" ]]; then
+            local resolved_db
+            resolved_db=$(dhis2_instance_configured_db "$INSTANCE" db 2>/dev/null) || resolved_db=""
+            [[ -n "$resolved_db" ]] && DBNAME="$resolved_db"
+        fi
+        if [[ -z "$OWNER" ]]; then
+            local resolved_owner
+            resolved_owner=$(dhis2_instance_configured_db "$INSTANCE" user 2>/dev/null) || resolved_owner=""
+            [[ -n "$resolved_owner" ]] && OWNER="$resolved_owner"
+        fi
+    fi
 }
 
 _plan() {

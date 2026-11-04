@@ -1129,6 +1129,64 @@ scenario_CE() {
     fi
 }
 
+scenario_CF() {
+    # Drift detection parses dhis.conf connection.url + Tomcat + PG major
+    local body; body=$(awk '/^_migrate_boombox_detect_drift\(\)/,/^}/' "$BIN/dhis2-deploy")
+    local ok=true
+    echo "$body" | grep -q 'DHIS2_DRIFT_TOMCAT'          || ok=false
+    echo "$body" | grep -q 'DHIS2_DRIFT_PG'              || ok=false
+    echo "$body" | grep -q 'DHIS2_DRIFT_CONF_DB_NAME'    || ok=false
+    echo "$body" | grep -q 'jdbc:postgresql'             || ok=false
+    $ok && _rec CF "migrate drift detection parses dhis.conf + versions" mock PASS "drift detector present" \
+         || _rec CF "migrate drift detection parses dhis.conf + versions" mock FAIL "drift detector incomplete"
+}
+
+scenario_CG() {
+    # Multi-instance support: plan/dryrun/execute iterate instances[]
+    local body; body=$(awk '/^_migrate\(\)/,/^}/' "$BIN/dhis2-deploy")
+    local ok=true
+    echo "$body" | grep -q 'instances+=('                || ok=false
+    local exec; exec=$(awk '/^_migrate_boombox_execute\(\)/,/^main \"\$@\"/' "$BIN/dhis2-deploy")
+    echo "$exec" | grep -qE 'for .* in .*instances'       || ok=false
+    $ok && _rec CG "migrate supports multi-instance boombox" mock PASS "multi-instance wired" \
+         || _rec CG "migrate supports multi-instance boombox" mock FAIL "multi-instance missing"
+}
+
+scenario_CH() {
+    # --rotate-db-password flag is parsed AND wired to dhis2-vault rotate-db-password
+    local body; body=$(awk '/^_migrate\(\)/,/^main \"\$@\"/' "$BIN/dhis2-deploy")
+    local ok=true
+    echo "$body" | grep -q -- '--rotate-db-password'     || ok=false
+    echo "$body" | grep -q 'rotate-db-password'          || ok=false
+    echo "$body" | grep -q 'dhis2-vault'                 || ok=false
+    $ok && _rec CH "migrate --rotate-db-password flag wired to dhis2-vault" mock PASS "rotation hook present" \
+         || _rec CH "migrate --rotate-db-password flag wired to dhis2-vault" mock FAIL "rotation hook missing"
+}
+
+scenario_CI() {
+    # Preservation of custom nginx snippets (conf.d) + pg systemd overrides
+    local body; body=$(awk '/^_migrate_boombox_execute\(\)/,/^main \"\$@\"/' "$BIN/dhis2-deploy")
+    local ok=true
+    echo "$body" | grep -qE 'nginx-?conf\.d|nginx/conf\.d'         || ok=false
+    echo "$body" | grep -qE 'nginx-?snippets|nginx/snippets'       || ok=false
+    echo "$body" | grep -qE 'pg-?systemd|postgresql\.service\.d'   || ok=false
+    echo "$body" | grep -q 'lxc file push'                         || ok=false
+    $ok && _rec CI "migrate preserves custom nginx + pg systemd overrides" mock PASS "preservation present" \
+         || _rec CI "migrate preserves custom nginx + pg systemd overrides" mock FAIL "preservation missing"
+}
+
+scenario_CJ() {
+    # dhis2-backup create + dhis2-restore resolve the configured DB name
+    # from /opt/dhis2/dhis.conf instead of assuming <instance> == db.
+    local ok=true
+    grep -q 'dhis2_instance_configured_db' "$ROOT/lib/inventory.sh" || ok=false
+    grep -q 'dhis2_instance_configured_db' "$BIN/dhis2-backup"      || ok=false
+    grep -q 'dhis2_instance_configured_db' "$BIN/dhis2-restore"     || ok=false
+    grep -q 'jdbc:postgresql' "$ROOT/lib/inventory.sh"              || ok=false
+    $ok && _rec CJ "backup/restore resolve configured DB from dhis.conf" mock PASS "configured-db resolution wired" \
+         || _rec CJ "backup/restore resolve configured DB from dhis.conf" mock FAIL "configured-db resolution missing"
+}
+
 scenario_BZ() {
     # Boombox role + dispatcher wiring: role exists; dhis2.yml gates on
     # dhis2_architecture=boombox; dhis2-doctor exposes a boombox check
@@ -1281,6 +1339,7 @@ scenario_BN; scenario_BO; scenario_BP; scenario_BQ; scenario_BR
 scenario_BS; scenario_BT; scenario_BU; scenario_BV
 scenario_BW; scenario_BX; scenario_BY; scenario_BZ
 scenario_CA; scenario_CB; scenario_CC; scenario_CD; scenario_CE
+scenario_CF; scenario_CG; scenario_CH; scenario_CI; scenario_CJ
 
 _write_report
 echo

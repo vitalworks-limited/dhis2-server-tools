@@ -89,14 +89,20 @@ _create() {
         *) dhis2_log_error "Unknown --format: $fmt"; exit "$DHIS2_EXIT_USAGE" ;;
     esac
     local path="$base$ext"
-    dhis2_log_info "Creating $fmt backup for $inst -> $path${encrypt:+ (encrypted with $encrypt:$recipient)}"
+    # Resolve the configured database from dhis.conf (honours operator
+    # renames). Falls back to $inst for pristine installs.
+    local db
+    db=$(dhis2_instance_configured_db "$inst" db 2>/dev/null) || db="$inst"
+    [[ -z "$db" ]] && db="$inst"
+    [[ "$db" != "$inst" ]] && dhis2_log_info "Instance '$inst' -> database '$db' (from dhis.conf)"
+    dhis2_log_info "Creating $fmt backup for $inst (db=$db) -> $path${encrypt:+ (encrypted with $encrypt:$recipient)}"
     local pg_cmd
     if [[ "$fmt" == "plain-gzip" ]]; then
-        pg_cmd="mkdir -p '$out' && sudo -u postgres pg_dump '$inst' | gzip -9 > '$path'"
+        pg_cmd="mkdir -p '$out' && sudo -u postgres pg_dump '$db' | gzip -9 > '$path'"
     elif [[ "$fmt" == "plain" ]]; then
-        pg_cmd="mkdir -p '$out' && sudo -u postgres pg_dump '$inst' > '$path'"
+        pg_cmd="mkdir -p '$out' && sudo -u postgres pg_dump '$db' > '$path'"
     else
-        pg_cmd="mkdir -p '$out' && sudo -u postgres pg_dump $pg_fmt_opt -f '$path' '$inst'"
+        pg_cmd="mkdir -p '$out' && sudo -u postgres pg_dump $pg_fmt_opt -f '$path' '$db'"
     fi
     dhis2_ansible_adhoc "$DB_HOST" shell -a "$pg_cmd && echo DONE $path" -b -o || { dhis2_log_error "pg_dump failed"; exit "$DHIS2_EXIT_FAILURE"; }
 

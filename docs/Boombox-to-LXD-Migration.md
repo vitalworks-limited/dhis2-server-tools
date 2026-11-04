@@ -42,20 +42,69 @@ off). DHIS2 is unreachable to users during that window.
 - You know how to restore from the backup. The migration can fail
   past the destructive point and hand off to you.
 
-## Three modes
+## Four modes
 
 ```bash
 # 1. preflight only (default). Prints the plan + 'OK' + exits 0.
 dhis2-deploy migrate boombox-to-lxd
 
-# 2. dry-run. Prints every command that would run. Exits 0.
+# 2. detect-drift. Scans the live host for Tomcat major, PostgreSQL
+#    major, DHIS2 version, and compares /opt/dhis2/dhis.conf against
+#    the inventory. Prints a drift report. Exits 0 even on drift so
+#    you can see every finding before deciding how to proceed.
+dhis2-deploy migrate boombox-to-lxd --detect-drift
+
+# 3. dry-run. Prints every command that would run. Exits 0.
 dhis2-deploy migrate boombox-to-lxd --dry-run
 
-# 3. actually execute. Requires --yes and typed instance name.
-dhis2-deploy migrate boombox-to-lxd --execute --yes --instance hmis
+# 4. actually execute. Requires --yes and typed instance name(s).
+#    Multi-instance boomboxes: repeat --instance per instance.
+#    Optionally rotate the DB password transactionally during the
+#    restore window.
+dhis2-deploy migrate boombox-to-lxd --execute --yes \
+    --instance hmis [--instance training] \
+    [--rotate-db-password]
 ```
 
-Always run modes 1 and 2 before 3.
+Always run modes 1, 2, and 3 before 4.
+
+## Drift detection
+
+Operators run boomboxes in the field for months. The host state drifts:
+Tomcat gets upgraded (9→10→11), PostgreSQL might get a minor bump, and
+somebody might have hand-edited `/opt/dhis2/dhis.conf` to point at a
+renamed database. The migration must cope with this or it fails
+destructively.
+
+`--detect-drift` reports four axes:
+
+1. **Tomcat major** detected from the running systemd unit (falls back
+   to webapps presence on disk). The LXD inventory emits
+   `tomcat_version=<detected>` so the new containers install the same
+   major.
+2. **PostgreSQL major** detected from `/etc/postgresql/<N>/main`. The
+   LXD inventory emits `postgresql_version=<detected>` so no silent
+   major upgrade happens through a restore.
+3. **DHIS2 version** parsed from the deployed WAR MANIFEST.MF under
+   `/var/lib/tomcat*/webapps/<instance>/META-INF/MANIFEST.MF`.
+4. **dhis.conf vs. inventory** parsed via regex over
+   `connection.url = jdbc:postgresql://HOST[:PORT]/DBNAME` and
+   `connection.username`. If `HOST` is not `localhost`/`127.0.0.1`
+   the preflight **refuses** the migration — a boombox by definition
+   runs PG locally; a non-local JDBC URL means the operator already
+   split the DB off to another host and this command is the wrong
+   tool.
+
+If `DBNAME` in `dhis.conf` differs from the instance name (a common
+rename), **the migration honours the real name** and prints:
+
+```
+Instance 'hmis' -> database 'hmis_prod' (from dhis.conf)
+```
+
+The same resolution is used by `dhis2-backup create` and
+`dhis2-restore database`, so the rename-aware behaviour is consistent
+across the backup/restore primitives this command composes.
 
 ## The 13 stages
 
@@ -173,23 +222,76 @@ migration summary. **Do not delete it until**:
 - you have confirmed the application behaves correctly end-to-
   end against the new topology.
 
+## Multi-instance boomboxes
+
+A single boombox host can carry more than one DHIS2 instance (they
+share one PG cluster, one Tomcat, one nginx). Pass `--instance` once
+per instance. The command will:
+
+1. Take one combined state snapshot + verified per-instance backup
+   for each instance (stage 1–2 iterated).
+2. Stop user-facing services once (stage 3–5).
+3. Install LXD and render a multi-instance LXD inventory (one
+   `[instances]` row per migrated name).
+4. Deploy the LXD stack once (stage 6–8).
+5. Restore each instance's database into the new postgres container
+   in turn (stage 9 iterated).
+6. Push file stores for each instance (stage 10 iterated).
+7. Exit maintenance and verify each instance's health (stage 11–13).
+
+The audit records emit one `destructive-point` entry per instance so
+operators can locate which instance's data the backup belongs to.
+
+## Rotating the database password during migration
+
+`--rotate-db-password` adds a transactional password rotation during
+stage 9 of each instance:
+
+1. After the database is restored into the new postgres container,
+   `dhis2-vault rotate-db-password` generates a fresh secret.
+2. The new secret is written to the postgres container (via
+   `ALTER USER ... PASSWORD`) **and** to the new instance
+   container's `/opt/dhis2/dhis.conf` atomically.
+3. If either side fails, the transaction aborts and the old password
+   is restored, leaving the system in a consistent state.
+
+Use this flag when the boombox was exposed (shared workshop network,
+former lead left the team, suspected compromise) — rotating here
+avoids a second restart window right after migration.
+
+## Preserving custom nginx + PostgreSQL files
+
+The migration snapshots and re-pushes operator customisations that
+live outside `sites-enabled/` and `postgresql.conf`:
+
+| Source on boombox | Destination in LXD |
+|---|---|
+| `/etc/nginx/conf.d/*` | `proxy` container `/etc/nginx/conf.d/` |
+| `/etc/nginx/snippets/*` | `proxy` container `/etc/nginx/snippets/` |
+| `/etc/systemd/system/postgresql.service.d/*.conf` | `postgres` container, same path |
+| `/etc/systemd/system/postgresql@.service.d/*.conf` | `postgres` container, same path |
+
+Everything is snapshotted to
+`/var/lib/dhis2-server-tools/snapshots/migrate-<instance>-<ts>/preserve/`
+before being pushed, so if the push fails you can `lxc file push`
+manually from the snapshot. The command does **not** push
+`/etc/nginx/sites-enabled/` — those are regenerated by the `proxy`
+role from inventory to prevent drift.
+
 ## Known limitations
 
-- No tested round-trip in CI. The command's behaviour under
-  real Ubuntu + LXD is exercised by operator testing; mock-mode
-  regression (scenarios CA–CE) verifies code paths only.
-- Not supported for multi-instance boombox (`[instances]` must
-  contain exactly one host; the command errors otherwise).
-- Does not rotate the DHIS2 database password (it is preserved
-  across the restore).
-- Does not migrate custom nginx snippets outside
-  `/etc/nginx/sites-enabled/`.
-- Does not migrate systemd overrides for `postgresql`.
+- **No tested round-trip in CI (free tier).** LXD + Patroni + etcd
+  does not run reliably on nested virtualisation in GitHub Actions.
+  The command's behaviour is exercised two ways:
+  1. Mock-mode regression (scenarios CA–CJ) covers every code path.
+  2. An opt-in live-matrix workflow runs the round-trip on a
+     self-hosted runner you provide. See
+     [tests/live/README.md](../tests/live/README.md) for the harness
+     (Vagrant-based, Ubuntu 22.04 and 24.04).
 
 For the second iteration of this command (planned):
-- Multi-instance boombox migration.
 - Live-rollback for a subset of post-destructive failures.
-- Molecule scenario with LXD-in-Docker.
+- Analytics-schema parity report after the restore.
 
 ## Related
 

@@ -1,0 +1,46 @@
+# frozen_string_literal: true
+# Vagrantfile for live round-trip testing of
+# `dhis2-deploy migrate boombox-to-lxd`.
+#
+# Not run on GitHub-hosted runners (LXD-in-nested-virt is unreliable);
+# invoked by tests/live/run.sh locally or on a self-hosted runner
+# labelled live-lxd.
+
+UBUNTU = ENV.fetch("DHIS2_LIVE_UBUNTU", "22.04")
+
+BOX = case UBUNTU
+      when "22.04" then "ubuntu/jammy64"
+      when "24.04" then "bento/ubuntu-24.04"
+      else raise "Unsupported DHIS2_LIVE_UBUNTU=#{UBUNTU} (22.04|24.04)"
+      end
+
+Vagrant.configure("2") do |config|
+  config.vm.box = BOX
+  config.vm.hostname = "dhis2-live-#{UBUNTU.tr('.', '')}"
+
+  config.vm.provider "virtualbox" do |v|
+    v.memory = 4096
+    v.cpus   = 2
+  end
+  config.vm.provider "libvirt" do |v|
+    v.memory = 4096
+    v.cpus   = 2
+  end
+
+  # Expose the DHIS2 web UI so the run script can hit /api/system/info.
+  config.vm.network "forwarded_port", guest: 443, host: 8443, protocol: "tcp"
+  config.vm.network "forwarded_port", guest: 80,  host: 8080, protocol: "tcp"
+
+  # Share the repo read-only so the VM can install the CLI from source.
+  config.vm.synced_folder "../../", "/opt/dhis2-tools-src", type: "rsync",
+                          rsync__exclude: [".git/", "tests/live/out/"]
+
+  config.vm.provision "shell", inline: <<~SHELL
+    set -euxo pipefail
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -y
+    apt-get install -y ansible python3 python3-pip git curl
+    # The run script is responsible for calling install.sh, deploying
+    # boombox, running the migrate, and verifying.
+  SHELL
+end

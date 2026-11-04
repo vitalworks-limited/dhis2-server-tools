@@ -1,0 +1,60 @@
+# Live round-trip for `dhis2-deploy migrate boombox-to-lxd`.
+#
+# NOT run on GitHub-hosted runners — LXD + Patroni on nested virt is
+# too flaky. Opt in by registering a self-hosted runner labelled
+# `live-lxd` with Vagrant + VirtualBox installed. The workflow fires
+# when a PR touches migration-sensitive paths OR on manual dispatch.
+
+name: live-matrix
+
+on:
+  pull_request:
+    paths:
+      - 'bin/dhis2-deploy'
+      - 'deploy/roles/boombox/**'
+      - 'deploy/roles/create-instance/**'
+      - 'deploy/roles/proxy/**'
+      - 'deploy/roles/postgres/**'
+      - 'tests/live/**'
+  workflow_dispatch:
+    inputs:
+      ubuntu:
+        description: 'Ubuntu release(s), space separated'
+        default: '22.04 24.04'
+      instances:
+        description: 'Instances per run, space separated'
+        default: 'hmis'
+      rotate:
+        description: 'Add --rotate-db-password (1/0)'
+        default: '0'
+
+jobs:
+  roundtrip:
+    # Only runs if a self-hosted runner with this label is available.
+    runs-on: [self-hosted, live-lxd]
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        ubuntu: ['22.04', '24.04']
+        scenario:
+          - { name: 'single',   instances: 'hmis',          rotate: '0' }
+          - { name: 'multi',    instances: 'hmis training', rotate: '0' }
+          - { name: 'rotated',  instances: 'hmis',          rotate: '1' }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run live round-trip
+        env:
+          DHIS2_LIVE_UBUNTU:    ${{ matrix.ubuntu }}
+          DHIS2_LIVE_INSTANCES: ${{ matrix.scenario.instances }}
+          DHIS2_LIVE_ROTATE:    ${{ matrix.scenario.rotate }}
+        run: bash tests/live/run.sh
+
+      - name: Collect artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-${{ matrix.ubuntu }}-${{ matrix.scenario.name }}
+          path: tests/live/out/
+          if-no-files-found: ignore

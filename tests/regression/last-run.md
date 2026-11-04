@@ -1,15 +1,15 @@
 # Regression run report
 
-Generated: 2026-11-03T11:05:34Z
+Generated: 2026-11-03T21:24:35Z
 
 Mode: mock
 
-Results: PASS=100 FAIL=0 SKIP=2
+Results: PASS=105 FAIL=0 SKIP=2
 
 | ID | Scenario | Mode | Result | Notes |
 |----|----------|------|--------|-------|
 | A | LXD deploy.sh help | mock | PASS | deploy.sh accepts --help |
-| B | SSH deployment direct ansible-playbook | mock | SKIP | community.general collection not installed |
+| B | SSH deployment direct ansible-playbook | mock | SKIP | ansible-playbook not installed on this host |
 | C | Hybrid connection detected | mock | PASS | dhis2-deploy show reports hybrid |
 | D | Existing Ansible tags exposed | mock | PASS | all canonical tags present |
 | E | create-instance preserves existing config path | mock | PASS | preserve branch present in tomcat-setup.yml |
@@ -24,7 +24,7 @@ Results: PASS=100 FAIL=0 SKIP=2
 | J | pg_conf preserve mode wired | mock | PASS | both CLI entry points honor postgres_conf_mode |
 | K | proxy remove preserves other routes | mock | PASS | operator is directed to inventory-driven removal |
 | L | restore terminates ONLY target-db sessions | mock | PASS | pg_terminate_backend scoped by datname |
-| M | idempotent deployment | mock | SKIP | community.general collection not installed |
+| M | idempotent deployment | mock | SKIP | ansible-playbook not installed |
 | N | proxy reload gated on config test | mock | PASS | reload invokes test first |
 | O | TLS install validates proxy before reload | mock | PASS | install refuses to reload on failed test |
 | P | interrupted upgrade state is captured | mock | PASS | state file recorded by monitor-migrations |
@@ -110,3 +110,8 @@ Results: PASS=100 FAIL=0 SKIP=2
 | CC | migrate --dry-run prints full plan including destructive stages | mock | PASS | dry-run complete |
 | CD | migrate has rollback-pre + operator-restore + audit records | mock | PASS | safety paths wired |
 | CE | post-migration inventory is LXD-shaped | mock | PASS | renderer correct |
+| CF | migrate drift detection parses dhis.conf + versions | mock | PASS | drift detector present |
+| CG | migrate supports multi-instance boombox | mock | PASS | multi-instance wired |
+| CH | migrate --rotate-db-password flag wired to dhis2-vault | mock | PASS | rotation hook present |
+| CI | migrate preserves custom nginx + pg systemd overrides | mock | PASS | preservation present |
+| CJ | backup/restore resolve configured DB from dhis.conf | mock | PASS | configured-db resolution wired |
