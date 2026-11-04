@@ -15,8 +15,9 @@ dhis2_config_resolve_inventory() {
     if [[ -n "${DHIS2_INVENTORY:-}" ]]; then
         printf '%s\n' "$DHIS2_INVENTORY"; return 0
     fi
-    if [[ -n "${DHIS2_OPT_ENVIRONMENT:-}" ]]; then
-        local envdir="/etc/dhis2-server-tools/environments/${DHIS2_OPT_ENVIRONMENT}"
+    local env_name="${DHIS2_OPT_ENVIRONMENT:-${DHIS2_ENVIRONMENT:-}}"
+    if [[ -n "$env_name" ]]; then
+        local envdir="/etc/dhis2-server-tools/environments/${env_name}"
         if [[ -f "$envdir/inventory/hosts" ]]; then
             printf '%s\n' "$envdir/inventory/hosts"; return 0
         fi

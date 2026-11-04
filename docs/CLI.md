@@ -53,6 +53,31 @@ Supported wherever applicable:
 | 8 | safety check prevented destructive action |
 | 9 | concurrent operation / lock conflict |
 
+## Environment variables
+
+Every `dhis2-*` command honours these. CLI flags win; env vars win
+over defaults.
+
+| Variable | Purpose | Default |
+| -------- | ------- | ------- |
+| `DHIS2_TOOLS_HOME` | Project root. Overrides the in-tree / installed auto-resolution. | derived from the script's own path |
+| `DHIS2_INVENTORY` | Path to an Ansible inventory. Equivalent to `--inventory`. | see [search order](#inventory-search-order) |
+| `DHIS2_ENVIRONMENT` | Named environment under `/etc/dhis2-server-tools/environments/<NAME>/`. Equivalent to `--environment`. | unset |
+| `DHIS2_LOG_LEVEL` | One of `trace`, `debug`, `info`, `warn`, `error`. | `info` |
+| `DHIS2_NO_COLOR` | Any non-empty value disables colour on stderr. The standard `NO_COLOR=1` is also honoured. | unset |
+| `DHIS2_STATE_DIR` | Base dir for `locks/`, `history/`, `snapshots/`. Falls back to `~/.local/share/dhis2-server-tools` when the primary path is unwritable. | `/var/lib/dhis2-server-tools` |
+
+### Inventory search order
+
+When no `--inventory` flag and no `DHIS2_INVENTORY` env var are set,
+commands resolve the inventory in this order:
+
+1. `--inventory PATH` flag
+2. `DHIS2_INVENTORY` env var
+3. `/etc/dhis2-server-tools/environments/<DHIS2_ENVIRONMENT>/inventory/hosts` (if `DHIS2_ENVIRONMENT` or `--environment` is set and that file exists)
+4. `<repo>/deploy/inventory/hosts` (in-tree)
+5. `/etc/dhis2-server-tools/inventory/hosts` (installed)
+
 ## Commands
 
 | Command | Purpose |
