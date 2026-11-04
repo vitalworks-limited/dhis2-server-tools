@@ -36,7 +36,9 @@ with `0600`.
 
 ## CLI integration
 
-- `dhis2-backup create INSTANCE [--format custom|plain|plain-gzip|tar|directory]`
+- `dhis2-backup create INSTANCE [--format custom|plain|plain-gzip|tar|directory] [--encrypt gpg --recipient KEY_ID]`
+  — resolves the configured database from `/opt/dhis2/dhis.conf`
+  (honours operator renames) before invoking `pg_dump`.
 - `dhis2-backup verify PATH` — gzip integrity, `pg_restore -l`,
   manifest presence.
 - `dhis2-backup test PATH` — restores into a disposable temp

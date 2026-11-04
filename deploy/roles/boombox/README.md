@@ -42,7 +42,12 @@ operator guide.
 ## Related
 
 - `docs/Boombox.md` - operator guide
+- `docs/Boombox-to-LXD-Migration.md` - automated migration when you
+  outgrow boombox (drift detection, multi-instance, DB password
+  rotation, nginx + pg-systemd preservation)
 - `docs/vital-enhancements/boombox-plan.md` - design + locked
   decisions
 - `docs/CLI-WAL-Operations.md` - WAL compliance math (the role
   stays within the compliance budget by construction)
+- `tests/live/README.md` - opt-in Vagrant-based round-trip harness
+  that proves the boombox → LXD migration end-to-end

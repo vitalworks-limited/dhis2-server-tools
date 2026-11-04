@@ -35,20 +35,29 @@ Topology:
 
 ## CLI integration
 
-Full operator surface lives in `bin/dhis2-cluster`:
+Full operator surface lives in `bin/dhis2-cluster` (13 subcommands;
+refuses without `dhis2_ha=true`):
 
 ```
-dhis2-cluster status | topology | leader | replicas | lag
-dhis2-cluster failover --to HOST [--yes]
-dhis2-cluster switchover --to HOST [--yes]
-dhis2-cluster reinit REPLICA [--yes]
-dhis2-cluster patroni-config show
-dhis2-cluster pause | resume
-dhis2-cluster etcd-health
+dhis2-cluster list                           # members + leader
+dhis2-cluster status                         # per-node state + lag
+dhis2-cluster topology [--check]             # 2-node + 3-etcd rules
+dhis2-cluster failover   --candidate HOST --yes
+dhis2-cluster switchover --candidate HOST --yes
+dhis2-cluster reinit     HOST --yes          # rebuild replica
+dhis2-cluster pause | resume                 # halt auto-failover
+dhis2-cluster etcd    status | members | endpoints
+dhis2-cluster haproxy status | pools | log
+dhis2-cluster vip     status                 # keepalived + VIP
+dhis2-cluster logs    <node>
+dhis2-cluster certs   check
 ```
 
-Reads use the Patroni REST API (`/cluster`, `/leader`, `/replica`,
-`/history`). Writes shell out to `patronictl` on the target host.
+Every destructive subcommand (`failover`, `switchover`, `reinit`,
+`pause`) is confirmation-gated. Output passes through the standard
+secret-redaction pipeline. Reads use the Patroni REST API
+(`/cluster`, `/leader`, `/replica`, `/history`). Writes shell out
+to `patronictl` on the target host.
 
 ## No-regression notes
 

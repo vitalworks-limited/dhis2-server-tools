@@ -36,6 +36,16 @@ Key knobs:
 | `pg_maintenance_work_mem` | unset | Used by VACUUM / CREATE INDEX |
 | `pg_effective_cache_size` | unset | Planner hint |
 | `pg_max_connections` | unset | Keep in sync with memory budget |
+| `pg_max_wal_size` | `min(16 GiB, 10 % of filesystem free)` | WAL compliance ceiling |
+| `pg_max_slot_wal_keep_size` | `2 × pg_max_wal_size` | Bounded slot retention |
+| `pg_wal_keep_size` | `2 GiB` | Streaming-replication cushion |
+| `pg_archive_timeout` | `60s` | Bounded time-to-archive |
+| `pg_log_checkpoints` | `on` | Evidence for WAL postmortems |
+
+Under `dhis2_architecture=boombox` the `boombox` role pre-computes
+the WAL-budget-respecting defaults above from host facts. Under
+`dhis2_ha=true` the Patroni role owns the cluster and this role
+only installs the binaries + shared extensions.
 
 ## Tags
 
@@ -55,6 +65,15 @@ Key knobs:
   settings intact.
 - `dhis2-db capacity | oom-check` — memory/cgroup estimates and OOM
   log scraping.
+- `dhis2-db wal status | archive-status | retention | compliance |
+  flush | checkpoint | emergency-drain | volume status | watchdog
+  status` — WAL safety operations. `dhis2-db wal compliance` exits
+  6 (warn) or 8 (breach) and is aggregated by `dhis2-doctor wal`.
+- `dhis2-db replication-slot list | drop | advance` — streaming +
+  logical slot management with safety gates.
+- `dhis2-db flyway info | history | pending | failed | locks | unlock
+  | repair | baseline | validate | source-version` — Flyway
+  inspection + bounded repair. `repair` never attempts arbitrary SQL.
 
 ## No-regression notes
 

@@ -37,9 +37,11 @@ See `defaults/main.yml`. Common overrides:
 
 ## CLI integration
 
-- `dhis2-cluster etcd-health` runs `etcdctl endpoint health` against
-  every member.
+- `dhis2-cluster etcd status | members | endpoints` — health, roster,
+  and endpoint list. Reads via `etcdctl`.
 - `dhis2-doctor cluster` includes the etcd quorum check.
+- `dhis2-deploy preflight` refuses to apply when the `[etcd]` group
+  places 3 members on the same `physical_host` (section 15b).
 
 ## No-regression notes
 

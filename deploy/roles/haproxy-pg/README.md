@@ -49,8 +49,11 @@ For analytics / read-only tooling, point at `:5001`.
 
 - `dhis2-proxy test` validates the config before reload (same safe-
   reload contract as the app proxy).
-- `dhis2-cluster leader` and `dhis2-cluster replicas` show what
-  HAProxy is routing to.
+- `dhis2-cluster haproxy status | pools | log` — read HAProxy stats
+  via the Unix socket, show the backend pool roster, and tail the
+  structured log.
+- `dhis2-cluster status` surfaces which host HAProxy is currently
+  routing writes to (read from Patroni, cross-checked with HAProxy).
 
 ## No-regression notes
 

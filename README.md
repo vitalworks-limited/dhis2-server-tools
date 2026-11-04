@@ -38,6 +38,10 @@ for analytics, WireGuard for admin access, and alerting hooks.
   - [Backup and restore](#backup-and-restore)
   - [Controlled DHIS2 upgrade](#controlled-dhis2-upgrade)
   - [Diagnostics and status](#diagnostics-and-status)
+  - [WAL disk-safety operations](#wal-disk-safety-operations)
+  - [Boombox (all-in-one)](#boombox-all-in-one)
+  - [HA cluster (Patroni + etcd + HAProxy)](#ha-cluster-patroni--etcd--haproxy)
+  - [Migrate boombox to LXD](#migrate-boombox-to-lxd)
   - [Multi-environment control plane](#multi-environment-control-plane)
 - [Direct Ansible workflows (preserved)](#direct-ansible-workflows-preserved)
   - [LXD single-host](#lxd-single-host)
@@ -58,6 +62,7 @@ for analytics, WireGuard for admin access, and alerting hooks.
 | **Distributed SSH** | SUPPORTED | Separate physical / virtual servers for proxy, PostgreSQL, DHIS2 app, and monitoring. The controller orchestrates them over SSH. |
 | **Hybrid LXD + SSH** | SUPPORTED | Any mix of LXD-managed and SSH-managed hosts; `ansible_connection` is resolved per host. |
 | **Boombox** | SUPPORTED | Every service on one Ubuntu host, no containers (systemd native). Workshop + small single-site production. See [docs/Boombox.md](./docs/Boombox.md). |
+| **HA (Patroni + etcd + HAProxy)** | SUPPORTED | Opt in with `dhis2_ha=true`. Multi-node PostgreSQL via Patroni, consensus via etcd, routed via HAProxy. Works on LXD, distributed SSH, or hybrid. See [docs/HA-Patroni.md](./docs/HA-Patroni.md). |
 | **Docker** | NOT IMPLEMENTED | Explicitly not supported until implemented and tested. |
 | **Kubernetes** | NOT IMPLEMENTED | Explicitly not supported until implemented and tested. |
 
@@ -120,6 +125,12 @@ execution, `6` health check, `7` partial success — review required,
 `8` safety check prevented destructive action, `9` concurrent-operation
 lock conflict.
 
+**Environment variables** (each has a CLI flag; the flag always wins):
+`DHIS2_TOOLS_HOME`, `DHIS2_INVENTORY`, `DHIS2_ENVIRONMENT`,
+`DHIS2_LOG_LEVEL` (`trace|debug|info|warn|error`), `DHIS2_NO_COLOR`,
+`DHIS2_STATE_DIR`. Full table + inventory search order:
+[docs/CLI.md § Environment variables](./docs/CLI.md#environment-variables).
+
 ---
 
 ## Operator command reference
@@ -131,10 +142,11 @@ lock conflict.
 | `dhis2-host`    | Bootstrap, SSH, sudo, services, resources, firewall, LXD |
 | `dhis2-inventory` | Inspect, validate, lint, graph, safely mutate inventory |
 | `dhis2-instance` | Lifecycle, config, war, endpoint, maintenance |
-| `dhis2-db`      | Status, activity, locks, tuning, config, HBA, ownership |
-| `dhis2-backup`  | Create, verify, manifest, prune, schedule, test-restore |
-| `dhis2-restore` | Plan, verify, restore, ownership, clone, config |
-| `dhis2-upgrade` | Releases, compatibility, run, resume, rollback |
+| `dhis2-db`      | Status, activity, locks, tuning, config, HBA, Flyway, WAL ops, replication slots |
+| `dhis2-cluster` | HA control plane: list, status, failover, switchover, reinit, pause/resume, etcd/haproxy health (13 subcommands; refuses without `dhis2_ha=true`) |
+| `dhis2-backup`  | Create (plain/gzip/custom/tar/directory + GPG), verify, manifest, prune, schedule, test-restore |
+| `dhis2-restore` | Plan, verify, restore (resolves configured DB from `dhis.conf`), ownership, clone, config |
+| `dhis2-upgrade` | Releases, compatibility, run, resume, rollback, preflight, failure-bundle |
 | `dhis2-proxy`   | Routes, config, test, reload, logs, maintenance |
 | `dhis2-tls`     | Inspect, verify, issue, install, renew, rotate |
 | `dhis2-monitor` | Status, install, targets, exporters, alerts, silences |
@@ -226,13 +238,26 @@ Every backup gets a manifest with instance, database, PostgreSQL
 version, format, size, SHA-256 checksum, and tool version.
 
 ```bash
+# Formats: custom (default), plain, plain-gzip, tar, directory.
+# --encrypt gpg --recipient <key_id> wraps the dump with GPG for
+# off-host storage; the recipient must be a long fingerprint or email
+# resolvable in the DB host's keyring.
 dhis2-backup create hmis --format custom --out /var/backups/dhis2
+dhis2-backup create hmis --format plain-gzip --encrypt gpg --recipient ops@example.org
 dhis2-backup verify  /var/backups/dhis2/hmis-20261029-120000.dump
 dhis2-backup test    /var/backups/dhis2/hmis-20261029-120000.dump   # restore into an isolated DB
 dhis2-backup list
 dhis2-backup prune --keep 14 --yes                                   # never prunes the newest valid backup
 dhis2-backup schedule hmis --cron "0 2 * * *"
 ```
+
+> **Instance ≠ database name.** `dhis2-backup create <instance>` and
+> `dhis2-restore database --instance <instance>` resolve the actual
+> configured database by parsing `connection.url` + `connection.username`
+> from `/opt/dhis2/dhis.conf`. If an operator renamed the database
+> (e.g. `hmis` → `hmis_prod`), the backup/restore primitives honour
+> the real name automatically. Override with `--database NAME` if
+> needed.
 
 Restore follows a strict ordered workflow (section 17.3 of the
 requirements): resolve → verify backup → disk check → stop app →
@@ -349,6 +374,138 @@ dhis2-logs migration hmis                      # Flyway-related log lines
 ```
 
 Secrets are redacted from logs, diffs, and bundles by default.
+
+### WAL disk-safety operations
+
+PostgreSQL WAL growth is the most common disk-full outage. The tools
+ship WAL-safe defaults (`max_wal_size`, `max_slot_wal_keep_size`,
+`wal_keep_size`, `archive_timeout`, `log_checkpoints`) and an
+observational watchdog that reads WAL state on a timer and surfaces
+breaches through `dhis2-doctor`.
+
+```bash
+dhis2-db wal status                         # pg_wal size + budget + headroom
+dhis2-db wal archive-status                 # archiver lag / failures
+dhis2-db wal retention                      # which setting is pinning WAL
+dhis2-db wal compliance                     # exits 6 (warn) or 8 (breach)
+dhis2-db wal flush                          # non-destructive; force an xlog flush
+dhis2-db wal checkpoint                     # manual CHECKPOINT (write + flush)
+dhis2-db wal emergency-drain --yes          # confirmation-gated last-resort drain
+dhis2-db wal volume status                  # dedicated pg_wal volume check
+dhis2-db wal watchdog status                # systemd timer + last reading
+
+dhis2-db replication-slot list              # streaming + logical slots with lag
+dhis2-db replication-slot drop NAME --force --yes
+dhis2-db replication-slot advance NAME --to LSN --yes
+```
+
+The archive-command preflight refuses the deploy if the inventory
+configures `archive_mode=on` without a valid `archive_command`, and
+`dhis2-doctor wal` aggregates compliance into the normal cross-stack
+check. Full runbook:
+[docs/CLI-WAL-Operations.md](./docs/CLI-WAL-Operations.md).
+
+### Boombox (all-in-one)
+
+Every service on one Ubuntu host, no containers — workshop laptops,
+demos, small single-site production. Opt in with
+`--architecture boombox`.
+
+```bash
+# Production: fqdn + email required, Let's Encrypt, UFW must be active.
+sudo dhis2-deploy init --architecture boombox --mode production \
+    --fqdn hmis.example.org --email ops@example.org
+# Workshop: fqdn optional, self-signed TLS, UFW inactive warns only.
+sudo dhis2-deploy init --architecture boombox --mode workshop
+
+sudo dhis2-deploy preflight                  # 15 boombox-specific checks
+sudo dhis2-deploy apply
+sudo dhis2-status
+sudo dhis2-doctor boombox                    # boombox cross-check
+```
+
+The `boombox` role computes `pg_shared_buffers`,
+`pg_effective_cache_size`, `pg_work_mem`,
+`pg_maintenance_work_mem`, `pg_max_connections`, `heap_memory_size`,
+`pg_max_wal_size`, `pg_max_slot_wal_keep_size`, and TLS defaults
+from the host's RAM/CPU/disk. Any value is overridable per host in
+inventory. Preflight refuses a boombox deploy when `lxc` is present
+or `dhis2_ha=true`. Full operator guide:
+[docs/Boombox.md](./docs/Boombox.md).
+
+### HA cluster (Patroni + etcd + HAProxy)
+
+Opt in with `dhis2_ha=true`. `dhis2-cluster` is the HA control plane
+and refuses to run without that flag. All destructive subcommands
+require `--yes` and a typed cluster name.
+
+```bash
+dhis2-cluster list                           # Patroni members + leader
+dhis2-cluster status                         # per-node state, replication lag
+dhis2-cluster topology [--check]             # 2-node + 3-etcd placement rules
+dhis2-cluster failover   --candidate pg02 --yes   # manual failover (leader down)
+dhis2-cluster switchover --candidate pg02 --yes   # planned role swap
+dhis2-cluster reinit     pg03 --yes          # rebuild a replica from the leader
+dhis2-cluster pause                          # stop auto-failover (e.g. rolling upgrade)
+dhis2-cluster resume
+dhis2-cluster etcd        status | members | endpoints
+dhis2-cluster haproxy     status | pools | log
+dhis2-cluster vip         status             # keepalived peer + VIP holder
+dhis2-cluster logs        <node>
+dhis2-cluster certs       check              # Patroni / etcd / HAProxy certs
+```
+
+Deploy-time preflights refuse unsafe topologies: 3 etcd members on
+the same `physical_host`, primary + sync standby colocated, etc.
+Rolling upgrades auto-pause the cluster when `--pause-cluster` is
+set. See [docs/HA-Patroni.md](./docs/HA-Patroni.md),
+[docs/HA-Runbook-Failover.md](./docs/HA-Runbook-Failover.md), and the
+8 locked ADRs under `docs/vital-enhancements/ha-adr-0*.md`.
+
+### Migrate boombox to LXD
+
+If a boombox outgrows the shared process space (performance ceiling,
+multi-tenant isolation need, upgrade to HA), `dhis2-deploy migrate
+boombox-to-lxd` performs the transition with four modes. Automatic
+rollback covers stages 1–5; stages 6+ are destructive and hand off
+to an operator-driven recovery path.
+
+```bash
+# 1. preflight-only (default). Prints the plan + OK + exits 0.
+sudo dhis2-deploy migrate boombox-to-lxd
+
+# 2. detect drift (reads live host: Tomcat major, PG major, DHIS2
+#    WAR version, parses /opt/dhis2/dhis.conf). Exits 0 even on drift.
+sudo dhis2-deploy migrate boombox-to-lxd --detect-drift
+
+# 3. dry-run. Prints every command that would run. Exits 0.
+sudo dhis2-deploy migrate boombox-to-lxd --dry-run
+
+# 4. execute. Requires --yes and one --instance per migrated instance.
+sudo dhis2-deploy migrate boombox-to-lxd --execute --yes \
+    --instance hmis [--instance training] \
+    [--rotate-db-password]
+```
+
+What it handles:
+
+- **Drift-aware.** Detected Tomcat/PG majors flow into the rendered
+  LXD inventory (`tomcat_version=`, `postgresql_version=`) so no
+  silent major bump happens via restore.
+- **Multi-instance.** Repeat `--instance` per instance; one state
+  snapshot and one verified backup per instance.
+- **Password rotation.** `--rotate-db-password` performs a
+  transactional rotation during stage 9 (new secret → new PG user
+  → new `dhis.conf` atomically).
+- **Preserved customisations.** `/etc/nginx/conf.d`,
+  `/etc/nginx/snippets`, and `postgresql(@).service.d` overrides are
+  snapshotted and pushed into the `proxy` / `postgres` containers.
+- **Honours renamed databases.** The configured DB name is read
+  from `dhis.conf` (same resolver as backup/restore), so an operator
+  rename survives the migration.
+
+Full 13-stage runbook with rollback paths and the opt-in live-test
+harness: [docs/Boombox-to-LXD-Migration.md](./docs/Boombox-to-LXD-Migration.md).
 
 ### Multi-environment control plane
 
@@ -602,14 +759,15 @@ Three layers of automated tests ship with the repository. See
 
 - **`tests/cli/run_cli_tests.sh`** — dependency-free CLI smoke tests
   (`--help`, exit codes, JSON schema, inventory validation, secret
-  redaction).
+  redaction). 33 assertions.
 - **`tests/regression/run_scenarios.sh`** — every scenario named in
-  sections 40, 69, 80, and 89 of the implementation requirements doc
-  (A through AE). Mock mode runs in CI; a live mode is available via
-  `DHIS2_REGRESSION_LIVE=1` for execution against a real deployment.
-  The runner writes the compatibility table required by section 53
-  to `tests/regression/last-run.md`.
-- **`molecule/`** — three container-based scenarios:
+  sections 40, 69, 80, and 89 of the implementation requirements doc,
+  plus WAL (AW–BV), HA (BA–BM), boombox (BW–BZ), and boombox→LXD
+  migration (CA–CJ). **105 passing scenarios, 0 failed, 2 skipped**
+  in mock mode. Live mode (`DHIS2_REGRESSION_LIVE=1`) runs against a
+  real deployment. The runner writes the compatibility table required
+  by section 53 to `tests/regression/last-run.md`.
+- **`molecule/`** — container-based scenarios:
   - `cli-smoke` — installs the CLI inside Ubuntu and runs both test
     suites end-to-end.
   - `dhis-conf-preservation` — mechanical proof of scenarios E1 / E2
@@ -617,6 +775,15 @@ Three layers of automated tests ship with the repository. See
   - `upgrade-monitor-migrations` — mechanical proof of scenarios X
     (failure never reports success) and P (interrupted upgrade state
     captured) against mocked Flyway output.
+- **`tests/live/`** — opt-in VM-based round-trip for the
+  `migrate boombox-to-lxd` subcommand. Not run on the free-tier
+  GitHub matrix (LXD on nested virt is unreliable); runs locally via
+  `bash tests/live/run.sh` (Vagrant + VirtualBox/libvirt) or against
+  any SSH target via `DHIS2_LIVE_HOST=…`. The companion workflow
+  `.github/workflows/live-matrix.yml` executes the full matrix
+  (Ubuntu 22.04/24.04 × single/multi/rotated) on a self-hosted runner
+  labelled `live-lxd`. See
+  [tests/live/README.md](./tests/live/README.md).
 
 CI runs shellcheck, bash syntax checks, ansible-lint, the CLI smoke
 tests, the regression suite in mock mode, and the full Molecule
